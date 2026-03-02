@@ -2,10 +2,8 @@ name: Build and Release
 
 on:
   push:
-    branches:
-      - main
     tags:
-      - 'v*' # 当推送形如 v1.0.0 的 tag 时触发
+      - 'v*' # 仅当推送形如 v1.0.0 的 tag 时触发
   workflow_dispatch: # 允许在 GitHub Actions 页面手动触发
 
 jobs:
