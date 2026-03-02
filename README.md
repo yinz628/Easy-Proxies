@@ -14,6 +14,16 @@ EasyProxiesV2 是一个轻量级、高性能的代理池与订阅管理工具，
 - GeoIP 分区路由（可选）
 - SQLite 持久化存储运行状态与统计数据
 
+## 🖼️ 项目预览
+
+> 以下图片来自 `frontend/public`，按顺序展示：
+
+![项目预览 1](./frontend/public/1.png)
+![项目预览 2](./frontend/public/2.png)
+![项目预览 3](./frontend/public/3.png)
+![项目预览 4](./frontend/public/4.png)
+![项目预览 5](./frontend/public/5.png)
+
 ---
 
 ## 🚀 最推荐：直接使用 Release 二进制（Linux / Windows）
