@@ -651,22 +651,11 @@ func parseNodesFromContent(content string) ([]config.NodeConfig, error) {
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		if isProxyURI(line) {
+		if config.IsProxyURI(line) {
 			nodes = append(nodes, config.NodeConfig{URI: line})
 		}
 	}
 	return nodes, nil
-}
-
-func isProxyURI(s string) bool {
-	schemes := []string{"vmess://", "vless://", "trojan://", "ss://", "ssr://", "hysteria://", "hysteria2://", "hy2://", "anytls://"}
-	lower := strings.ToLower(s)
-	for _, scheme := range schemes {
-		if strings.HasPrefix(lower, scheme) {
-			return true
-		}
-	}
-	return false
 }
 
 type defaultLogger struct{}

@@ -78,10 +78,10 @@ type MultiPortConfig struct {
 
 // ManagementConfig controls the monitoring HTTP endpoint.
 type ManagementConfig struct {
-	Enabled             *bool          `yaml:"enabled"`
-	Listen              string         `yaml:"listen"`
-	ProbeTarget         string         `yaml:"probe_target"`
-	Password            string         `yaml:"password"` // WebUI 访问密码，为空则不需要密码
+	Enabled             *bool         `yaml:"enabled"`
+	Listen              string        `yaml:"listen"`
+	ProbeTarget         string        `yaml:"probe_target"`
+	Password            string        `yaml:"password"` // WebUI 访问密码，为空则不需要密码
 	HealthCheckInterval time.Duration `yaml:"health_check_interval"`
 }
 
@@ -110,6 +110,20 @@ const (
 	InboundProtocolSOCKS5 = "socks5"
 	InboundProtocolMixed  = "mixed"
 )
+
+var supportedProxyURISchemes = []string{
+	"vmess://",
+	"vless://",
+	"trojan://",
+	"ss://",
+	"ssr://",
+	"hysteria://",
+	"hysteria2://",
+	"hy2://",
+	"anytls://",
+	"http://",
+	"socks5://",
+}
 
 // NormalizeInboundProtocol normalizes inbound protocol aliases and validates the value.
 func NormalizeInboundProtocol(value string) (string, error) {
@@ -683,9 +697,9 @@ func isBase64(s string) bool {
 
 // IsProxyURI checks if a string is a valid proxy URI
 func IsProxyURI(s string) bool {
-	schemes := []string{"vmess://", "vless://", "trojan://", "ss://", "ssr://", "hysteria://", "hysteria2://", "hy2://", "anytls://"}
-	for _, scheme := range schemes {
-		if strings.HasPrefix(strings.ToLower(s), scheme) {
+	lower := strings.ToLower(strings.TrimSpace(s))
+	for _, scheme := range supportedProxyURISchemes {
+		if strings.HasPrefix(lower, scheme) {
 			return true
 		}
 	}

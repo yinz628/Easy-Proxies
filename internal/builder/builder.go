@@ -349,6 +349,18 @@ func buildNodeOutbound(tag, rawURI string, skipCertVerify bool) (option.Outbound
 		return option.Outbound{}, fmt.Errorf("parse uri: %w", err)
 	}
 	switch strings.ToLower(parsed.Scheme) {
+	case "http":
+		opts, err := buildHTTPOptions(parsed, skipCertVerify)
+		if err != nil {
+			return option.Outbound{}, err
+		}
+		return option.Outbound{Type: C.TypeHTTP, Tag: tag, Options: &opts}, nil
+	case "socks5":
+		opts, err := buildSOCKSOptions(parsed)
+		if err != nil {
+			return option.Outbound{}, err
+		}
+		return option.Outbound{Type: C.TypeSOCKS, Tag: tag, Options: &opts}, nil
 	case "vless":
 		opts, err := buildVLESSOptions(parsed, skipCertVerify)
 		if err != nil {
@@ -388,6 +400,64 @@ func buildNodeOutbound(tag, rawURI string, skipCertVerify bool) (option.Outbound
 	default:
 		return option.Outbound{}, fmt.Errorf("unsupported scheme %q", parsed.Scheme)
 	}
+}
+
+func buildHTTPOptions(u *url.URL, skipCertVerify bool) (option.HTTPOutboundOptions, error) {
+	query := u.Query()
+	defaultPort := 80
+	if strings.EqualFold(query.Get("security"), "tls") {
+		defaultPort = 443
+	}
+	server, port, err := hostPort(u, defaultPort)
+	if err != nil {
+		return option.HTTPOutboundOptions{}, err
+	}
+
+	opts := option.HTTPOutboundOptions{
+		ServerOptions: option.ServerOptions{Server: server, ServerPort: uint16(port)},
+	}
+	if u.User != nil {
+		opts.Username = u.User.Username()
+		if password, ok := u.User.Password(); ok {
+			opts.Password = password
+		}
+	}
+	if path := u.EscapedPath(); path != "" {
+		opts.Path = path
+	}
+	if host := strings.TrimSpace(query.Get("host")); host != "" {
+		opts.Headers = badoption.HTTPHeader{"Host": {host}}
+	}
+	if tlsOptions, err := buildTLSOptions(query, skipCertVerify); err != nil {
+		return option.HTTPOutboundOptions{}, err
+	} else if tlsOptions != nil {
+		opts.OutboundTLSOptionsContainer = option.OutboundTLSOptionsContainer{TLS: tlsOptions}
+	}
+
+	return opts, nil
+}
+
+func buildSOCKSOptions(u *url.URL) (option.SOCKSOutboundOptions, error) {
+	server, port, err := hostPort(u, 1080)
+	if err != nil {
+		return option.SOCKSOutboundOptions{}, err
+	}
+
+	opts := option.SOCKSOutboundOptions{
+		ServerOptions: option.ServerOptions{Server: server, ServerPort: uint16(port)},
+		Version:       "5",
+	}
+	if u.User != nil {
+		opts.Username = u.User.Username()
+		if password, ok := u.User.Password(); ok {
+			opts.Password = password
+		}
+	}
+	if network := strings.ToLower(strings.TrimSpace(u.Query().Get("network"))); network != "" {
+		opts.Network = option.NetworkList(network)
+	}
+
+	return opts, nil
 }
 
 func buildAnyTLSOptions(u *url.URL, skipCertVerify bool) (option.AnyTLSOutboundOptions, error) {

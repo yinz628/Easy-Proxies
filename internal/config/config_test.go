@@ -1,0 +1,22 @@
+package config
+
+import "testing"
+
+func TestIsProxyURIRecognizesHTTPAndSOCKS5(t *testing.T) {
+	tests := []struct {
+		name string
+		uri  string
+		want bool
+	}{
+		{name: "http", uri: "http://alice:secret@example.com:8080", want: true},
+		{name: "socks5", uri: "socks5://alice:secret@example.com:1080", want: true},
+		{name: "vmess", uri: "vmess://example", want: true},
+		{name: "invalid", uri: "ftp://example.com", want: false},
+	}
+
+	for _, tt := range tests {
+		if got := IsProxyURI(tt.uri); got != tt.want {
+			t.Fatalf("%s: IsProxyURI(%q) = %v, want %v", tt.name, tt.uri, got, tt.want)
+		}
+	}
+}
