@@ -109,6 +109,15 @@ geoip:
 subscriptions:
   - "https://example.com/subscribe?token=xxx"
 #   - "https://another.com/api/v1/client/subscribe?token=yyy"
+# txt_subscriptions:
+#   - name: "vmheaven-http"
+#     url: "https://github.com/vmheaven/VMHeaven-Free-Proxy-Updated/blob/main/http.txt"
+#     default_protocol: "http"        # http | https | socks5
+#     auto_update_enabled: true       # 是否参与定时自动刷新
+#   - name: "vmheaven-socks5"
+#     url: "https://github.com/vmheaven/VMHeaven-Free-Proxy-Updated/blob/main/socks5_anonymous.txt"
+#     default_protocol: "socks5"
+#     auto_update_enabled: false      # false 时仍可以通过“立即刷新”手动刷新
 
 # ───────────────────────────────────────────────────────────────
 # 方式 2: 节点文件（每行一个代理 URI）

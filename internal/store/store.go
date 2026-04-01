@@ -37,6 +37,9 @@ type Store interface {
 	// Returns the number of deleted rows.
 	DeleteNodesBySource(ctx context.Context, source string) (int64, error)
 
+	// DeleteNodesByFeedKey removes all nodes belonging to a specific subscription feed.
+	DeleteNodesByFeedKey(ctx context.Context, feedKey string) (int64, error)
+
 	// BulkUpsertNodes inserts or updates nodes in a single transaction.
 	// Nodes are matched by URI for upsert logic.
 	BulkUpsertNodes(ctx context.Context, nodes []Node) error
@@ -124,6 +127,7 @@ type Node struct {
 	URI       string    `json:"uri"`
 	Name      string    `json:"name"`
 	Source    string    `json:"source"` // inline, nodes_file, subscription, manual
+	FeedKey   string    `json:"feed_key,omitempty"`
 	Port      uint16    `json:"port"`
 	Username  string    `json:"username,omitempty"`
 	Password  string    `json:"password,omitempty"`
@@ -213,4 +217,5 @@ const (
 	NodeSourceFile         = "nodes_file"
 	NodeSourceSubscription = "subscription"
 	NodeSourceManual       = "manual"
+	NodeSourceTXTSubscription = "txt_subscription"
 )

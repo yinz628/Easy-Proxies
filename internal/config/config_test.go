@@ -1,6 +1,12 @@
 package config
 
-import "testing"
+import (
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"testing"
+)
 
 func TestIsProxyURIRecognizesHTTPAndSOCKS5(t *testing.T) {
 	tests := []struct {
@@ -18,5 +24,63 @@ func TestIsProxyURIRecognizesHTTPAndSOCKS5(t *testing.T) {
 		if got := IsProxyURI(tt.uri); got != tt.want {
 			t.Fatalf("%s: IsProxyURI(%q) = %v, want %v", tt.name, tt.uri, got, tt.want)
 		}
+	}
+}
+
+func TestLoadAppliesExampleAlignedDefaults(t *testing.T) {
+	tempDir := t.TempDir()
+	configPath := filepath.Join(tempDir, "config.yaml")
+
+	if err := os.WriteFile(configPath, []byte("{}\n"), 0o644); err != nil {
+		t.Fatalf("write config file: %v", err)
+	}
+
+	cfg, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	if got, want := cfg.MultiPort.BasePort, uint16(24000); got != want {
+		t.Fatalf("MultiPort.BasePort = %d, want %d", got, want)
+	}
+
+	if got, want := cfg.Management.Listen, "0.0.0.0:9888"; got != want {
+		t.Fatalf("Management.Listen = %q, want %q", got, want)
+	}
+
+	if got, want := cfg.Management.ProbeTarget, "http://cp.cloudflare.com/generate_204"; got != want {
+		t.Fatalf("Management.ProbeTarget = %q, want %q", got, want)
+	}
+}
+
+func TestLoadIncludesTXTSubscriptionsOnInitialStartup(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("1.0.171.213:8080\n"))
+	}))
+	defer server.Close()
+
+	tempDir := t.TempDir()
+	configPath := filepath.Join(tempDir, "config.yaml")
+	configBody := "txt_subscriptions:\n" +
+		"  - name: vmheaven\n" +
+		"    url: " + server.URL + "/all_proxies.txt\n" +
+		"    default_protocol: socks5\n" +
+		"    auto_update_enabled: true\n"
+
+	if err := os.WriteFile(configPath, []byte(configBody), 0o644); err != nil {
+		t.Fatalf("write config file: %v", err)
+	}
+
+	cfg, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	if len(cfg.Nodes) != 1 {
+		t.Fatalf("len(cfg.Nodes) = %d, want 1", len(cfg.Nodes))
+	}
+
+	if got, want := cfg.Nodes[0].URI, "socks5://1.0.171.213:8080"; got != want {
+		t.Fatalf("cfg.Nodes[0].URI = %q, want %q", got, want)
 	}
 }

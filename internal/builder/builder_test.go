@@ -66,3 +66,27 @@ func TestBuildNodeOutboundSupportsHTTP(t *testing.T) {
 		t.Fatalf("path = %q, want %q", opts.Path, "/proxy")
 	}
 }
+
+func TestBuildNodeOutboundSupportsHTTPS(t *testing.T) {
+	outbound, err := buildNodeOutbound("https-node", "https://secure.example.com:443", false)
+	if err != nil {
+		t.Fatalf("buildNodeOutbound returned error: %v", err)
+	}
+	if outbound.Type != C.TypeHTTP {
+		t.Fatalf("outbound type = %q, want %q", outbound.Type, C.TypeHTTP)
+	}
+
+	opts, ok := outbound.Options.(*option.HTTPOutboundOptions)
+	if !ok {
+		t.Fatalf("outbound options type = %T, want *option.HTTPOutboundOptions", outbound.Options)
+	}
+	if opts.Server != "secure.example.com" {
+		t.Fatalf("server = %q, want %q", opts.Server, "secure.example.com")
+	}
+	if opts.ServerPort != 443 {
+		t.Fatalf("server port = %d, want %d", opts.ServerPort, 443)
+	}
+	if opts.TLS == nil || !opts.TLS.Enabled {
+		t.Fatalf("TLS = %#v, want enabled TLS options", opts.TLS)
+	}
+}

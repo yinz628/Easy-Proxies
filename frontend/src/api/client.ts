@@ -340,6 +340,13 @@ export async function refreshSubscription(): Promise<{ message: string; node_cou
   return request('/api/subscription/refresh', { method: 'POST' })
 }
 
+export async function refreshSubscriptionFeed(feedKey: string): Promise<{ message: string; feed_key: string }> {
+  return request('/api/subscription/refresh-feed', {
+    method: 'POST',
+    body: JSON.stringify({ feed_key: feedKey }),
+  })
+}
+
 // ---- Export API ----
 
 export async function exportProxies(): Promise<string> {

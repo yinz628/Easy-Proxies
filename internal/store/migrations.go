@@ -105,6 +105,14 @@ ALTER TABLE node_stats ADD COLUMN total_upload_bytes INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE node_stats ADD COLUMN total_download_bytes INTEGER NOT NULL DEFAULT 0;
 `,
 		},
+		{
+			Version:     3,
+			Description: "add feed key to nodes",
+			Up: `
+ALTER TABLE nodes ADD COLUMN feed_key TEXT NOT NULL DEFAULT '';
+CREATE INDEX IF NOT EXISTS idx_nodes_feed_key ON nodes(feed_key);
+`,
+		},
 	}
 }
 

@@ -67,7 +67,7 @@ type querier interface {
 // ===================== Node operations =====================
 
 func (s *sqliteStore) ListNodes(ctx context.Context, filter NodeFilter) ([]Node, error) {
-	query := "SELECT id, uri, name, source, port, username, password, region, country, enabled, created_at, updated_at FROM nodes"
+	query := "SELECT id, uri, name, source, feed_key, port, username, password, region, country, enabled, created_at, updated_at FROM nodes"
 	var conditions []string
 	var args []any
 
@@ -110,19 +110,19 @@ func (s *sqliteStore) ListNodes(ctx context.Context, filter NodeFilter) ([]Node,
 
 func (s *sqliteStore) GetNode(ctx context.Context, id int64) (*Node, error) {
 	row := s.conn().QueryRowContext(ctx,
-		"SELECT id, uri, name, source, port, username, password, region, country, enabled, created_at, updated_at FROM nodes WHERE id = ?", id)
+		"SELECT id, uri, name, source, feed_key, port, username, password, region, country, enabled, created_at, updated_at FROM nodes WHERE id = ?", id)
 	return scanNode(row)
 }
 
 func (s *sqliteStore) GetNodeByURI(ctx context.Context, uri string) (*Node, error) {
 	row := s.conn().QueryRowContext(ctx,
-		"SELECT id, uri, name, source, port, username, password, region, country, enabled, created_at, updated_at FROM nodes WHERE uri = ?", uri)
+		"SELECT id, uri, name, source, feed_key, port, username, password, region, country, enabled, created_at, updated_at FROM nodes WHERE uri = ?", uri)
 	return scanNode(row)
 }
 
 func (s *sqliteStore) GetNodeByName(ctx context.Context, name string) (*Node, error) {
 	row := s.conn().QueryRowContext(ctx,
-		"SELECT id, uri, name, source, port, username, password, region, country, enabled, created_at, updated_at FROM nodes WHERE name = ?", name)
+		"SELECT id, uri, name, source, feed_key, port, username, password, region, country, enabled, created_at, updated_at FROM nodes WHERE name = ?", name)
 	return scanNode(row)
 }
 
@@ -140,9 +140,9 @@ func (s *sqliteStore) CreateNode(ctx context.Context, node *Node) error {
 	}
 
 	result, err := s.conn().ExecContext(ctx,
-		`INSERT INTO nodes (uri, name, source, port, username, password, region, country, enabled, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		node.URI, node.Name, node.Source, node.Port,
+		`INSERT INTO nodes (uri, name, source, feed_key, port, username, password, region, country, enabled, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		node.URI, node.Name, node.Source, node.FeedKey, node.Port,
 		node.Username, node.Password, node.Region, node.Country,
 		enabled, now, now,
 	)
@@ -174,10 +174,10 @@ func (s *sqliteStore) UpdateNode(ctx context.Context, node *Node) error {
 	}
 
 	result, err := s.conn().ExecContext(ctx,
-		`UPDATE nodes SET uri=?, name=?, source=?, port=?, username=?, password=?,
+		`UPDATE nodes SET uri=?, name=?, source=?, feed_key=?, port=?, username=?, password=?,
 		 region=?, country=?, enabled=?, updated_at=?
 		 WHERE id=?`,
-		node.URI, node.Name, node.Source, node.Port,
+		node.URI, node.Name, node.Source, node.FeedKey, node.Port,
 		node.Username, node.Password, node.Region, node.Country,
 		enabled, now, node.ID,
 	)
@@ -212,6 +212,14 @@ func (s *sqliteStore) DeleteNodesBySource(ctx context.Context, source string) (i
 	return result.RowsAffected()
 }
 
+func (s *sqliteStore) DeleteNodesByFeedKey(ctx context.Context, feedKey string) (int64, error) {
+	result, err := s.conn().ExecContext(ctx, "DELETE FROM nodes WHERE feed_key = ?", feedKey)
+	if err != nil {
+		return 0, fmt.Errorf("delete nodes by feed key %q: %w", feedKey, err)
+	}
+	return result.RowsAffected()
+}
+
 func (s *sqliteStore) BulkUpsertNodes(ctx context.Context, nodes []Node) error {
 	if len(nodes) == 0 {
 		return nil
@@ -220,10 +228,10 @@ func (s *sqliteStore) BulkUpsertNodes(ctx context.Context, nodes []Node) error {
 	execFn := func(txStore *sqliteStore) error {
 		now := time.Now().UTC().Format(time.RFC3339)
 		stmt, err := txStore.conn().PrepareContext(ctx,
-			`INSERT INTO nodes (uri, name, source, port, username, password, region, country, enabled, created_at, updated_at)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			`INSERT INTO nodes (uri, name, source, feed_key, port, username, password, region, country, enabled, created_at, updated_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			 ON CONFLICT(uri) DO UPDATE SET
-			   name=excluded.name, source=excluded.source, port=excluded.port,
+			   name=excluded.name, source=excluded.source, feed_key=excluded.feed_key, port=excluded.port,
 			   username=excluded.username, password=excluded.password,
 			   region=excluded.region, country=excluded.country,
 			   updated_at=excluded.updated_at`)
@@ -239,7 +247,7 @@ func (s *sqliteStore) BulkUpsertNodes(ctx context.Context, nodes []Node) error {
 				enabled = 1
 			}
 			result, err := stmt.ExecContext(ctx,
-				n.URI, n.Name, n.Source, n.Port,
+				n.URI, n.Name, n.Source, n.FeedKey, n.Port,
 				n.Username, n.Password, n.Region, n.Country,
 				enabled, now, now,
 			)
@@ -745,7 +753,7 @@ func scanNode(row *sql.Row) (*Node, error) {
 	var createdAtStr, updatedAtStr string
 
 	err := row.Scan(
-		&n.ID, &n.URI, &n.Name, &n.Source, &n.Port,
+		&n.ID, &n.URI, &n.Name, &n.Source, &n.FeedKey, &n.Port,
 		&n.Username, &n.Password, &n.Region, &n.Country,
 		&enabled, &createdAtStr, &updatedAtStr,
 	)
@@ -770,7 +778,7 @@ func scanNodes(rows *sql.Rows) ([]Node, error) {
 		var createdAtStr, updatedAtStr string
 
 		err := rows.Scan(
-			&n.ID, &n.URI, &n.Name, &n.Source, &n.Port,
+			&n.ID, &n.URI, &n.Name, &n.Source, &n.FeedKey, &n.Port,
 			&n.Username, &n.Password, &n.Region, &n.Country,
 			&enabled, &createdAtStr, &updatedAtStr,
 		)

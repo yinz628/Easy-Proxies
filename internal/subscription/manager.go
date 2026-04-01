@@ -17,6 +17,7 @@ import (
 	"easy_proxies/internal/config"
 	"easy_proxies/internal/monitor"
 	"easy_proxies/internal/store"
+	"easy_proxies/internal/txtsub"
 )
 
 // Logger defines logging interface.
@@ -42,6 +43,33 @@ func WithStore(s store.Store) Option {
 // Ensure Manager implements boxmgr.ConfigUpdateListener.
 var _ boxmgr.ConfigUpdateListener = (*Manager)(nil)
 
+type feedKind string
+
+const (
+	feedKindLegacy feedKind = "legacy"
+	feedKindTXT    feedKind = "txt"
+)
+
+type refreshRequest struct {
+	includeDisabledTXT bool
+}
+
+type feedRequest struct {
+	Kind              feedKind
+	Name              string
+	URL               string
+	NormalizedURL     string
+	FeedKey           string
+	DefaultProtocol   txtsub.DefaultProtocol
+	AutoUpdateEnabled bool
+}
+
+type feedFetchResult struct {
+	Nodes        []config.NodeConfig
+	ValidNodes   int
+	SkippedLines int
+}
+
 // Manager handles periodic subscription refresh.
 type Manager struct {
 	mu sync.RWMutex
@@ -56,7 +84,7 @@ type Manager struct {
 	ctx           context.Context
 	cancel        context.CancelFunc
 	refreshMu     sync.Mutex // prevents concurrent refreshes
-	manualRefresh chan struct{}
+	manualRefresh chan refreshRequest
 	configChanged chan struct{} // signals config updates to the refresh loop
 }
 
@@ -90,7 +118,7 @@ func New(cfg *config.Config, boxMgr *boxmgr.Manager, opts ...Option) *Manager {
 		boxMgr:        boxMgr,
 		ctx:           ctx,
 		cancel:        cancel,
-		manualRefresh: make(chan struct{}, 1),
+		manualRefresh: make(chan refreshRequest, 1),
 		configChanged: make(chan struct{}, 1),
 		httpClient:    httpClient,
 	}
@@ -132,7 +160,7 @@ func (m *Manager) Stop() {
 // It only requires that subscription URLs are configured.
 func (m *Manager) RefreshNow() error {
 	m.mu.RLock()
-	hasSubscriptions := len(m.baseCfg.Subscriptions) > 0
+	hasSubscriptions := m.hasAnySubscriptionsLocked()
 	timeout := m.baseCfg.SubscriptionRefresh.Timeout
 	healthCheckTimeout := m.baseCfg.SubscriptionRefresh.HealthCheckTimeout
 	m.mu.RUnlock()
@@ -142,7 +170,7 @@ func (m *Manager) RefreshNow() error {
 	}
 
 	select {
-	case m.manualRefresh <- struct{}{}:
+	case m.manualRefresh <- refreshRequest{includeDisabledTXT: true}:
 	default:
 		// Already a refresh pending
 	}
@@ -180,9 +208,16 @@ func (m *Manager) RefreshNow() error {
 func (m *Manager) Status() monitor.SubscriptionStatus {
 	m.mu.RLock()
 	status := m.status
-	status.Enabled = m.baseCfg.SubscriptionRefresh.Enabled
-	status.HasSubscriptions = len(m.baseCfg.Subscriptions) > 0
+	cfg := m.baseCfg.Clone()
+	existingFeeds := make([]monitor.SubscriptionFeedStatus, len(status.Feeds))
+	copy(existingFeeds, status.Feeds)
 	m.mu.RUnlock()
+
+	if cfg != nil {
+		status.Enabled = cfg.SubscriptionRefresh.Enabled
+		status.HasSubscriptions = len(cfg.Subscriptions) > 0 || len(cfg.TXTSubscriptions) > 0
+		status.Feeds = buildConfiguredFeedStatuses(cfg, existingFeeds)
+	}
 
 	// Check if nodes have been modified since last refresh
 	status.NodesModified = m.CheckNodesModified()
@@ -219,7 +254,7 @@ func (m *Manager) refreshLoop() {
 
 			// Only auto-refresh when enabled and subscriptions exist
 			if m.isEnabled() {
-				m.doRefresh()
+				m.doRefresh(false)
 			}
 
 			m.mu.Lock()
@@ -230,9 +265,9 @@ func (m *Manager) refreshLoop() {
 			}
 			m.mu.Unlock()
 
-		case <-m.manualRefresh:
+		case req := <-m.manualRefresh:
 			// Manual refresh always executes (caller already verified subscriptions exist)
-			m.doRefresh()
+			m.doRefresh(req.includeDisabledTXT)
 			// Reset ticker and recalculate interval after manual refresh
 			newInterval := m.currentInterval()
 			if newInterval != interval {
@@ -271,7 +306,114 @@ func (m *Manager) isEnabled() bool {
 
 // isEnabledLocked checks if auto-refresh should run (caller must hold mu).
 func (m *Manager) isEnabledLocked() bool {
-	return m.baseCfg.SubscriptionRefresh.Enabled && len(m.baseCfg.Subscriptions) > 0
+	return m.baseCfg.SubscriptionRefresh.Enabled && m.hasAnySubscriptionsLocked()
+}
+
+func (m *Manager) hasAnySubscriptionsLocked() bool {
+	return len(m.baseCfg.Subscriptions) > 0 || len(m.baseCfg.TXTSubscriptions) > 0
+}
+
+func (m *Manager) collectFeedRequests(includeDisabledTXT bool) []feedRequest {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	var feeds []feedRequest
+	for _, subURL := range m.baseCfg.Subscriptions {
+		trimmed := strings.TrimSpace(subURL)
+		if trimmed == "" {
+			continue
+		}
+		feeds = append(feeds, feedRequest{
+			Kind:          feedKindLegacy,
+			URL:           trimmed,
+			NormalizedURL: trimmed,
+			FeedKey:       txtsub.BuildFeedKey(txtsub.FeedKindLegacy, trimmed),
+		})
+	}
+
+	for _, txtCfg := range m.baseCfg.TXTSubscriptions {
+		trimmedURL := strings.TrimSpace(txtCfg.URL)
+		if trimmedURL == "" {
+			continue
+		}
+		if !includeDisabledTXT && !txtCfg.AutoUpdateEnabled {
+			continue
+		}
+		defaultProtocol, err := txtsub.NormalizeDefaultProtocol(txtCfg.DefaultProtocol)
+		if err != nil {
+			continue
+		}
+		normalizedURL := txtsub.NormalizeSourceURL(trimmedURL)
+		feeds = append(feeds, feedRequest{
+			Kind:              feedKindTXT,
+			Name:              strings.TrimSpace(txtCfg.Name),
+			URL:               trimmedURL,
+			NormalizedURL:     normalizedURL,
+			FeedKey:           txtsub.BuildFeedKey(txtsub.FeedKindTXT, normalizedURL),
+			DefaultProtocol:   defaultProtocol,
+			AutoUpdateEnabled: txtCfg.AutoUpdateEnabled,
+		})
+	}
+
+	return feeds
+}
+
+func (m *Manager) findTXTFeedRequestByFeedKey(feedKey string) (feedRequest, error) {
+	feeds := m.collectFeedRequests(true)
+	for _, feed := range feeds {
+		if feed.FeedKey != feedKey {
+			continue
+		}
+		if feed.Kind != feedKindTXT {
+			return feedRequest{}, fmt.Errorf("feed %q is not a txt subscription", feedKey)
+		}
+		return feed, nil
+	}
+	return feedRequest{}, fmt.Errorf("txt feed %q not found", feedKey)
+}
+
+func buildConfiguredFeedStatuses(cfg *config.Config, existing []monitor.SubscriptionFeedStatus) []monitor.SubscriptionFeedStatus {
+	existingByKey := make(map[string]monitor.SubscriptionFeedStatus, len(existing))
+	for _, feed := range existing {
+		existingByKey[feed.FeedKey] = feed
+	}
+
+	statuses := make([]monitor.SubscriptionFeedStatus, 0, len(cfg.Subscriptions)+len(cfg.TXTSubscriptions))
+	for _, subURL := range cfg.Subscriptions {
+		trimmed := strings.TrimSpace(subURL)
+		if trimmed == "" {
+			continue
+		}
+		feedKey := txtsub.BuildFeedKey(txtsub.FeedKindLegacy, trimmed)
+		status := existingByKey[feedKey]
+		status.FeedKey = feedKey
+		status.Name = trimmed
+		status.Type = string(feedKindLegacy)
+		status.URL = trimmed
+		status.AutoUpdateEnabled = true
+		statuses = append(statuses, status)
+	}
+
+	for _, txtCfg := range cfg.TXTSubscriptions {
+		trimmed := strings.TrimSpace(txtCfg.URL)
+		if trimmed == "" {
+			continue
+		}
+		normalizedURL := txtsub.NormalizeSourceURL(trimmed)
+		feedKey := txtsub.BuildFeedKey(txtsub.FeedKindTXT, normalizedURL)
+		status := existingByKey[feedKey]
+		status.FeedKey = feedKey
+		status.Name = strings.TrimSpace(txtCfg.Name)
+		if status.Name == "" {
+			status.Name = trimmed
+		}
+		status.Type = string(feedKindTXT)
+		status.URL = trimmed
+		status.AutoUpdateEnabled = txtCfg.AutoUpdateEnabled
+		statuses = append(statuses, status)
+	}
+
+	return statuses
 }
 
 // currentInterval returns the configured refresh interval (acquires read lock).
@@ -291,9 +433,9 @@ func (m *Manager) currentIntervalLocked() time.Duration {
 }
 
 // doRefresh performs a single refresh operation.
-// It fetches subscription nodes and persists them to the SQLite Store,
-// then reloads the config. Manual nodes are preserved in the Store.
-func (m *Manager) doRefresh() {
+// It fetches configured feeds, updates their nodes in the SQLite Store,
+// then triggers a runtime reload.
+func (m *Manager) doRefresh(includeDisabledTXT bool) {
 	// Prevent concurrent refreshes
 	if !m.refreshMu.TryLock() {
 		m.logger.Warnf("refresh already in progress, skipping")
@@ -314,41 +456,69 @@ func (m *Manager) doRefresh() {
 
 	m.logger.Infof("starting subscription refresh")
 
-	// Fetch nodes from all subscriptions
-	nodes, err := m.fetchAllSubscriptions()
-	if err != nil {
-		m.logger.Errorf("fetch subscriptions failed: %v", err)
+	m.mu.RLock()
+	cfgSnapshot := m.baseCfg.Clone()
+	previousFeedStatuses := make([]monitor.SubscriptionFeedStatus, len(m.status.Feeds))
+	copy(previousFeedStatuses, m.status.Feeds)
+	m.mu.RUnlock()
+
+	feeds := m.collectFeedRequests(includeDisabledTXT)
+	feedStatuses := buildConfiguredFeedStatuses(cfgSnapshot, previousFeedStatuses)
+	feedStatusIndex := make(map[string]int, len(feedStatuses))
+	for idx := range feedStatuses {
+		feedStatusIndex[feedStatuses[idx].FeedKey] = idx
+	}
+	if len(feeds) == 0 {
 		m.mu.Lock()
-		m.status.LastError = err.Error()
+		m.status.LastError = "no subscriptions configured"
 		m.status.LastRefresh = time.Now()
+		m.status.Feeds = feedStatuses
 		m.mu.Unlock()
 		return
 	}
 
-	if len(nodes) == 0 {
-		m.logger.Warnf("no nodes fetched from subscriptions")
+	if m.store == nil {
 		m.mu.Lock()
-		m.status.LastError = "no nodes fetched"
+		m.status.LastError = "store not available"
 		m.status.LastRefresh = time.Now()
+		m.status.Feeds = feedStatuses
 		m.mu.Unlock()
 		return
 	}
 
-	m.logger.Infof("fetched %d nodes from subscriptions", len(nodes))
+	updatedFeeds := 0
+	var lastErr string
 
-	// Persist subscription nodes to Store (replace old subscription nodes)
-	if m.store != nil {
-		// Delete old subscription nodes
-		deleted, err := m.store.DeleteNodesBySource(m.ctx, store.NodeSourceSubscription)
+	for _, feed := range feeds {
+		fetched, err := m.fetchFeedNodes(feed)
+		statusIdx, hasStatus := feedStatusIndex[feed.FeedKey]
 		if err != nil {
-			m.logger.Warnf("failed to delete old subscription nodes from store: %v", err)
-		} else if deleted > 0 {
-			m.logger.Infof("deleted %d old subscription nodes from store", deleted)
+			m.logger.Warnf("failed to refresh %s feed %q: %v", feed.Kind, feed.NormalizedURL, err)
+			lastErr = err.Error()
+			if hasStatus {
+				feedStatuses[statusIdx].LastError = err.Error()
+			}
+			continue
+		}
+		if len(fetched.Nodes) == 0 {
+			lastErr = fmt.Sprintf("feed %q returned no valid nodes", feed.NormalizedURL)
+			if hasStatus {
+				feedStatuses[statusIdx].LastError = lastErr
+				feedStatuses[statusIdx].SkippedLines = fetched.SkippedLines
+			}
+			continue
 		}
 
-		// Insert new subscription nodes
-		var storeNodes []store.Node
-		for _, n := range nodes {
+		if _, err := m.store.DeleteNodesByFeedKey(m.ctx, feed.FeedKey); err != nil {
+			lastErr = fmt.Sprintf("delete old nodes for %s: %v", feed.FeedKey, err)
+			if hasStatus {
+				feedStatuses[statusIdx].LastError = lastErr
+			}
+			continue
+		}
+
+		storeNodes := make([]store.Node, 0, len(fetched.Nodes))
+		for _, n := range fetched.Nodes {
 			name := strings.TrimSpace(n.Name)
 			uri := strings.TrimSpace(n.URI)
 			if name == "" {
@@ -364,39 +534,42 @@ func (m *Manager) doRefresh() {
 				name = fmt.Sprintf("sub-node-%d", len(storeNodes)+1)
 			}
 			storeNodes = append(storeNodes, store.Node{
-				URI:     uri,
-				Name:    name,
-				Source:  store.NodeSourceSubscription,
-				Enabled: true,
+				URI:      uri,
+				Name:     name,
+				Source:   string(n.Source),
+				FeedKey:  feed.FeedKey,
+				Port:     n.Port,
+				Username: n.Username,
+				Password: n.Password,
+				Enabled:  true,
 			})
 		}
 		if err := m.store.BulkUpsertNodes(m.ctx, storeNodes); err != nil {
-			m.logger.Errorf("failed to save subscription nodes to store: %v", err)
-			m.mu.Lock()
-			m.status.LastError = fmt.Sprintf("save to store: %v", err)
-			m.status.LastRefresh = time.Now()
-			m.mu.Unlock()
-			return
+			lastErr = fmt.Sprintf("save feed %s: %v", feed.FeedKey, err)
+			if hasStatus {
+				feedStatuses[statusIdx].LastError = lastErr
+			}
+			continue
 		}
-		m.logger.Infof("saved %d subscription nodes to store", len(storeNodes))
-	} else {
-		m.logger.Errorf("store is not available, cannot persist subscription nodes")
+		if hasStatus {
+			feedStatuses[statusIdx].LastRefresh = time.Now()
+			feedStatuses[statusIdx].LastError = ""
+			feedStatuses[statusIdx].ValidNodes = fetched.ValidNodes
+			feedStatuses[statusIdx].SkippedLines = fetched.SkippedLines
+		}
+		updatedFeeds++
+	}
+
+	if updatedFeeds == 0 {
 		m.mu.Lock()
-		m.status.LastError = "store not available"
+		m.status.LastError = lastErr
 		m.status.LastRefresh = time.Now()
+		m.status.Feeds = feedStatuses
 		m.mu.Unlock()
 		return
 	}
 
-	// Get current port mapping to preserve existing node ports
-	portMap := m.boxMgr.CurrentPortMap()
-
-	// Create new config with updated subscription nodes + preserved manual nodes
-	newCfg := m.createNewConfig(nodes)
-
-	// Trigger BoxManager reload with port preservation
-	if err := m.boxMgr.ReloadWithPortMap(newCfg, portMap); err != nil {
-		m.logger.Errorf("reload failed: %v", err)
+	if err := m.boxMgr.TriggerReload(m.ctx); err != nil {
 		m.mu.Lock()
 		m.status.LastError = err.Error()
 		m.status.LastRefresh = time.Now()
@@ -404,15 +577,19 @@ func (m *Manager) doRefresh() {
 		return
 	}
 
-	// Count total nodes including manual
-	totalNodes := len(newCfg.Nodes)
+	enabled := true
+	totalNodes, err := m.store.CountNodes(m.ctx, store.NodeFilter{Enabled: &enabled})
+	if err != nil {
+		m.logger.Warnf("failed to count nodes after refresh: %v", err)
+	}
 	m.mu.Lock()
 	m.status.LastRefresh = time.Now()
-	m.status.NodeCount = totalNodes
+	m.status.NodeCount = int(totalNodes)
 	m.status.LastError = ""
+	m.status.Feeds = feedStatuses
 	m.mu.Unlock()
 
-	m.logger.Infof("subscription refresh completed, %d total nodes active (%d from subscription)", totalNodes, len(nodes))
+	m.logger.Infof("subscription refresh completed, %d feeds updated, %d total nodes active", updatedFeeds, totalNodes)
 }
 
 // OnConfigUpdate is called by boxmgr after a successful reload.
@@ -476,6 +653,102 @@ func (m *Manager) fetchAllSubscriptions() ([]config.NodeConfig, error) {
 	return allNodes, nil
 }
 
+func (m *Manager) fetchFeedNodes(feed feedRequest) (feedFetchResult, error) {
+	switch feed.Kind {
+	case feedKindLegacy:
+		nodes, err := m.fetchSubscription(feed.URL, m.baseCfg.SubscriptionRefresh.Timeout)
+		if err != nil {
+			return feedFetchResult{}, err
+		}
+		for idx := range nodes {
+			nodes[idx].Source = config.NodeSourceSubscription
+			nodes[idx].FeedKey = feed.FeedKey
+		}
+		return feedFetchResult{Nodes: nodes, ValidNodes: len(nodes)}, nil
+	case feedKindTXT:
+		return m.fetchTXTSubscription(feed)
+	default:
+		return feedFetchResult{}, fmt.Errorf("unsupported feed kind %q", feed.Kind)
+	}
+}
+
+func (m *Manager) RefreshFeed(feedKey string) error {
+	feed, err := m.findTXTFeedRequestByFeedKey(strings.TrimSpace(feedKey))
+	if err != nil {
+		return err
+	}
+
+	if !m.refreshMu.TryLock() {
+		return fmt.Errorf("refresh already in progress")
+	}
+	defer m.refreshMu.Unlock()
+
+	m.mu.Lock()
+	m.status.IsRefreshing = true
+	m.mu.Unlock()
+	defer func() {
+		m.mu.Lock()
+		m.status.IsRefreshing = false
+		m.status.RefreshCount++
+		m.mu.Unlock()
+	}()
+
+	fetched, err := m.fetchFeedNodes(feed)
+	if err != nil {
+		return err
+	}
+	if len(fetched.Nodes) == 0 {
+		return fmt.Errorf("feed %q returned no valid nodes", feed.NormalizedURL)
+	}
+
+	if m.store == nil {
+		return fmt.Errorf("store not available")
+	}
+
+	if _, err := m.store.DeleteNodesByFeedKey(m.ctx, feed.FeedKey); err != nil {
+		return err
+	}
+
+	storeNodes := make([]store.Node, 0, len(fetched.Nodes))
+	for _, n := range fetched.Nodes {
+		storeNodes = append(storeNodes, store.Node{
+			URI:      n.URI,
+			Name:     n.Name,
+			Source:   string(n.Source),
+			FeedKey:  n.FeedKey,
+			Port:     n.Port,
+			Username: n.Username,
+			Password: n.Password,
+			Enabled:  true,
+		})
+	}
+	if err := m.store.BulkUpsertNodes(m.ctx, storeNodes); err != nil {
+		return err
+	}
+
+	if err := m.boxMgr.TriggerReload(m.ctx); err != nil {
+		return err
+	}
+
+	status := m.Status()
+	for idx := range status.Feeds {
+		if status.Feeds[idx].FeedKey == feed.FeedKey {
+			status.Feeds[idx].LastRefresh = time.Now()
+			status.Feeds[idx].LastError = ""
+			status.Feeds[idx].ValidNodes = fetched.ValidNodes
+			status.Feeds[idx].SkippedLines = fetched.SkippedLines
+		}
+	}
+
+	m.mu.Lock()
+	m.status.LastRefresh = time.Now()
+	m.status.LastError = ""
+	m.status.Feeds = status.Feeds
+	m.mu.Unlock()
+
+	return nil
+}
+
 // fetchSubscription fetches and parses a single subscription URL.
 func (m *Manager) fetchSubscription(subURL string, timeout time.Duration) ([]config.NodeConfig, error) {
 	ctx, cancel := context.WithTimeout(m.ctx, timeout)
@@ -510,6 +783,58 @@ func (m *Manager) fetchSubscription(subURL string, timeout time.Duration) ([]con
 	}
 
 	return parseSubscriptionContent(string(body))
+}
+
+func (m *Manager) fetchTXTSubscription(feed feedRequest) (feedFetchResult, error) {
+	timeout := m.baseCfg.SubscriptionRefresh.Timeout
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+
+	ctx, cancel := context.WithTimeout(m.ctx, timeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, "GET", feed.NormalizedURL, nil)
+	if err != nil {
+		return feedFetchResult{}, fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+	req.Header.Set("Accept", "*/*")
+
+	resp, err := m.httpClient.Do(req)
+	if err != nil {
+		return feedFetchResult{}, fmt.Errorf("fetch txt subscription: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return feedFetchResult{}, fmt.Errorf("status %d", resp.StatusCode)
+	}
+
+	const maxBodySize = 10 * 1024 * 1024
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBodySize))
+	if err != nil {
+		return feedFetchResult{}, fmt.Errorf("read body: %w", err)
+	}
+
+	result, err := txtsub.ParseContent(string(body), feed.Name, feed.DefaultProtocol)
+	if err != nil {
+		return feedFetchResult{}, err
+	}
+	nodes := make([]config.NodeConfig, 0, len(result.Entries))
+	for _, entry := range result.Entries {
+		nodes = append(nodes, config.NodeConfig{
+			Name:    entry.Name,
+			URI:     entry.URI,
+			Source:  config.NodeSourceTXTSubscription,
+			FeedKey: feed.FeedKey,
+		})
+	}
+	return feedFetchResult{
+		Nodes:        nodes,
+		ValidNodes:   len(nodes),
+		SkippedLines: result.SkippedLines,
+	}, nil
 }
 
 // createNewConfig creates a new config with updated subscription nodes while

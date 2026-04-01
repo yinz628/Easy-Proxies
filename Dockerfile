@@ -37,7 +37,7 @@ COPY --from=builder /src/easy-proxies /usr/local/bin/easy-proxies
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 COPY --chown=easy:easy config.example.yaml /etc/easy-proxies/config.yaml
-# Pool/Hybrid mode: 2323, Management: 9091, Multi-port/Hybrid mode: 24000-24200
-EXPOSE 2323 9091 24000-24200
+# Pool/Hybrid mode: 2323, Management: 9888, Multi-port/Hybrid mode: 24000-24200
+EXPOSE 2323 9888 24000-24200
 ENTRYPOINT ["docker-entrypoint.sh"]
 CMD ["--config", "/etc/easy-proxies/config.yaml"]

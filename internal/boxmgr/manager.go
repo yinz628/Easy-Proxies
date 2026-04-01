@@ -601,6 +601,7 @@ func (m *Manager) ListConfigNodes(ctx context.Context) ([]config.NodeConfig, err
 			Username: n.Username,
 			Password: n.Password,
 			Source:   config.NodeSource(n.Source),
+			FeedKey:  n.FeedKey,
 			Disabled: !n.Enabled,
 		})
 	}
@@ -637,6 +638,7 @@ func (m *Manager) CreateNode(ctx context.Context, node config.NodeConfig) (confi
 			URI:      normalized.URI,
 			Name:     normalized.Name,
 			Source:   string(normalized.Source),
+			FeedKey:  normalized.FeedKey,
 			Port:     normalized.Port,
 			Username: normalized.Username,
 			Password: normalized.Password,
@@ -679,6 +681,7 @@ func (m *Manager) UpdateNode(ctx context.Context, name string, node config.NodeC
 
 	// Preserve the original source
 	normalized.Source = m.cfg.Nodes[idx].Source
+	normalized.FeedKey = m.cfg.Nodes[idx].FeedKey
 
 	// Persist to Store if available
 	if m.store != nil {
@@ -689,6 +692,7 @@ func (m *Manager) UpdateNode(ctx context.Context, name string, node config.NodeC
 		if existing != nil {
 			existing.URI = normalized.URI
 			existing.Name = normalized.Name
+			existing.FeedKey = normalized.FeedKey
 			existing.Port = normalized.Port
 			existing.Username = normalized.Username
 			existing.Password = normalized.Password
@@ -859,6 +863,7 @@ func (m *Manager) TriggerReload(ctx context.Context) error {
 					Username: n.Username,
 					Password: n.Password,
 					Source:   config.NodeSource(n.Source),
+					FeedKey:  n.FeedKey,
 				})
 			}
 			m.logger.Infof("merged nodes for reload: %d inline + store nodes = %d total", len(inlineURIs), len(newCfg.Nodes))

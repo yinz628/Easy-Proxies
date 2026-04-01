@@ -107,6 +107,18 @@ cp ./config.example.yaml ./config.yaml
 - `management.password`: 面板登录密码（为空则不需要登录）
 - `subscriptions` / `nodes_file` / `nodes`: 节点来源（三选一或混用）
 
+### TXT 代理订阅
+
+项目额外支持 `txt_subscriptions`，适用于 GitHub TXT 代理列表或普通 TXT 代理地址列表。
+
+- 支持 GitHub `blob` 链接，程序会自动转换为 `raw` 地址
+- 支持每行已经带协议的格式，例如 `http://1.0.170.50:80`
+- 支持每行只有 `ip:port` 的格式，例如 `1.0.171.213:8080`
+- 对于 `ip:port` 格式，需要在该 TXT 订阅上配置 `default_protocol`，可选 `http` / `https` / `socks5`
+- 每个 TXT 订阅都可以单独设置 `auto_update_enabled`，决定它是否参与自动更新
+
+示例配置请查看 `config.example.yaml` 中的 `txt_subscriptions` 注释块。
+
 ---
 
 ## 🧪 从源码构建（开发者）

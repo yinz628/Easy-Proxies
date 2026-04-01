@@ -125,6 +125,7 @@ export interface SettingsData {
 
   // Subscriptions
   subscriptions: string[]
+  txt_subscriptions: TXTSubscriptionConfig[]
 }
 
 export interface SettingsUpdateResponse {
@@ -173,6 +174,25 @@ export interface ConfigNodeMutationResponse {
   message: string
 }
 
+export interface TXTSubscriptionConfig {
+  name: string
+  url: string
+  default_protocol: 'http' | 'https' | 'socks5'
+  auto_update_enabled: boolean
+}
+
+export interface SubscriptionFeedStatus {
+  feed_key: string
+  name: string
+  type: 'legacy' | 'txt'
+  url: string
+  auto_update_enabled: boolean
+  last_refresh?: string
+  last_error?: string
+  valid_nodes?: number
+  skipped_lines?: number
+}
+
 // ---- Subscription types ----
 
 export interface SubscriptionStatus {
@@ -185,6 +205,7 @@ export interface SubscriptionStatus {
   refresh_count?: number
   is_refreshing?: boolean
   message?: string
+  feeds?: SubscriptionFeedStatus[]
 }
 
 // ---- SSE Probe types ----

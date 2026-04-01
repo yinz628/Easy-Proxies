@@ -170,6 +170,7 @@ func loadNodesFromStore(ctx context.Context, cfg *config.Config, s store.Store) 
 			Username: n.Username,
 			Password: n.Password,
 			Source:   config.NodeSource(n.Source),
+			FeedKey:  n.FeedKey,
 		})
 	}
 
@@ -194,6 +195,7 @@ func seedStoreFromConfig(ctx context.Context, cfg *config.Config, s store.Store)
 			URI:      n.URI,
 			Name:     n.Name,
 			Source:   source,
+			FeedKey:  n.FeedKey,
 			Port:     n.Port,
 			Username: n.Username,
 			Password: n.Password,

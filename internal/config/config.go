@@ -16,6 +16,8 @@ import (
 	"syscall"
 	"time"
 
+	"easy_proxies/internal/txtsub"
+
 	"gopkg.in/yaml.v3"
 )
 
@@ -31,6 +33,7 @@ type Config struct {
 	SubscriptionRefresh SubscriptionRefreshConfig `yaml:"subscription_refresh"`
 	GeoIP               GeoIPConfig               `yaml:"geoip"`
 	Nodes               []NodeConfig              `yaml:"nodes"`
+	TXTSubscriptions    []TXTSubscriptionConfig   `yaml:"txt_subscriptions"`
 	NodesFile           string                    `yaml:"nodes_file"`    // 节点文件路径，每行一个 URI
 	Subscriptions       []string                  `yaml:"subscriptions"` // 订阅链接列表
 	ExternalIP          string                    `yaml:"external_ip"`   // 外部 IP 地址，用于导出时替换 0.0.0.0
@@ -76,6 +79,13 @@ type MultiPortConfig struct {
 	Password string `yaml:"password"`
 }
 
+type TXTSubscriptionConfig struct {
+	Name              string `yaml:"name" json:"name"`
+	URL               string `yaml:"url" json:"url"`
+	DefaultProtocol   string `yaml:"default_protocol" json:"default_protocol"`
+	AutoUpdateEnabled bool   `yaml:"auto_update_enabled" json:"auto_update_enabled"`
+}
+
 // ManagementConfig controls the monitoring HTTP endpoint.
 type ManagementConfig struct {
 	Enabled             *bool         `yaml:"enabled"`
@@ -103,6 +113,7 @@ const (
 	NodeSourceFile         NodeSource = "nodes_file"   // Loaded from external nodes file
 	NodeSourceSubscription NodeSource = "subscription" // Fetched from subscription URL
 	NodeSourceManual       NodeSource = "manual"       // Added manually via WebUI
+	NodeSourceTXTSubscription NodeSource = "txt_subscription"
 )
 
 const (
@@ -122,6 +133,7 @@ var supportedProxyURISchemes = []string{
 	"hy2://",
 	"anytls://",
 	"http://",
+	"https://",
 	"socks5://",
 }
 
@@ -149,6 +161,7 @@ type NodeConfig struct {
 	Password string     `yaml:"password,omitempty" json:"password,omitempty"`
 	Source   NodeSource `yaml:"-" json:"source,omitempty"`   // Runtime only, not persisted in YAML
 	Disabled bool       `yaml:"-" json:"disabled,omitempty"` // Runtime only, not persisted in YAML; true = node is disabled
+	FeedKey  string     `yaml:"-" json:"feed_key,omitempty"`
 }
 
 // NodeKey returns a unique identifier for the node based on its URI.
@@ -262,7 +275,7 @@ func (c *Config) applyDefaults() error {
 		c.MultiPort.Address = "0.0.0.0"
 	}
 	if c.MultiPort.BasePort == 0 {
-		c.MultiPort.BasePort = 28000
+		c.MultiPort.BasePort = 24000
 	}
 	if c.MultiPort.Protocol == "" {
 		c.MultiPort.Protocol = InboundProtocolHTTP
@@ -273,10 +286,10 @@ func (c *Config) applyDefaults() error {
 	}
 	c.MultiPort.Protocol = multiPortProtocol
 	if c.Management.Listen == "" {
-		c.Management.Listen = "127.0.0.1:9090"
+		c.Management.Listen = "0.0.0.0:9888"
 	}
 	if c.Management.ProbeTarget == "" {
-		c.Management.ProbeTarget = "www.apple.com:80"
+		c.Management.ProbeTarget = "http://cp.cloudflare.com/generate_204"
 	}
 	if c.Management.Enabled == nil {
 		defaultEnabled := true
@@ -305,6 +318,14 @@ func (c *Config) applyDefaults() error {
 
 	if c.LogLevel == "" {
 		c.LogLevel = "info"
+	}
+
+	for idx := range c.TXTSubscriptions {
+		c.TXTSubscriptions[idx].Name = strings.TrimSpace(c.TXTSubscriptions[idx].Name)
+		c.TXTSubscriptions[idx].URL = strings.TrimSpace(c.TXTSubscriptions[idx].URL)
+		if strings.TrimSpace(c.TXTSubscriptions[idx].DefaultProtocol) == "" {
+			c.TXTSubscriptions[idx].DefaultProtocol = string(txtsub.DefaultProtocolHTTP)
+		}
 	}
 
 	return nil
@@ -355,12 +376,30 @@ func (c *Config) normalizeInternal(skipSubscriptionFetch bool) error {
 					continue
 				}
 				log.Printf("✅ Loaded %d nodes from subscription", len(nodes))
+				feedKey := txtsub.BuildFeedKey(txtsub.FeedKindLegacy, strings.TrimSpace(subURL))
+				for idx := range nodes {
+					nodes[idx].FeedKey = feedKey
+				}
 				subNodes = append(subNodes, nodes...)
 			}
 			for idx := range subNodes {
 				subNodes[idx].Source = NodeSourceSubscription
 			}
 			c.Nodes = append(c.Nodes, subNodes...)
+		}
+
+		// Load nodes from TXT proxy subscriptions.
+		if len(c.TXTSubscriptions) > 0 {
+			txtTimeout := c.SubscriptionRefresh.Timeout
+			for _, txtCfg := range c.TXTSubscriptions {
+				nodes, err := loadNodesFromTXTSubscription(txtCfg, txtTimeout)
+				if err != nil {
+					log.Printf("⚠️ Failed to load TXT subscription %q: %v (skipping)", txtCfg.URL, err)
+					continue
+				}
+				log.Printf("✅ Loaded %d nodes from TXT subscription %q", len(nodes), txtCfg.Name)
+				c.Nodes = append(c.Nodes, nodes...)
+			}
 		}
 	}
 
@@ -608,6 +647,57 @@ func loadNodesFromSubscription(subURL string, timeout time.Duration) ([]NodeConf
 
 	// Try to detect and parse different formats
 	return parseSubscriptionContent(content)
+}
+
+func loadNodesFromTXTSubscription(cfg TXTSubscriptionConfig, timeout time.Duration) ([]NodeConfig, error) {
+	protocol, err := txtsub.NormalizeDefaultProtocol(cfg.DefaultProtocol)
+	if err != nil {
+		return nil, err
+	}
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+
+	normalizedURL := txtsub.NormalizeSourceURL(cfg.URL)
+	client := &http.Client{Timeout: timeout}
+	req, err := http.NewRequest("GET", normalizedURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+	req.Header.Set("Accept", "*/*")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("fetch txt subscription: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("txt subscription returned status %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read response: %w", err)
+	}
+
+	result, err := txtsub.ParseContent(string(body), cfg.Name, protocol)
+	if err != nil {
+		return nil, fmt.Errorf("parse txt subscription: %w", err)
+	}
+
+	nodes := make([]NodeConfig, 0, len(result.Entries))
+	feedKey := txtsub.BuildFeedKey(txtsub.FeedKindTXT, normalizedURL)
+	for _, entry := range result.Entries {
+		nodes = append(nodes, NodeConfig{
+			Name:    entry.Name,
+			URI:     entry.URI,
+			Source:  NodeSourceTXTSubscription,
+			FeedKey: feedKey,
+		})
+	}
+	return nodes, nil
 }
 
 // parseSubscriptionContent tries to parse subscription content in various formats (optimized)
@@ -994,6 +1084,10 @@ func (c *Config) Clone() *Config {
 		cloned.Subscriptions = make([]string, len(c.Subscriptions))
 		copy(cloned.Subscriptions, c.Subscriptions)
 	}
+	if c.TXTSubscriptions != nil {
+		cloned.TXTSubscriptions = make([]TXTSubscriptionConfig, len(c.TXTSubscriptions))
+		copy(cloned.TXTSubscriptions, c.TXTSubscriptions)
+	}
 	return &cloned
 }
 
@@ -1065,6 +1159,7 @@ func (c *Config) SaveSettings() error {
 
 	// Subscriptions
 	saveCfg.Subscriptions = c.Subscriptions
+	saveCfg.TXTSubscriptions = c.TXTSubscriptions
 
 	newData, err := yaml.Marshal(&saveCfg)
 	if err != nil {

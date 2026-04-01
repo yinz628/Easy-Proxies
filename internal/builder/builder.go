@@ -355,6 +355,12 @@ func buildNodeOutbound(tag, rawURI string, skipCertVerify bool) (option.Outbound
 			return option.Outbound{}, err
 		}
 		return option.Outbound{Type: C.TypeHTTP, Tag: tag, Options: &opts}, nil
+	case "https":
+		opts, err := buildHTTPSOptions(parsed, skipCertVerify)
+		if err != nil {
+			return option.Outbound{}, err
+		}
+		return option.Outbound{Type: C.TypeHTTP, Tag: tag, Options: &opts}, nil
 	case "socks5":
 		opts, err := buildSOCKSOptions(parsed)
 		if err != nil {
@@ -400,6 +406,14 @@ func buildNodeOutbound(tag, rawURI string, skipCertVerify bool) (option.Outbound
 	default:
 		return option.Outbound{}, fmt.Errorf("unsupported scheme %q", parsed.Scheme)
 	}
+}
+
+func buildHTTPSOptions(u *url.URL, skipCertVerify bool) (option.HTTPOutboundOptions, error) {
+	copyURL := *u
+	query := copyURL.Query()
+	query.Set("security", "tls")
+	copyURL.RawQuery = query.Encode()
+	return buildHTTPOptions(&copyURL, skipCertVerify)
 }
 
 func buildHTTPOptions(u *url.URL, skipCertVerify bool) (option.HTTPOutboundOptions, error) {

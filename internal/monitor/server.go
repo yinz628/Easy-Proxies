@@ -20,6 +20,7 @@ import (
 
 	"easy_proxies/internal/config"
 	"easy_proxies/internal/store"
+	"easy_proxies/internal/txtsub"
 
 	"golang.org/x/sync/semaphore"
 )
@@ -54,20 +55,34 @@ var (
 // SubscriptionRefresher interface for subscription manager.
 type SubscriptionRefresher interface {
 	RefreshNow() error
+	RefreshFeed(feedKey string) error
 	Status() SubscriptionStatus
+}
+
+type SubscriptionFeedStatus struct {
+	FeedKey           string    `json:"feed_key"`
+	Name              string    `json:"name"`
+	Type              string    `json:"type"`
+	URL               string    `json:"url"`
+	AutoUpdateEnabled bool      `json:"auto_update_enabled"`
+	LastRefresh       time.Time `json:"last_refresh"`
+	LastError         string    `json:"last_error,omitempty"`
+	ValidNodes        int       `json:"valid_nodes"`
+	SkippedLines      int       `json:"skipped_lines"`
 }
 
 // SubscriptionStatus represents subscription refresh status.
 type SubscriptionStatus struct {
-	Enabled          bool      `json:"enabled"`           // Whether auto-refresh is enabled in config
-	HasSubscriptions bool      `json:"has_subscriptions"` // Whether subscription URLs are configured
-	LastRefresh      time.Time `json:"last_refresh"`
-	NextRefresh      time.Time `json:"next_refresh"`
-	NodeCount        int       `json:"node_count"`
-	LastError        string    `json:"last_error,omitempty"`
-	RefreshCount     int       `json:"refresh_count"`
-	IsRefreshing     bool      `json:"is_refreshing"`
-	NodesModified    bool      `json:"nodes_modified"` // True if nodes were modified since last refresh
+	Enabled          bool                     `json:"enabled"`           // Whether auto-refresh is enabled in config
+	HasSubscriptions bool                     `json:"has_subscriptions"` // Whether subscription URLs are configured
+	LastRefresh      time.Time                `json:"last_refresh"`
+	NextRefresh      time.Time                `json:"next_refresh"`
+	NodeCount        int                      `json:"node_count"`
+	LastError        string                   `json:"last_error,omitempty"`
+	RefreshCount     int                      `json:"refresh_count"`
+	IsRefreshing     bool                     `json:"is_refreshing"`
+	NodesModified    bool                     `json:"nodes_modified"` // True if nodes were modified since last refresh
+	Feeds            []SubscriptionFeedStatus `json:"feeds,omitempty"`
 }
 
 // Server exposes HTTP endpoints for monitoring.
@@ -139,6 +154,7 @@ func NewServer(cfg Config, mgr *Manager, logger *log.Logger) *Server {
 	mux.HandleFunc("/api/import", s.withAuth(s.handleImport))
 	mux.HandleFunc("/api/subscription/status", s.withAuth(s.handleSubscriptionStatus))
 	mux.HandleFunc("/api/subscription/refresh", s.withAuth(s.handleSubscriptionRefresh))
+	mux.HandleFunc("/api/subscription/refresh-feed", s.withAuth(s.handleSubscriptionRefreshFeed))
 	mux.HandleFunc("/api/reload", s.withAuth(s.handleReload))
 
 	// Default handler for static assets (React App)
@@ -234,7 +250,8 @@ type allSettingsResponse struct {
 	GeoIPAutoUpdateInterval string `json:"geoip_auto_update_interval"`
 
 	// Subscriptions
-	Subscriptions []string `json:"subscriptions"`
+	Subscriptions    []string                     `json:"subscriptions"`
+	TXTSubscriptions []config.TXTSubscriptionConfig `json:"txt_subscriptions"`
 }
 
 // allSettingsRequest is the JSON structure for PUT /api/settings.
@@ -286,7 +303,8 @@ type allSettingsRequest struct {
 	GeoIPAutoUpdateInterval string `json:"geoip_auto_update_interval"`
 
 	// Subscriptions
-	Subscriptions []string `json:"subscriptions"`
+	Subscriptions    []string                     `json:"subscriptions"`
+	TXTSubscriptions []config.TXTSubscriptionConfig `json:"txt_subscriptions"`
 }
 
 // getAllSettings reads all config fields into a flat response (thread-safe).
@@ -346,7 +364,8 @@ func (s *Server) getAllSettings() allSettingsResponse {
 		GeoIPAutoUpdateEnabled:  c.GeoIP.AutoUpdateEnabled,
 		GeoIPAutoUpdateInterval: c.GeoIP.AutoUpdateInterval.String(),
 
-		Subscriptions: c.Subscriptions,
+		Subscriptions:    c.Subscriptions,
+		TXTSubscriptions: c.TXTSubscriptions,
 	}
 }
 
@@ -443,6 +462,27 @@ func (s *Server) updateAllSettings(req allSettingsRequest) error {
 
 	// Subscriptions
 	c.Subscriptions = req.Subscriptions
+	txtSubscriptions := make([]config.TXTSubscriptionConfig, 0, len(req.TXTSubscriptions))
+	for idx, txtCfg := range req.TXTSubscriptions {
+		urlValue := strings.TrimSpace(txtCfg.URL)
+		if urlValue == "" {
+			return fmt.Errorf("txt_subscriptions[%d].url cannot be empty", idx)
+		}
+		protocol := strings.TrimSpace(txtCfg.DefaultProtocol)
+		if protocol == "" {
+			protocol = string(txtsub.DefaultProtocolHTTP)
+		}
+		if _, err := txtsub.NormalizeDefaultProtocol(protocol); err != nil {
+			return fmt.Errorf("txt_subscriptions[%d].default_protocol: %w", idx, err)
+		}
+		txtSubscriptions = append(txtSubscriptions, config.TXTSubscriptionConfig{
+			Name:              strings.TrimSpace(txtCfg.Name),
+			URL:               urlValue,
+			DefaultProtocol:   protocol,
+			AutoUpdateEnabled: txtCfg.AutoUpdateEnabled,
+		})
+	}
+	c.TXTSubscriptions = txtSubscriptions
 
 	// Sync ALL monitor-level config fields for runtime effect
 	s.cfg.ExternalIP = c.ExternalIP
@@ -1120,12 +1160,13 @@ func (s *Server) handleSubscriptionStatus(w http.ResponseWriter, r *http.Request
 		resp := map[string]any{
 			"enabled":           false,
 			"has_subscriptions": false,
+			"feeds":             []SubscriptionFeedStatus{},
 			"message":           "订阅管理器未初始化",
 		}
 		if c != nil {
 			c.RLock()
 			resp["enabled"] = c.SubscriptionRefresh.Enabled
-			resp["has_subscriptions"] = len(c.Subscriptions) > 0
+			resp["has_subscriptions"] = len(c.Subscriptions) > 0 || len(c.TXTSubscriptions) > 0
 			c.RUnlock()
 		}
 		writeJSON(w, resp)
@@ -1142,6 +1183,7 @@ func (s *Server) handleSubscriptionStatus(w http.ResponseWriter, r *http.Request
 		"last_error":        status.LastError,
 		"refresh_count":     status.RefreshCount,
 		"is_refreshing":     status.IsRefreshing,
+		"feeds":             status.Feeds,
 	})
 }
 
@@ -1168,6 +1210,44 @@ func (s *Server) handleSubscriptionRefresh(w http.ResponseWriter, r *http.Reques
 	writeJSON(w, map[string]any{
 		"message":    "刷新成功",
 		"node_count": status.NodeCount,
+	})
+}
+
+func (s *Server) handleSubscriptionRefreshFeed(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	if s.subRefresher == nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		writeJSON(w, map[string]any{"error": "订阅管理器未初始化，请重启程序"})
+		return
+	}
+
+	var req struct {
+		FeedKey string `json:"feed_key"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		writeJSON(w, map[string]any{"error": "请求格式错误"})
+		return
+	}
+	if strings.TrimSpace(req.FeedKey) == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		writeJSON(w, map[string]any{"error": "feed_key 不能为空"})
+		return
+	}
+
+	if err := s.subRefresher.RefreshFeed(req.FeedKey); err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		writeJSON(w, map[string]any{"error": err.Error()})
+		return
+	}
+
+	writeJSON(w, map[string]any{
+		"message":  "单源刷新成功",
+		"feed_key": req.FeedKey,
 	})
 }
 

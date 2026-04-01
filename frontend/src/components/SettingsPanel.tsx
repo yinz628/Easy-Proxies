@@ -1,6 +1,6 @@
-import { useState, useEffect, useCallback } from 'react'
-import type { SettingsData, SubscriptionStatus } from '../types'
-import { fetchSettings, updateSettings, triggerReload, fetchSubscriptionStatus, refreshSubscription } from '../api/client'
+import { useState, useEffect, useCallback, useMemo } from 'react'
+import type { SettingsData, SubscriptionStatus, TXTSubscriptionConfig } from '../types'
+import { fetchSettings, updateSettings, triggerReload, fetchSubscriptionStatus, refreshSubscription, refreshSubscriptionFeed } from '../api/client'
 
 const defaultSettings: SettingsData = {
   mode: 'pool',
@@ -25,8 +25,8 @@ const defaultSettings: SettingsData = {
   pool_blacklist_duration: '24h0m0s',
 
   management_enabled: true,
-  management_listen: '0.0.0.0:9090',
-  management_probe_target: '',
+  management_listen: '0.0.0.0:9888',
+  management_probe_target: 'http://cp.cloudflare.com/generate_204',
   management_password: '',
   management_health_check_interval: '2h0m0s',
 
@@ -43,6 +43,7 @@ const defaultSettings: SettingsData = {
   geoip_auto_update_interval: '24h0m0s',
 
   subscriptions: [],
+  txt_subscriptions: [],
 }
 
 export default function SettingsPanel() {
@@ -59,9 +60,16 @@ export default function SettingsPanel() {
   // Subscription status
   const [subStatus, setSubStatus] = useState<SubscriptionStatus | null>(null)
   const [subRefreshing, setSubRefreshing] = useState(false)
+  const [refreshingFeedKey, setRefreshingFeedKey] = useState<string | null>(null)
 
   // New subscription input
   const [newSubUrl, setNewSubUrl] = useState('')
+  const [newTxtSubscription, setNewTxtSubscription] = useState<TXTSubscriptionConfig>({
+    name: '',
+    url: '',
+    default_protocol: 'http',
+    auto_update_enabled: true,
+  })
 
   const refreshSubStatus = useCallback(async () => {
     try {
@@ -80,7 +88,8 @@ export default function SettingsPanel() {
           refreshSubStatus(),
         ])
         const subscriptions = settingsData.subscriptions || []
-        const merged = { ...defaultSettings, ...settingsData, subscriptions }
+        const txt_subscriptions = settingsData.txt_subscriptions || []
+        const merged = { ...defaultSettings, ...settingsData, subscriptions, txt_subscriptions }
         setSettings(merged)
         setSavedSettings(merged)
         setIsDirty(false)
@@ -149,6 +158,20 @@ export default function SettingsPanel() {
     }
   }
 
+  const handleTxtFeedRefresh = async (feedKey: string) => {
+    setRefreshingFeedKey(feedKey)
+    setError('')
+    try {
+      const res = await refreshSubscriptionFeed(feedKey)
+      setSuccess(res.message || '单源刷新成功')
+      await refreshSubStatus()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '单源刷新失败')
+    } finally {
+      setRefreshingFeedKey(null)
+    }
+  }
+
   const addSubscription = () => {
     const url = newSubUrl.trim()
     if (!url) return
@@ -172,6 +195,59 @@ export default function SettingsPanel() {
     })
   }
 
+  const addTxtSubscription = () => {
+    const name = newTxtSubscription.name.trim()
+    const url = newTxtSubscription.url.trim()
+    if (!url) {
+      setError('TXT 订阅地址不能为空')
+      return
+    }
+    if (settings.txt_subscriptions.some(item => item.url === url)) {
+      setError('该 TXT 订阅地址已存在')
+      return
+    }
+    setSettings(s => {
+      const updated = {
+        ...s,
+        txt_subscriptions: [
+          ...s.txt_subscriptions,
+          {
+            ...newTxtSubscription,
+            name,
+            url,
+          },
+        ],
+      }
+      setIsDirty(JSON.stringify(updated) !== JSON.stringify(savedSettings))
+      return updated
+    })
+    setNewTxtSubscription({
+      name: '',
+      url: '',
+      default_protocol: 'http',
+      auto_update_enabled: true,
+    })
+  }
+
+  const updateTxtSubscription = <K extends keyof TXTSubscriptionConfig>(index: number, key: K, value: TXTSubscriptionConfig[K]) => {
+    setSettings(s => {
+      const txt_subscriptions = s.txt_subscriptions.map((item, itemIndex) =>
+        itemIndex === index ? { ...item, [key]: value } : item
+      )
+      const updated = { ...s, txt_subscriptions }
+      setIsDirty(JSON.stringify(updated) !== JSON.stringify(savedSettings))
+      return updated
+    })
+  }
+
+  const removeTxtSubscription = (index: number) => {
+    setSettings(s => {
+      const updated = { ...s, txt_subscriptions: s.txt_subscriptions.filter((_, i) => i !== index) }
+      setIsDirty(JSON.stringify(updated) !== JSON.stringify(savedSettings))
+      return updated
+    })
+  }
+
   const updateField = <K extends keyof SettingsData>(key: K, value: SettingsData[K]) => {
     setSettings(s => {
       const updated = { ...s, [key]: value }
@@ -179,6 +255,16 @@ export default function SettingsPanel() {
       return updated
     })
   }
+
+  const txtFeedStatusByURL = useMemo(() => {
+    const map = new Map<string, NonNullable<SubscriptionStatus['feeds']>[number]>()
+    for (const feed of subStatus?.feeds || []) {
+      if (feed.type === 'txt') {
+        map.set(feed.url, feed)
+      }
+    }
+    return map
+  }, [subStatus])
 
   // Warn before leaving with unsaved changes
   useEffect(() => {
@@ -585,7 +671,7 @@ export default function SettingsPanel() {
             <input
               type="text"
               className="input input-md w-full bg-base-200/50 focus:bg-base-100 transition-colors focus:border-primary/50"
-              placeholder="0.0.0.0:9090"
+              placeholder="0.0.0.0:9888"
               value={settings.management_listen}
               onChange={(e) => updateField('management_listen', e.target.value)}
             />
@@ -596,7 +682,7 @@ export default function SettingsPanel() {
             <input
               type="text"
               className="input input-md w-full bg-base-200/50 focus:bg-base-100 transition-colors focus:border-primary/50"
-              placeholder="http://www.google.com"
+              placeholder="http://cp.cloudflare.com/generate_204"
               value={settings.management_probe_target}
               onChange={(e) => updateField('management_probe_target', e.target.value)}
             />
@@ -796,7 +882,7 @@ export default function SettingsPanel() {
             </div>
 
             {/* Show refresh button when subscriptions exist (saved or in current settings) */}
-            {(subStatus?.has_subscriptions || settings.subscriptions.length > 0) && (
+            {(subStatus?.has_subscriptions || settings.subscriptions.length > 0 || settings.txt_subscriptions.length > 0) && (
               <div className="flex items-center gap-3 bg-base-200/50 px-3 py-1.5 rounded-lg border border-base-300/50">
                 {subStatus && subStatus.node_count != null && subStatus.node_count > 0 && (
                   <span className="text-sm font-medium text-base-content/70">
@@ -898,7 +984,174 @@ export default function SettingsPanel() {
             </div>
           )}
           
-          <p className="text-xs text-base-content/40 text-center mt-4">⚠️ 添加或删除订阅后，需点击顶部「保存设置」并「重载配置」才能生效</p>
+          <div className="mt-8 pt-6 border-t border-base-200 space-y-4">
+            <div className="flex items-center gap-3">
+              <div className="w-9 h-9 rounded-lg bg-primary/10 flex items-center justify-center text-primary shrink-0">
+                <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 11H5m14-6H9m10 12H7" />
+                </svg>
+              </div>
+              <div>
+                <h4 className="font-semibold text-base-content">TXT 订阅管理</h4>
+                <p className="text-xs text-base-content/50">适用于 GitHub TXT 代理列表，支持 `协议://ip:端口` 或 `ip:端口`</p>
+              </div>
+            </div>
+
+            {settings.txt_subscriptions.length > 0 ? (
+              <div className="space-y-4">
+                {settings.txt_subscriptions.map((item, index) => {
+                  const feedStatus = txtFeedStatusByURL.get(item.url)
+                  return (
+                    <div key={`${item.url}-${index}`} className="rounded-xl border border-base-300/50 bg-base-200/20 p-4 space-y-4">
+                      <div className="grid gap-4 lg:grid-cols-[1fr_1.4fr_180px_auto] items-start">
+                        <fieldset className="fieldset">
+                          <legend className="fieldset-legend">名称</legend>
+                          <input
+                            type="text"
+                            className="input input-sm w-full"
+                            value={item.name}
+                            placeholder="例如 vmheaven-all"
+                            onChange={(e) => updateTxtSubscription(index, 'name', e.target.value)}
+                          />
+                        </fieldset>
+
+                        <fieldset className="fieldset">
+                          <legend className="fieldset-legend">TXT 地址</legend>
+                          <input
+                            type="text"
+                            className="input input-sm w-full font-mono"
+                            value={item.url}
+                            placeholder="https://github.com/.../blob/main/all_proxies.txt"
+                            onChange={(e) => updateTxtSubscription(index, 'url', e.target.value)}
+                          />
+                        </fieldset>
+
+                        <fieldset className="fieldset">
+                          <legend className="fieldset-legend">默认协议</legend>
+                          <select
+                            className="select select-sm w-full"
+                            value={item.default_protocol}
+                            onChange={(e) => updateTxtSubscription(index, 'default_protocol', e.target.value as TXTSubscriptionConfig['default_protocol'])}
+                          >
+                            <option value="http">http</option>
+                            <option value="https">https</option>
+                            <option value="socks5">socks5</option>
+                          </select>
+                        </fieldset>
+
+                        <div className="flex flex-col gap-3 pt-6">
+                          <label className="flex items-center gap-2 text-sm font-medium">
+                            <input
+                              type="checkbox"
+                              className="toggle toggle-primary toggle-sm"
+                              checked={item.auto_update_enabled}
+                              onChange={(e) => updateTxtSubscription(index, 'auto_update_enabled', e.target.checked)}
+                            />
+                            自动更新
+                          </label>
+                          <button
+                            type="button"
+                            className="btn btn-sm btn-ghost text-primary hover:bg-primary/10"
+                            onClick={() => feedStatus && handleTxtFeedRefresh(feedStatus.feed_key)}
+                            disabled={!feedStatus || refreshingFeedKey === feedStatus.feed_key || isDirty}
+                            title={isDirty ? '请先保存当前设置' : '只刷新当前 TXT 源'}
+                          >
+                            {refreshingFeedKey === feedStatus?.feed_key ? '刷新中...' : '单独刷新'}
+                          </button>
+                          <button
+                            type="button"
+                            className="btn btn-sm btn-ghost text-error hover:bg-error/10"
+                            onClick={() => removeTxtSubscription(index)}
+                          >
+                            删除
+                          </button>
+                        </div>
+                      </div>
+
+                      {feedStatus && (
+                        <div className={`rounded-lg border px-3 py-2 text-xs ${
+                          feedStatus.last_error ? 'border-error/30 bg-error/5 text-error' : 'border-success/20 bg-success/5 text-base-content/70'
+                        }`}>
+                          <div className="flex flex-wrap items-center gap-3">
+                            <span>上次有效节点: <strong>{feedStatus.valid_nodes ?? 0}</strong></span>
+                            <span>跳过行数: <strong>{feedStatus.skipped_lines ?? 0}</strong></span>
+                            {feedStatus.last_refresh && <span>上次刷新: <strong>{new Date(feedStatus.last_refresh).toLocaleString()}</strong></span>}
+                            {feedStatus.last_error && <span className="break-all">错误: <strong>{feedStatus.last_error}</strong></span>}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  )
+                })}
+              </div>
+            ) : (
+              <div className="rounded-xl border border-dashed border-base-300 bg-base-200/20 px-4 py-6 text-sm text-base-content/50 text-center">
+                暂无 TXT 订阅配置
+              </div>
+            )}
+
+            <div className="rounded-xl border border-base-300/50 bg-base-200/20 p-4 space-y-4">
+              <div className="text-sm font-semibold">新增 TXT 订阅</div>
+              <div className="grid gap-4 lg:grid-cols-[1fr_1.6fr_180px_auto] items-start">
+                <fieldset className="fieldset">
+                  <legend className="fieldset-legend">名称</legend>
+                  <input
+                    type="text"
+                    className="input input-sm w-full"
+                    value={newTxtSubscription.name}
+                    placeholder="例如 vmheaven-socks5"
+                    onChange={(e) => setNewTxtSubscription((current) => ({ ...current, name: e.target.value }))}
+                  />
+                </fieldset>
+
+                <fieldset className="fieldset">
+                  <legend className="fieldset-legend">TXT 地址</legend>
+                  <input
+                    type="text"
+                    className="input input-sm w-full font-mono"
+                    value={newTxtSubscription.url}
+                    placeholder="https://github.com/.../blob/main/socks5_anonymous.txt"
+                    onChange={(e) => setNewTxtSubscription((current) => ({ ...current, url: e.target.value }))}
+                  />
+                </fieldset>
+
+                <fieldset className="fieldset">
+                  <legend className="fieldset-legend">默认协议</legend>
+                  <select
+                    className="select select-sm w-full"
+                    value={newTxtSubscription.default_protocol}
+                    onChange={(e) => setNewTxtSubscription((current) => ({ ...current, default_protocol: e.target.value as TXTSubscriptionConfig['default_protocol'] }))}
+                  >
+                    <option value="http">http</option>
+                    <option value="https">https</option>
+                    <option value="socks5">socks5</option>
+                  </select>
+                </fieldset>
+
+                <div className="flex flex-col gap-3 pt-6">
+                  <label className="flex items-center gap-2 text-sm font-medium">
+                    <input
+                      type="checkbox"
+                      className="toggle toggle-primary toggle-sm"
+                      checked={newTxtSubscription.auto_update_enabled}
+                      onChange={(e) => setNewTxtSubscription((current) => ({ ...current, auto_update_enabled: e.target.checked }))}
+                    />
+                    自动更新
+                  </label>
+                  <button
+                    type="button"
+                    className="btn btn-sm btn-primary"
+                    onClick={addTxtSubscription}
+                    disabled={!newTxtSubscription.url.trim()}
+                  >
+                    添加 TXT 源
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <p className="text-xs text-base-content/40 text-center mt-4">⚠️ 添加、删除或修改订阅后，需点击顶部「保存设置」；节点集合发生变化后，再执行「立即刷新」或「重载配置」让运行时同步。</p>
         </div>
       </div>
 
