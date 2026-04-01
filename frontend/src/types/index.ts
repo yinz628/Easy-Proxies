@@ -178,6 +178,60 @@ export interface ConfigNodesResponse {
   nodes: ConfigNodeConfig[]
 }
 
+export type ManageStatus = '' | 'normal' | 'unavailable' | 'blacklisted' | 'pending' | 'disabled'
+export type ManageSortKey = 'name' | 'status' | 'latency' | 'region' | 'port' | 'source'
+export type ManageSortDir = 'asc' | 'desc'
+
+export interface ManageQuery {
+  page: number
+  page_size: number
+  keyword: string
+  status: ManageStatus
+  region: string
+  source: string
+  sort_key: ManageSortKey
+  sort_dir: ManageSortDir
+}
+
+export interface ManageFilterSnapshot {
+  keyword: string
+  status: ManageStatus
+  region: string
+  source: string
+}
+
+export interface ManageNodeRow extends ConfigNodeConfig {
+  runtime_status: Exclude<ManageStatus, ''>
+  latency_ms: number
+  region?: string
+  country?: string
+  active_connections: number
+  success_count: number
+  failure_count: number
+  tag?: string
+}
+
+export interface ManageListResponse {
+  items: ManageNodeRow[]
+  page: number
+  page_size: number
+  total: number
+  filtered_total: number
+  summary: Record<Exclude<ManageStatus, ''>, number>
+  facets: {
+    regions: string[]
+    sources: string[]
+  }
+}
+
+export type SelectionState =
+  | { mode: 'names'; names: Set<string> }
+  | { mode: 'filter'; filter: ManageFilterSnapshot; excludeNames: Set<string> }
+
+export type ManageSelectionRequest =
+  | { selection: { mode: 'names'; names: string[] } }
+  | { selection: { mode: 'filter'; filter: ManageFilterSnapshot; exclude_names: string[] } }
+
 export interface ConfigNodeMutationResponse {
   node?: ConfigNodeConfig
   message: string

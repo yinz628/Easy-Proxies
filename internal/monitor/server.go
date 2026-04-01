@@ -146,6 +146,7 @@ func NewServer(cfg Config, mgr *Manager, logger *log.Logger) *Server {
 	mux.HandleFunc("/api/auth", s.handleAuth)
 	mux.HandleFunc("/api/settings", s.withAuth(s.handleSettings))
 	mux.HandleFunc("/api/nodes", s.withAuth(s.handleNodes))
+	mux.HandleFunc("/api/nodes/manage", s.withAuth(s.handleManageNodes))
 	mux.HandleFunc("/api/nodes/config", s.withAuth(s.handleConfigNodes))
 	mux.HandleFunc("/api/nodes/config/batch-toggle", s.withAuth(s.handleConfigNodesBatchToggle))
 	mux.HandleFunc("/api/nodes/config/batch-delete", s.withAuth(s.handleConfigNodesBatchDelete))
@@ -626,6 +627,32 @@ func (s *Server) handleNodes(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, payload)
 }
 
+func (s *Server) handleManageNodes(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.ensureNodeManager(w) {
+		return
+	}
+
+	query, err := parseManageQuery(r.URL.Query())
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		writeJSON(w, map[string]any{"error": err.Error()})
+		return
+	}
+
+	configNodes, err := s.nodeMgr.ListConfigNodes(r.Context())
+	if err != nil {
+		s.respondNodeError(w, err)
+		return
+	}
+
+	rows := BuildManageRows(configNodes, s.mgr.Snapshot())
+	writeJSON(w, QueryManageRows(rows, query))
+}
+
 func (s *Server) handleDebug(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		w.WriteHeader(http.StatusMethodNotAllowed)
@@ -776,15 +803,23 @@ func (s *Server) handleProbeBatch(w http.ResponseWriter, r *http.Request) {
 	s.handleProbeBatchStart(w, r)
 }
 
+type manageSelectionRequest struct {
+	Selection *ManageSelection `json:"selection,omitempty"`
+	Names     []string         `json:"names,omitempty"`
+	Tags      []string         `json:"tags,omitempty"`
+}
+
 func (s *Server) handleProbeBatchStart(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
-
-	var req struct {
-		Tags []string `json:"tags"`
+	if r.Header.Get("Content-Type") == "application/json" {
+		s.handleProbeBatchStartV2(w, r)
+		return
 	}
+
+	var req manageSelectionRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(http.StatusBadRequest)
 		writeJSON(w, map[string]any{"error": "请求格式错误"})
@@ -1012,6 +1047,10 @@ func (s *Server) streamProbeSnapshots(w http.ResponseWriter, r *http.Request, sn
 func (s *Server) handleQualityCheckBatch(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	if s.store != nil {
+		s.handleQualityCheckBatchV2(w, r)
 		return
 	}
 	if s.store == nil {
@@ -1261,6 +1300,506 @@ func (s *Server) handleTrafficStream(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (s *Server) handleProbeBatchStartV2(w http.ResponseWriter, r *http.Request) {
+	var req manageSelectionRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		writeJSON(w, map[string]any{"error": "璇锋眰鏍煎紡閿欒"})
+		return
+	}
+	if usesNodeManagerSelection(req) && !s.ensureNodeManager(w) {
+		return
+	}
+
+	selectedRows, err := s.resolveSelectionRequest(r.Context(), req)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		writeJSON(w, map[string]any{"error": "娌℃湁鍙帰娴嬬殑鑺傜偣"})
+		return
+	}
+
+	requestedTags := tagsFromRows(selectedRows)
+	if len(requestedTags) == 0 {
+		w.WriteHeader(http.StatusBadRequest)
+		writeJSON(w, map[string]any{"error": "娌℃湁鍙帰娴嬬殑鑺傜偣"})
+		return
+	}
+
+	snapshotsByTag := make(map[string]Snapshot)
+	for _, snap := range s.mgr.Snapshot() {
+		if snap.Tag != "" {
+			snapshotsByTag[snap.Tag] = snap
+		}
+	}
+
+	filtered := make([]Snapshot, 0, len(requestedTags))
+	for _, tag := range requestedTags {
+		if snap, ok := snapshotsByTag[tag]; ok {
+			filtered = append(filtered, snap)
+		}
+	}
+	if len(filtered) == 0 {
+		w.WriteHeader(http.StatusBadRequest)
+		writeJSON(w, map[string]any{"error": "娌℃湁鍙帰娴嬬殑鑺傜偣"})
+		return
+	}
+
+	job, err := s.probeJobs.Start(requestedTags, filtered, func(ctx context.Context, snap Snapshot) (int64, error) {
+		probeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+
+		if err := s.probeSem.Acquire(probeCtx, 1); err != nil {
+			return -1, fmt.Errorf("probe cancelled: %w", err)
+		}
+		defer s.probeSem.Release(1)
+
+		latency, err := s.mgr.Probe(probeCtx, snap.Tag)
+		if err != nil {
+			return -1, err
+		}
+		return latency.Milliseconds(), nil
+	})
+	if err != nil {
+		if errors.Is(err, ErrBatchProbeJobRunning) {
+			w.WriteHeader(http.StatusConflict)
+		} else {
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+		writeJSON(w, map[string]any{"error": err.Error()})
+		return
+	}
+
+	writeJSON(w, map[string]any{"job": job})
+}
+
+func (s *Server) handleQualityCheckBatchV2(w http.ResponseWriter, r *http.Request) {
+	var req manageSelectionRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		writeJSON(w, map[string]any{"error": "璇锋眰鏍煎紡閿欒"})
+		return
+	}
+	if usesNodeManagerSelection(req) && !s.ensureNodeManager(w) {
+		return
+	}
+
+	selectedRows, err := s.resolveSelectionRequest(r.Context(), req)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		writeJSON(w, map[string]any{"error": "娌℃湁鍙娴嬬殑鑺傜偣"})
+		return
+	}
+
+	selectedTags := tagsFromRows(selectedRows)
+	if len(selectedTags) == 0 {
+		w.WriteHeader(http.StatusBadRequest)
+		writeJSON(w, map[string]any{"error": "娌℃湁鍙娴嬬殑鑺傜偣"})
+		return
+	}
+
+	snapshotByTag := make(map[string]Snapshot)
+	for _, snap := range s.mgr.Snapshot() {
+		if snap.Tag != "" {
+			snapshotByTag[snap.Tag] = snap
+		}
+	}
+
+	filtered := make([]Snapshot, 0, len(selectedTags))
+	for _, tag := range selectedTags {
+		if snap, ok := snapshotByTag[tag]; ok {
+			filtered = append(filtered, snap)
+		}
+	}
+	if len(filtered) == 0 {
+		w.WriteHeader(http.StatusBadRequest)
+		writeJSON(w, map[string]any{"error": "娌℃湁鍙娴嬬殑鑺傜偣"})
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "SSE not supported", http.StatusInternalServerError)
+		return
+	}
+
+	total := len(filtered)
+	fmt.Fprintf(w, "data: %s\n\n", fmt.Sprintf(`{"type":"start","total":%d}`, total))
+	flusher.Flush()
+
+	type qualityResult struct {
+		tag              string
+		name             string
+		qualityStatus    string
+		qualityScore     int
+		qualityGrade     string
+		qualitySummary   string
+		qualityCheckedAt string
+		exitIP           string
+		exitCountry      string
+		exitCountryCode  string
+		exitRegion       string
+		items            []store.NodeQualityCheckItem
+		err              string
+	}
+
+	checker := NewQualityChecker(s.mgr, s.store)
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
+	defer cancel()
+
+	results := make(chan qualityResult, total)
+	var wg sync.WaitGroup
+
+	for _, snap := range filtered {
+		wg.Add(1)
+		go func(snap Snapshot) {
+			defer wg.Done()
+
+			if err := s.qualitySem.Acquire(ctx, 1); err != nil {
+				results <- qualityResult{tag: snap.Tag, name: snap.Name, err: "quality check cancelled: " + err.Error()}
+				return
+			}
+			defer s.qualitySem.Release(1)
+
+			check, err := checker.CheckNode(ctx, snap.Tag)
+			if err != nil {
+				results <- qualityResult{tag: snap.Tag, name: snap.Name, err: err.Error()}
+				return
+			}
+
+			score := 0
+			if check.QualityScore != nil {
+				score = *check.QualityScore
+			}
+			checkedAt := ""
+			if !check.QualityCheckedAt.IsZero() {
+				checkedAt = check.QualityCheckedAt.Format(time.RFC3339)
+			}
+			results <- qualityResult{
+				tag:              snap.Tag,
+				name:             snap.Name,
+				qualityStatus:    check.QualityStatus,
+				qualityScore:     score,
+				qualityGrade:     check.QualityGrade,
+				qualitySummary:   check.QualitySummary,
+				qualityCheckedAt: checkedAt,
+				exitIP:           check.ExitIP,
+				exitCountry:      check.ExitCountry,
+				exitCountryCode:  check.ExitCountryCode,
+				exitRegion:       check.ExitRegion,
+				items:            check.Items,
+			}
+		}(snap)
+	}
+
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	successCount := 0
+	failedCount := 0
+	count := 0
+
+	for result := range results {
+		count++
+		status := "success"
+		if result.err != "" {
+			status = "error"
+			failedCount++
+		} else {
+			successCount++
+		}
+
+		payload := map[string]any{
+			"type":               "progress",
+			"tag":                result.tag,
+			"name":               result.name,
+			"status":             status,
+			"error":              result.err,
+			"quality_status":     result.qualityStatus,
+			"quality_score":      result.qualityScore,
+			"quality_grade":      result.qualityGrade,
+			"quality_summary":    result.qualitySummary,
+			"quality_checked_at": result.qualityCheckedAt,
+			"exit_ip":            result.exitIP,
+			"exit_country":       result.exitCountry,
+			"exit_country_code":  result.exitCountryCode,
+			"exit_region":        result.exitRegion,
+			"items":              result.items,
+			"current":            count,
+			"total":              total,
+		}
+		eventData, err := json.Marshal(payload)
+		if err != nil {
+			continue
+		}
+		fmt.Fprintf(w, "data: %s\n\n", eventData)
+		flusher.Flush()
+	}
+
+	fmt.Fprintf(w, "data: %s\n\n", fmt.Sprintf(`{"type":"complete","total":%d,"success":%d,"failed":%d}`, total, successCount, failedCount))
+	flusher.Flush()
+}
+
+func (s *Server) handleConfigNodesBatchToggleV2(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		manageSelectionRequest
+		Enabled bool `json:"enabled"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		writeJSON(w, map[string]any{"error": "璇锋眰鏍煎紡閿欒"})
+		return
+	}
+
+	selectedRows, err := s.resolveSelectionRequest(r.Context(), body.manageSelectionRequest)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		writeJSON(w, map[string]any{"error": "鑺傜偣鍒楄〃涓虹┖"})
+		return
+	}
+
+	selectedNames := namesFromRows(selectedRows)
+	var errs []string
+	successCount := 0
+	for _, name := range selectedNames {
+		if err := s.nodeMgr.SetNodeEnabled(r.Context(), name, body.Enabled); err != nil {
+			errs = append(errs, fmt.Sprintf("%s: %v", name, err))
+		} else {
+			successCount++
+		}
+	}
+
+	action := "鍚敤"
+	if !body.Enabled {
+		action = "绂佺敤"
+	}
+
+	reloadMsg := ""
+	if successCount > 0 {
+		if err := s.nodeMgr.TriggerReload(r.Context()); err != nil {
+			s.logger.Printf("auto-reload after batch toggle failed: %v", err)
+			reloadMsg = "锛堣嚜鍔ㄩ噸杞藉け璐ワ紝璇锋墜鍔ㄩ噸杞斤級"
+		} else {
+			reloadMsg = "锛堝凡鑷姩閲嶈浇锛?"
+		}
+	}
+
+	result := map[string]any{
+/*
+		"message": fmt.Sprintf("鎴愬姛%s %d 涓妭鐐?s", action, successCount, reloadMsg),
+*/
+		"message": fmt.Sprintf("%s %d 个节点%s", action, successCount, reloadMsg),
+		"success": successCount,
+		"total":   len(selectedNames),
+	}
+	if len(errs) > 0 {
+		result["errors"] = errs
+	}
+	writeJSON(w, result)
+}
+
+func (s *Server) handleConfigNodesBatchDeleteV2(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		manageSelectionRequest
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		writeJSON(w, map[string]any{"error": "璇锋眰鏍煎紡閿欒"})
+		return
+	}
+
+	selectedRows, err := s.resolveSelectionRequest(r.Context(), body.manageSelectionRequest)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		writeJSON(w, map[string]any{"error": "鑺傜偣鍒楄〃涓虹┖"})
+		return
+	}
+
+	selectedNames := namesFromRows(selectedRows)
+	var errs []string
+	successCount := 0
+	for _, name := range selectedNames {
+		if err := s.nodeMgr.DeleteNode(r.Context(), name); err != nil {
+			errs = append(errs, fmt.Sprintf("%s: %v", name, err))
+		} else {
+			successCount++
+		}
+	}
+
+	reloadMsg := ""
+	if successCount > 0 {
+		if err := s.nodeMgr.TriggerReload(r.Context()); err != nil {
+			s.logger.Printf("auto-reload after batch delete failed: %v", err)
+			reloadMsg = "锛堣嚜鍔ㄩ噸杞藉け璐ワ紝璇锋墜鍔ㄩ噸杞斤級"
+		} else {
+			reloadMsg = "锛堝凡鑷姩閲嶈浇锛?"
+		}
+	}
+
+	result := map[string]any{
+/*
+		"message": fmt.Sprintf("鎴愬姛鍒犻櫎 %d 涓妭鐐?s", successCount, reloadMsg),
+*/
+		"message": fmt.Sprintf("删除 %d 个节点%s", successCount, reloadMsg),
+		"success": successCount,
+		"total":   len(selectedNames),
+	}
+	if len(errs) > 0 {
+		result["errors"] = errs
+	}
+	writeJSON(w, result)
+}
+
+func (s *Server) handleExportSelected(w http.ResponseWriter, r *http.Request) {
+	if !s.ensureNodeManager(w) {
+		return
+	}
+
+	var req manageSelectionRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		writeJSON(w, map[string]any{"error": "璇锋眰鏍煎紡閿欒"})
+		return
+	}
+
+	selectedRows, err := s.resolveSelectionRequest(r.Context(), req)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		writeJSON(w, map[string]any{"error": "娌℃湁鍙鍑虹殑鑺傜偣"})
+		return
+	}
+
+	lines := urisFromRows(selectedRows)
+	if len(lines) == 0 {
+		w.WriteHeader(http.StatusBadRequest)
+		writeJSON(w, map[string]any{"error": "娌℃湁鍙鍑虹殑鑺傜偣"})
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("Content-Disposition", "attachment; filename=selected_nodes_export.txt")
+	_, _ = w.Write([]byte(strings.Join(lines, "\n")))
+}
+
+func usesNodeManagerSelection(req manageSelectionRequest) bool {
+	return req.Selection != nil || len(req.Names) > 0
+}
+
+func (s *Server) resolveSelectionRequest(ctx context.Context, req manageSelectionRequest) ([]ManageRow, error) {
+	if req.Selection != nil {
+		rows, err := s.loadManageRows(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return ResolveManageSelection(rows, *req.Selection)
+	}
+
+	if len(req.Names) > 0 {
+		rows, err := s.loadManageRows(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return ResolveManageSelection(rows, ManageSelection{Mode: "names", Names: req.Names})
+	}
+
+	if len(req.Tags) > 0 {
+		selectedTags := make(map[string]struct{}, len(req.Tags))
+		for _, tag := range req.Tags {
+			trimmed := strings.TrimSpace(tag)
+			if trimmed == "" {
+				continue
+			}
+			selectedTags[trimmed] = struct{}{}
+		}
+		if len(selectedTags) == 0 {
+			return nil, errInvalidManageSelection
+		}
+
+		rows := make([]ManageRow, 0, len(selectedTags))
+		for _, snap := range s.mgr.Snapshot() {
+			if _, ok := selectedTags[snap.Tag]; !ok {
+				continue
+			}
+			rows = append(rows, ManageRow{
+				Name:              snap.Name,
+				URI:               snap.URI,
+				Port:              snap.Port,
+				RuntimeStatus:     resolveManageRuntimeStatus(snap),
+				Tag:               snap.Tag,
+				LatencyMS:         snap.LastLatencyMs,
+				Region:            snap.Region,
+				Country:           snap.Country,
+				ActiveConnections: int(snap.ActiveConnections),
+				SuccessCount:      snap.SuccessCount,
+				FailureCount:      snap.FailureCount,
+			})
+		}
+		if len(rows) == 0 {
+			return nil, errInvalidManageSelection
+		}
+		return rows, nil
+	}
+
+	return nil, errInvalidManageSelection
+}
+
+func (s *Server) loadManageRows(ctx context.Context) ([]ManageRow, error) {
+	configNodes, err := s.nodeMgr.ListConfigNodes(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return BuildManageRows(configNodes, s.mgr.Snapshot()), nil
+}
+
+func namesFromRows(rows []ManageRow) []string {
+	names := make([]string, 0, len(rows))
+	seen := make(map[string]struct{}, len(rows))
+	for _, row := range rows {
+		if row.Name == "" {
+			continue
+		}
+		if _, ok := seen[row.Name]; ok {
+			continue
+		}
+		seen[row.Name] = struct{}{}
+		names = append(names, row.Name)
+	}
+	return names
+}
+
+func tagsFromRows(rows []ManageRow) []string {
+	tags := make([]string, 0, len(rows))
+	seen := make(map[string]struct{}, len(rows))
+	for _, row := range rows {
+		if row.Tag == "" {
+			continue
+		}
+		if _, ok := seen[row.Tag]; ok {
+			continue
+		}
+		seen[row.Tag] = struct{}{}
+		tags = append(tags, row.Tag)
+	}
+	return tags
+}
+
+func urisFromRows(rows []ManageRow) []string {
+	uris := make([]string, 0, len(rows))
+	for _, row := range rows {
+		uri := strings.TrimSpace(row.URI)
+		if uri == "" {
+			continue
+		}
+		uris = append(uris, uri)
+	}
+	return uris
+}
+
 func writeJSON(w http.ResponseWriter, payload any) {
 	w.Header().Set("Content-Type", "application/json")
 	enc := json.NewEncoder(w)
@@ -1376,6 +1915,10 @@ func (s *Server) handleAuth(w http.ResponseWriter, r *http.Request) {
 // handleExport 导出所有可用节点的原始代理 URI（如 trojan://、vless:// 等），每行一个
 // 导出的内容可以直接用于导入
 func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodPost {
+		s.handleExportSelected(w, r)
+		return
+	}
 	if r.Method != http.MethodGet {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
@@ -1753,6 +2296,8 @@ func (s *Server) handleConfigNodesBatchToggle(w http.ResponseWriter, r *http.Req
 	if !s.ensureNodeManager(w) {
 		return
 	}
+	s.handleConfigNodesBatchToggleV2(w, r)
+	return
 
 	var body struct {
 		Names   []string `json:"names"`
@@ -1815,6 +2360,8 @@ func (s *Server) handleConfigNodesBatchDelete(w http.ResponseWriter, r *http.Req
 	if !s.ensureNodeManager(w) {
 		return
 	}
+	s.handleConfigNodesBatchDeleteV2(w, r)
+	return
 
 	var body struct {
 		Names []string `json:"names"`

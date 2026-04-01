@@ -1,5 +1,6 @@
 import type {
   ConfigNodeConfig,
+  ManageListResponse,
   NodeQualityCheckResult,
   QualityCheckBatchComplete,
   QualityCheckBatchEvent,
@@ -58,6 +59,25 @@ export function applyQualityResultToConfigNode(node: ConfigNodeConfig, result: N
     exit_country: result.exit_country,
     exit_country_code: result.exit_country_code,
     exit_region: result.exit_region,
+  }
+}
+
+export function applyQualityResultToManageList(
+  page: ManageListResponse | null,
+  nodeName: string,
+  result: NodeQualityCheckResult,
+): ManageListResponse | null {
+  if (!page) {
+    return page
+  }
+
+  return {
+    ...page,
+    items: page.items.map(item => (
+      item.name === nodeName
+        ? { ...item, ...applyQualityResultToConfigNode(item, result) }
+        : item
+    )),
   }
 }
 

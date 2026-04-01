@@ -7,6 +7,9 @@ import type {
   ConfigNodesResponse,
   ConfigNodePayload,
   ConfigNodeMutationResponse,
+  ManageListResponse,
+  ManageQuery,
+  ManageSelectionRequest,
   SubscriptionStatus,
   BatchProbeJob,
   ProbeSSEEvent,
@@ -90,6 +93,21 @@ export class ApiError extends Error {
   }
 }
 
+function normalizeSelectionBody(selectionOrNames: ManageSelectionRequest | string[], key: 'names' | 'tags'): ManageSelectionRequest | { tags: string[] } {
+  if (Array.isArray(selectionOrNames)) {
+    if (key === 'tags') {
+      return { tags: selectionOrNames }
+    }
+    return {
+      selection: {
+        mode: 'names',
+        names: selectionOrNames,
+      },
+    }
+  }
+  return selectionOrNames
+}
+
 // ---- Auth API ----
 
 /** Check if password is required & login */
@@ -127,6 +145,20 @@ export function logout() {
 
 export async function fetchNodes(): Promise<NodesResponse> {
   return request<NodesResponse>('/api/nodes')
+}
+
+export async function fetchManageNodes(query: ManageQuery, signal?: AbortSignal): Promise<ManageListResponse> {
+  const params = new URLSearchParams()
+  params.set('page', String(query.page))
+  params.set('page_size', String(query.page_size))
+  if (query.keyword) params.set('keyword', query.keyword)
+  if (query.status) params.set('status', query.status)
+  if (query.region) params.set('region', query.region)
+  if (query.source) params.set('source', query.source)
+  params.set('sort_key', query.sort_key)
+  params.set('sort_dir', query.sort_dir)
+
+  return request<ManageListResponse>(`/api/nodes/manage?${params.toString()}`, { signal })
 }
 
 export async function probeNode(tag: string): Promise<{ message: string; latency_ms: number }> {
@@ -321,17 +353,17 @@ export async function toggleConfigNode(name: string, enabled: boolean): Promise<
   })
 }
 
-export async function batchToggleConfigNodes(names: string[], enabled: boolean): Promise<{ message: string; success: number; total: number; errors?: string[] }> {
+export async function batchToggleConfigNodes(selectionOrNames: ManageSelectionRequest | string[], enabled: boolean): Promise<{ message: string; success: number; total: number; errors?: string[] }> {
   return request('/api/nodes/config/batch-toggle', {
     method: 'POST',
-    body: JSON.stringify({ names, enabled }),
+    body: JSON.stringify({ ...normalizeSelectionBody(selectionOrNames, 'names'), enabled }),
   })
 }
 
-export async function batchDeleteConfigNodes(names: string[]): Promise<{ message: string; success: number; total: number; errors?: string[] }> {
+export async function batchDeleteConfigNodes(selectionOrNames: ManageSelectionRequest | string[]): Promise<{ message: string; success: number; total: number; errors?: string[] }> {
   return request('/api/nodes/config/batch-delete', {
     method: 'POST',
-    body: JSON.stringify({ names }),
+    body: JSON.stringify(normalizeSelectionBody(selectionOrNames, 'names')),
   })
 }
 
@@ -419,10 +451,10 @@ export function probeBatchNodes(
   return controller
 }
 
-export async function startProbeBatchJob(tags: string[]): Promise<{ job: BatchProbeJob }> {
+export async function startProbeBatchJob(selectionOrTags: ManageSelectionRequest | string[]): Promise<{ job: BatchProbeJob }> {
   return request('/api/nodes/probe-batch/start', {
     method: 'POST',
-    body: JSON.stringify({ tags }),
+    body: JSON.stringify(normalizeSelectionBody(selectionOrTags, 'tags')),
   })
 }
 
@@ -438,7 +470,7 @@ export async function cancelProbeBatchJob(jobId: string): Promise<{ message: str
 }
 
 export function checkNodeQualityBatch(
-  tags: string[],
+  selectionOrTags: ManageSelectionRequest | string[],
   onEvent: (event: QualityCheckBatchEvent) => void,
   onError?: (error: Error) => void
 ): AbortController {
@@ -456,7 +488,7 @@ export function checkNodeQualityBatch(
       const res = await fetch('/api/nodes/quality-check-batch', {
         method: 'POST',
         headers,
-        body: JSON.stringify({ tags }),
+        body: JSON.stringify(normalizeSelectionBody(selectionOrTags, 'tags')),
         credentials: 'include',
         signal: controller.signal,
       })
@@ -524,6 +556,23 @@ export async function exportProxies(): Promise<string> {
     credentials: 'include',
   })
   if (!res.ok) throw new ApiError('导出失败', res.status)
+  return res.text()
+}
+
+export async function exportSelectedProxies(selection: ManageSelectionRequest): Promise<string> {
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+  }
+  if (authToken) {
+    headers['Authorization'] = `Bearer ${authToken}`
+  }
+  const res = await fetch('/api/export', {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(selection),
+    credentials: 'include',
+  })
+  if (!res.ok) throw new ApiError('导出选中节点失败', res.status)
   return res.text()
 }
 

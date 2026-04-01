@@ -1,8 +1,9 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 
-import type { ConfigNodeConfig, NodeQualityCheckResult, QualityCheckBatchEvent } from '../src/types/index.ts'
+import type { ConfigNodeConfig, ManageListResponse, NodeQualityCheckResult, QualityCheckBatchEvent } from '../src/types/index.ts'
 import {
+  applyQualityResultToManageList,
   applyQualityResultToConfigNode,
   buildQualityResultFromBatchProgress,
   buildQualityCacheEntry,
@@ -74,6 +75,74 @@ test('applyQualityResultToConfigNode copies the latest quality fields into the r
   assert.equal(updated.exit_country, 'Singapore')
   assert.equal(updated.exit_country_code, 'SG')
   assert.equal(updated.exit_region, 'sg')
+})
+
+test('applyQualityResultToManageList updates the matching page row without losing runtime fields', () => {
+  const page: ManageListResponse = {
+    items: [
+      {
+        name: 'node-a',
+        uri: 'trojan://a',
+        port: 1080,
+        username: '',
+        password: '',
+        runtime_status: 'normal',
+        latency_ms: 88,
+        region: 'hk',
+        country: 'Hong Kong',
+        active_connections: 1,
+        success_count: 10,
+        failure_count: 2,
+        tag: 'tag-a',
+      },
+      {
+        name: 'node-b',
+        uri: 'trojan://b',
+        port: 1081,
+        username: '',
+        password: '',
+        runtime_status: 'pending',
+        latency_ms: -1,
+        active_connections: 0,
+        success_count: 0,
+        failure_count: 0,
+      },
+    ],
+    page: 1,
+    page_size: 100,
+    total: 2,
+    filtered_total: 2,
+    summary: {
+      normal: 1,
+      pending: 1,
+      unavailable: 0,
+      blacklisted: 0,
+      disabled: 0,
+    },
+    facets: {
+      regions: ['hk'],
+      sources: [],
+    },
+  }
+
+  const result: NodeQualityCheckResult = {
+    node_id: 10,
+    quality_status: 'healthy',
+    quality_score: 93,
+    quality_grade: 'A',
+    quality_summary: 'connectivity ok',
+    quality_checked_at: '2026-04-01T11:12:13Z',
+    items: [],
+  }
+
+  const updated = applyQualityResultToManageList(page, 'node-a', result)
+
+  assert.equal(updated?.items[0]?.runtime_status, 'normal')
+  assert.equal(updated?.items[0]?.tag, 'tag-a')
+  assert.equal(updated?.items[0]?.quality_status, 'healthy')
+  assert.equal(updated?.items[0]?.quality_score, 93)
+  assert.equal(updated?.items[0]?.quality_grade, 'A')
+  assert.equal(updated?.items[1]?.quality_status, undefined)
 })
 
 test('reduceBatchQualityEvent tracks start, progress and completion', () => {
