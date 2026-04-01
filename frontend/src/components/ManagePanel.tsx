@@ -17,6 +17,7 @@ import {
   reduceBatchQualityEvent,
 } from './managePanelQuality.ts'
 import type { BatchQualityState } from './managePanelQuality.ts'
+import { buildSelectedExportText } from './managePanelExport.ts'
 import { getBatchProbeSelection, mergeManageNodes } from './managePanelNodes.ts'
 import type { MergedManageNode as MergedNode } from './managePanelNodes.ts'
 
@@ -691,6 +692,23 @@ export default function ManagePanel() {
     }
   }
 
+  const handleExportSelected = () => {
+    try {
+      const text = buildSelectedExportText(sortedNodes, selectedNodes)
+      if (!text.trim()) { setError('没有可导出的选中节点'); return }
+      const blob = new Blob([text], { type: 'text/plain' })
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = 'selected_nodes_export.txt'
+      a.click()
+      URL.revokeObjectURL(url)
+      setSuccess(`已导出 ${selectedNodes.size} 个选中节点`)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '导出选中节点失败')
+    }
+  }
+
   const handleReload = async () => {
     try {
       setError('')
@@ -762,8 +780,19 @@ export default function ManagePanel() {
                 管理操作
                 <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4 opacity-50" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 9l-7 7-7-7" /></svg>
               </div>
-              <ul tabIndex={0} className="dropdown-content menu bg-base-100 border border-base-200 rounded-xl z-20 w-48 p-2 shadow-xl mt-2">
+              <ul tabIndex={0} className="dropdown-content menu bg-base-100 border border-base-200 rounded-xl z-20 w-52 p-2 shadow-xl mt-2">
                 <li><a onClick={openImportModal} className="hover:bg-primary/10 hover:text-primary gap-3"><svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12" /></svg> 导入节点配置</a></li>
+                <li>
+                  <button
+                    type="button"
+                    onClick={handleExportSelected}
+                    disabled={selectedNodes.size === 0}
+                    className="hover:bg-primary/10 hover:text-primary gap-3 disabled:text-base-content/30 disabled:bg-transparent"
+                  >
+                    <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
+                    导出选中节点
+                  </button>
+                </li>
                 <li><a onClick={handleExport} className="hover:bg-primary/10 hover:text-primary gap-3"><svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg> 导出所有节点</a></li>
               </ul>
             </div>
