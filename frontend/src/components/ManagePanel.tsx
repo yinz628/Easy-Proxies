@@ -1,5 +1,5 @@
 ﻿import { useState, useEffect, useCallback, useMemo } from 'react'
-import type { ConfigNodeConfig, ConfigNodePayload, NodeSnapshot, NodesResponse } from '../types'
+import type { ConfigNodeConfig, ConfigNodePayload, NodesResponse } from '../types'
 import {
   fetchConfigNodes, createConfigNode, updateConfigNode, deleteConfigNode,
   toggleConfigNode, batchToggleConfigNodes, batchDeleteConfigNodes, triggerReload,
@@ -16,19 +16,8 @@ import {
   reduceBatchQualityEvent,
 } from './managePanelQuality.ts'
 import type { BatchQualityState } from './managePanelQuality.ts'
-
-// ---- Merged node type ----
-interface MergedNode extends ConfigNodeConfig {
-  // Runtime state from monitor
-  runtimeStatus: 'normal' | 'unavailable' | 'blacklisted' | 'pending' | 'disabled'
-  latency_ms: number
-  region?: string
-  country?: string
-  active_connections: number
-  success_count: number
-  failure_count: number
-  tag?: string
-}
+import { getBatchProbeSelection, mergeManageNodes } from './managePanelNodes.ts'
+import type { MergedManageNode as MergedNode } from './managePanelNodes.ts'
 
 // ---- Helpers ----
 
@@ -286,66 +275,7 @@ export default function ManagePanel() {
   // ---- Merge config + monitor data ----
 
   const mergedNodes = useMemo((): MergedNode[] => {
-    const snapshots = monitorData?.nodes || []
-    const snapMap = new Map<string, NodeSnapshot>()
-    for (const s of snapshots) {
-      snapMap.set(s.name, s)
-    }
-
-    return configNodes.map((cfg): MergedNode => {
-      const snap = snapMap.get(cfg.name)
-
-      if (cfg.disabled) {
-        return {
-          ...cfg,
-          runtimeStatus: 'disabled',
-          latency_ms: -1,
-          region: undefined,
-          country: undefined,
-          active_connections: 0,
-          success_count: 0,
-          failure_count: 0,
-          tag: undefined,
-        }
-      }
-
-      if (!snap) {
-        return {
-          ...cfg,
-          runtimeStatus: 'pending',
-          latency_ms: -1,
-          region: undefined,
-          country: undefined,
-          active_connections: 0,
-          success_count: 0,
-          failure_count: 0,
-          tag: undefined,
-        }
-      }
-
-      let runtimeStatus: MergedNode['runtimeStatus'] = 'pending'
-      if (snap.blacklisted) {
-        runtimeStatus = 'blacklisted'
-      } else if (!snap.initial_check_done) {
-        runtimeStatus = 'pending'
-      } else if (snap.available) {
-        runtimeStatus = 'normal'
-      } else {
-        runtimeStatus = 'unavailable'
-      }
-
-      return {
-        ...cfg,
-        runtimeStatus,
-        latency_ms: snap.last_latency_ms,
-        region: snap.region,
-        country: snap.country,
-        active_connections: snap.active_connections,
-        success_count: typeof snap.success_count === 'number' ? snap.success_count : 0,
-        failure_count: snap.failure_count,
-        tag: snap.tag,
-      }
-    })
+    return mergeManageNodes(configNodes, monitorData?.nodes || [])
   }, [configNodes, monitorData])
 
   // ---- Filtering ----
@@ -596,17 +526,24 @@ export default function ManagePanel() {
   }
 
   const handleBatchProbe = async () => {
-    const nodesToProbe = sortedNodes.filter(n => selectedNodes.has(n.name) && !n.disabled && n.tag)
-    if (nodesToProbe.length === 0) {
+    const selection = getBatchProbeSelection(sortedNodes, selectedNodes)
+    if (selection.probeable.length === 0) {
       setError('所选节点中没有可探测的节点（已禁用或无运行时标识的节点将被跳过）')
       return
     }
 
     try {
-      const res = await startProbeBatchJob(nodesToProbe.map(n => n.tag!))
+      const res = await startProbeBatchJob(selection.probeable.map(n => n.tag!))
       setActiveProbeJob(res.job)
       setBatchProbeProgress({ current: res.job.completed, total: res.job.total })
-      setSuccess('批量探测任务已启动')
+      if (selection.skippedTotal > 0) {
+        const skippedParts: string[] = []
+        if (selection.skippedNoTag > 0) skippedParts.push(`${selection.skippedNoTag} 个未加载到运行时的节点`)
+        if (selection.skippedDisabled > 0) skippedParts.push(`${selection.skippedDisabled} 个已禁用节点`)
+        setSuccess(`批量探测任务已启动，已跳过 ${skippedParts.join('、')}`)
+      } else {
+        setSuccess('批量探测任务已启动')
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : '批量探测启动失败')
     }
