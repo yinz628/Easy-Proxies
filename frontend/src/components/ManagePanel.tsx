@@ -7,6 +7,15 @@ import {
   fetchNodes, probeNode, releaseNode, startProbeBatchJob, fetchProbeBatchJobStatus, cancelProbeBatchJob,
 } from '../api/client'
 import type { BatchProbeJob } from '../types'
+import { Fragment, useRef } from 'react'
+import type { NodeQualityCheckResult } from '../types'
+import { checkNodeQuality, getNodeQuality, checkNodeQualityBatch } from '../api/client'
+import {
+  applyQualityResultToConfigNode,
+  buildQualityCacheEntry,
+  reduceBatchQualityEvent,
+} from './managePanelQuality.ts'
+import type { BatchQualityState } from './managePanelQuality.ts'
 
 // ---- Merged node type ----
 interface MergedNode extends ConfigNodeConfig {
@@ -82,6 +91,30 @@ function regionFlag(region?: string): string {
   return flags[region?.toLowerCase() || ''] || '🌐'
 }
 
+function qualityStatusTone(status?: string): string {
+  switch (status) {
+    case 'healthy':
+      return 'badge-success border-none bg-success/15 text-success'
+    case 'degraded':
+      return 'badge-warning border-none bg-warning/15 text-warning-content'
+    case 'failed':
+    case 'unhealthy':
+      return 'badge-error border-none bg-error/15 text-error'
+    default:
+      return 'badge-ghost border-none bg-base-300/40 text-base-content/50'
+  }
+}
+
+function formatQualityChecked(epochSeconds?: number): string {
+  if (!epochSeconds) return '未检测'
+  return new Date(epochSeconds * 1000).toLocaleString()
+}
+
+function formatQualityCheckedAt(iso?: string): string {
+  if (!iso) return '未检测'
+  return new Date(iso).toLocaleString()
+}
+
 function SortIcon({ active, dir }: { active: boolean; dir: SortDir }) {
   if (!active) {
     return (
@@ -152,6 +185,11 @@ export default function ManagePanel() {
 
   // Probe state
   const [probingTag, setProbingTag] = useState<string | null>(null)
+  const [qualityLoadingKey, setQualityLoadingKey] = useState<string | null>(null)
+  const [expandedQualityNode, setExpandedQualityNode] = useState<string | null>(null)
+  const [qualityDetails, setQualityDetails] = useState<Record<string, NodeQualityCheckResult>>({})
+  const [batchQualityState, setBatchQualityState] = useState<BatchQualityState | null>(null)
+  const batchQualityControllerRef = useRef<AbortController | null>(null)
 
   // Batch selection
   const [selectedNodes, setSelectedNodes] = useState<Set<string>>(new Set())
@@ -206,6 +244,12 @@ export default function ManagePanel() {
       return () => clearTimeout(timer)
     }
   }, [success])
+
+  useEffect(() => {
+    return () => {
+      batchQualityControllerRef.current?.abort()
+    }
+  }, [])
 
   useEffect(() => {
     let disposed = false
@@ -345,6 +389,7 @@ export default function ManagePanel() {
   }, [filteredNodes, sortKey, sortDir])
 
   const probeJobRunning = activeProbeJob?.status === 'queued' || activeProbeJob?.status === 'running'
+  const qualityBatchRunning = batchQualityState?.status === 'running'
 
   useEffect(() => {
     const current = activeProbeJob?.status ?? null
@@ -464,6 +509,58 @@ export default function ManagePanel() {
     }
   }
 
+  const applyQualityResult = useCallback((nodeName: string, result: NodeQualityCheckResult) => {
+    setQualityDetails(prev => ({ ...prev, [nodeName]: result }))
+    setConfigNodes(prev => prev.map(node => (
+      node.name === nodeName ? applyQualityResultToConfigNode(node, result) : node
+    )))
+  }, [])
+
+  const handleQualityCheck = async (node: MergedNode) => {
+    if (!node.tag) {
+      setError('当前节点还没有运行时标识，暂时无法执行质量检测')
+      return
+    }
+
+    const loadingKey = `check:${node.name}`
+    setExpandedQualityNode(node.name)
+    setQualityLoadingKey(loadingKey)
+    try {
+      const res = await checkNodeQuality(node.tag)
+      applyQualityResult(node.name, res.result)
+      setSuccess(res.message || '质量检测完成')
+      await loadData()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '质量检测失败')
+    } finally {
+      setQualityLoadingKey(current => current === loadingKey ? null : current)
+    }
+  }
+
+  const handleToggleQualityDetails = async (node: MergedNode) => {
+    if (expandedQualityNode === node.name) {
+      setExpandedQualityNode(null)
+      return
+    }
+
+    setExpandedQualityNode(node.name)
+
+    const cached = qualityDetails[node.name]
+    if (cached && cached.items.length > 0) return
+    if (!node.tag) return
+
+    const loadingKey = `detail:${node.name}`
+    setQualityLoadingKey(loadingKey)
+    try {
+      const res = await getNodeQuality(node.tag)
+      applyQualityResult(node.name, res.result)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '加载质量检测详情失败')
+    } finally {
+      setQualityLoadingKey(current => current === loadingKey ? null : current)
+    }
+  }
+
   // ---- Batch ----
 
   const toggleSelectNode = (name: string) => {
@@ -528,6 +625,61 @@ export default function ManagePanel() {
     } catch (err) {
       setError(err instanceof Error ? err.message : '取消批量探测失败')
     }
+  }
+
+  const handleBatchQualityCheck = async () => {
+    const nodesToCheck = sortedNodes.filter(n => selectedNodes.has(n.name) && !n.disabled && n.tag)
+    if (nodesToCheck.length === 0) {
+      setError('所选节点中没有可做质量检测的节点（已禁用或无运行时标识的节点将被跳过）')
+      return
+    }
+
+    batchQualityControllerRef.current?.abort()
+    const nameByTag = new Map(nodesToCheck.map(node => [node.tag!, node.name]))
+    setBatchQualityState({
+      status: 'running',
+      total: nodesToCheck.length,
+      current: 0,
+      success: 0,
+      failed: 0,
+      lastResult: null,
+    })
+
+    const controller = checkNodeQualityBatch(
+      nodesToCheck.map(node => node.tag!),
+      (event) => {
+        setBatchQualityState(prev => reduceBatchQualityEvent(prev, event))
+
+        if (event.type === 'progress' && event.status === 'success') {
+          const nodeName = nameByTag.get(event.tag)
+          if (nodeName) {
+            setConfigNodes(prev => prev.map(node => (
+              node.name === nodeName
+                ? {
+                    ...node,
+                    quality_status: event.quality_status ?? node.quality_status,
+                    quality_score: event.quality_score ?? node.quality_score,
+                    quality_grade: event.quality_grade ?? node.quality_grade,
+                  }
+                : node
+            )))
+          }
+        }
+
+        if (event.type === 'complete') {
+          batchQualityControllerRef.current = null
+          setSuccess(`批量质量检测完成：成功 ${event.success}，失败 ${event.failed}`)
+          void loadData()
+        }
+      },
+      (err) => {
+        batchQualityControllerRef.current = null
+        setError(err instanceof Error ? err.message : '批量质量检测失败')
+        setBatchQualityState(prev => prev ? { ...prev, status: 'completed' } : prev)
+      },
+    )
+
+    batchQualityControllerRef.current = controller
   }
 
   const handleBatchDelete = async () => {
@@ -742,6 +894,34 @@ export default function ManagePanel() {
           ></progress>
         </div>
       )}
+      {batchQualityState && (
+        <div className={`rounded-2xl border px-5 py-4 shadow-sm ${qualityBatchRunning ? 'border-secondary/30 bg-secondary/5' : 'border-base-300/50 bg-base-100'}`}>
+          <div className="flex flex-col lg:flex-row lg:items-center gap-3">
+            <div className="flex-1">
+              <div className="text-sm font-semibold text-base-content">
+                批量质量检测
+                <span className="ml-2 badge badge-sm">{batchQualityState.status}</span>
+              </div>
+              <div className="text-xs text-base-content/60 mt-1">
+                进度 {batchQualityState.current}/{batchQualityState.total} · 成功 {batchQualityState.success} · 失败 {batchQualityState.failed}
+              </div>
+              {batchQualityState.lastResult && (
+                <div className="text-xs text-base-content/50 mt-1">
+                  最近完成: {batchQualityState.lastResult.name}
+                  {batchQualityState.lastResult.status === 'error'
+                    ? ` · ${batchQualityState.lastResult.error || '检测失败'}`
+                    : ` · ${batchQualityState.lastResult.quality_grade || '-'} / ${batchQualityState.lastResult.quality_status || 'unknown'}`}
+                </div>
+              )}
+            </div>
+          </div>
+          <progress
+            className="progress progress-secondary w-full h-2 mt-3"
+            value={batchQualityState.current}
+            max={batchQualityState.total || 1}
+          ></progress>
+        </div>
+      )}
 
       {/* Filters Area */}
       <div className="bg-base-100 border border-base-300/50 rounded-2xl p-4 shadow-sm">
@@ -796,32 +976,42 @@ export default function ManagePanel() {
               <button
                 className="btn btn-sm btn-primary shadow-sm gap-1.5"
                 onClick={handleBatchProbe}
-                disabled={batchProcessing || probeJobRunning}
+                disabled={batchProcessing || probeJobRunning || qualityBatchRunning}
                 title="对选中的已启用节点逐个探测"
               >
                 {batchProbeProgress
                   ? <><span className="loading loading-spinner loading-xs"></span> {batchProbeProgress.current}/{batchProbeProgress.total}</>
                   : <><svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M13 10V3L4 14h7v7l9-11h-7z" /></svg> 批量探测</>}
               </button>
+              <button
+                className="btn btn-sm btn-secondary shadow-sm gap-1.5"
+                onClick={handleBatchQualityCheck}
+                disabled={batchProcessing || probeJobRunning || qualityBatchRunning}
+                title="对选中的已启用节点执行批量质量检测"
+              >
+                {qualityBatchRunning
+                  ? <><span className="loading loading-spinner loading-xs"></span> {batchQualityState?.current || 0}/{batchQualityState?.total || 0}</>
+                  : <><svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 12l2 2 4-4m5-2a9 9 0 11-18 0 9 9 0 0118 0z" /></svg> 批量质检</>}
+              </button>
               <div className="w-px h-6 bg-base-300 mx-1 self-center"></div>
               <button
                 className="btn btn-sm btn-success border-none bg-success/15 text-success hover:bg-success hover:text-success-content"
                 onClick={() => handleBatchToggle(true)}
-                disabled={batchProcessing || probeJobRunning}
+                disabled={batchProcessing || probeJobRunning || qualityBatchRunning}
               >
                 启用
               </button>
               <button
                 className="btn btn-sm btn-warning border-none bg-warning/15 text-warning-content hover:bg-warning hover:text-warning-content"
                 onClick={() => handleBatchToggle(false)}
-                disabled={batchProcessing || probeJobRunning}
+                disabled={batchProcessing || probeJobRunning || qualityBatchRunning}
               >
                 禁用
               </button>
               <button
                 className="btn btn-sm btn-error border-none bg-error/15 text-error hover:bg-error hover:text-error-content"
                 onClick={() => setBatchDeleteConfirm(true)}
-                disabled={batchProcessing || probeJobRunning}
+                disabled={batchProcessing || probeJobRunning || qualityBatchRunning}
               >
                 删除
               </button>
@@ -829,7 +1019,7 @@ export default function ManagePanel() {
               <button
                 className="btn btn-sm btn-ghost hover:bg-base-300"
                 onClick={() => setSelectedNodes(new Set())}
-                disabled={batchProcessing || probeJobRunning}
+                disabled={batchProcessing || probeJobRunning || qualityBatchRunning}
               >
                 取消选择
               </button>
@@ -905,102 +1095,208 @@ export default function ManagePanel() {
                   </td>
                 </tr>
               ) : (
-                sortedNodes.map((node) => (
-                  <tr
-                    key={node.name}
-                    className={`
-                      transition-colors border-b border-base-200/50 last:border-none group
-                      ${node.runtimeStatus === 'disabled' ? 'opacity-50 grayscale-[0.5]' : ''}
-                      ${node.runtimeStatus === 'blacklisted' ? 'opacity-80' : ''}
-                      ${selectedNodes.has(node.name) ? 'bg-primary/5' : 'hover:bg-base-200/40'}
-                    `}
-                  >
-                    <td className="w-8">
-                      <input
-                        type="checkbox"
-                        className="checkbox checkbox-sm"
-                        checked={selectedNodes.has(node.name)}
-                        onChange={() => toggleSelectNode(node.name)}
-                      />
-                    </td>
-                    <td>
-                      <div className="font-semibold text-sm flex items-center gap-2">
-                        {node.region && <span className="text-lg leading-none filter drop-shadow-sm">{regionFlag(node.region)}</span>}
-                        <span className="truncate max-w-[200px]" title={node.name}>{node.name}</span>
-                      </div>
-                    </td>
-                    <td><StatusBadge status={node.runtimeStatus} /></td>
-                    <td className={`font-mono text-sm font-medium ${latencyColor(node.latency_ms)}`}>
-                      {node.latency_ms < 0 ? <span className="text-base-content/30">-</span> : `${node.latency_ms} ms`}
-                    </td>
-                    <td className="hidden md:table-cell text-sm text-base-content/70">
-                      {node.country || node.region
-                        ? <div className="badge badge-ghost badge-sm">{node.country || node.region}</div>
-                        : '-'}
-                    </td>
-                    <td className="hidden md:table-cell font-mono text-sm text-base-content/70">{node.port || '-'}</td>
-                    <td className="hidden lg:table-cell">
-                      <div className="badge badge-ghost badge-sm opacity-70 bg-transparent border-base-300">{sourceLabel(node.source)}</div>
-                    </td>
-                    <td>
-                      <div className="flex gap-1.5 opacity-60 group-hover:opacity-100 transition-opacity">
-                        {/* Probe - only for enabled nodes with a tag */}
-                        {!node.disabled && node.tag && (
-                          <button
-                            className="btn btn-sm btn-square btn-ghost text-primary hover:bg-primary/10"
-                            onClick={() => handleProbe(node.tag!)}
-                            disabled={probingTag === node.tag}
-                            title="探测延迟"
-                          >
-                            {probingTag === node.tag
-                              ? <span className="loading loading-spinner loading-xs"></span>
-                              : <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M13 10V3L4 14h7v7l9-11h-7z" /></svg>}
-                          </button>
-                        )}
-                        {/* Release from blacklist */}
-                        {node.runtimeStatus === 'blacklisted' && node.tag && (
-                          <button
-                            className="btn btn-sm btn-square btn-ghost text-warning hover:bg-warning/10"
-                            onClick={() => handleRelease(node.tag!)}
-                            title="解除黑名单"
-                          >
-                            <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M8 11V7a4 4 0 118 0m-4 8v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2z" /></svg>
-                          </button>
-                        )}
-                        {/* Toggle enable/disable */}
-                        <button
-                          className={`btn btn-sm btn-square btn-ghost ${node.disabled ? 'text-success hover:bg-success/10' : 'text-warning hover:bg-warning/10'}`}
-                          onClick={() => handleToggle(node)}
-                          disabled={toggling === node.name}
-                          title={node.disabled ? '启用该节点' : '禁用该节点'}
-                        >
-                          {toggling === node.name
-                            ? <span className="loading loading-spinner loading-xs"></span>
-                            : node.disabled
-                                ? <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M5 13l4 4L19 7" /></svg>
-                                : <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M18.364 18.364A9 9 0 005.636 5.636m12.728 12.728A9 9 0 015.636 5.636m12.728 12.728L5.636 5.636" /></svg>
-                          }
-                        </button>
-                        {/* Edit */}
-                        <button
-                          className="btn btn-sm btn-square btn-ghost text-info hover:bg-info/10"
-                          onClick={() => openEditModal(node)}
-                          title="编辑节点配置"
-                        >
-                          <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" /></svg>
-                        </button>
-                        {/* Delete */}
-                        <button
-                          className="btn btn-sm btn-square btn-ghost text-error hover:bg-error/10"
-                          onClick={() => setDeleteTarget(node.name)}
-                          title="删除节点"
-                        >
-                          <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>
-                        </button>
-                      </div>
-                    </td>
-                  </tr>
-                ))
+                sortedNodes.map((node) => {
+                  const detail = qualityDetails[node.name] ?? buildQualityCacheEntry(node)
+                  const isExpanded = expandedQualityNode === node.name
+                  const isCheckingQuality = qualityLoadingKey === `check:${node.name}`
+                  const isLoadingDetail = qualityLoadingKey === `detail:${node.name}`
+                  const canShowQuality = !!node.tag || !!detail
+
+                  return (
+                    <Fragment key={node.name}>
+                      <tr
+                        className={`
+                          transition-colors border-b border-base-200/50 group
+                          ${node.runtimeStatus === 'disabled' ? 'opacity-50 grayscale-[0.5]' : ''}
+                          ${node.runtimeStatus === 'blacklisted' ? 'opacity-80' : ''}
+                          ${selectedNodes.has(node.name) ? 'bg-primary/5' : 'hover:bg-base-200/40'}
+                        `}
+                      >
+                        <td className="w-8">
+                          <input
+                            type="checkbox"
+                            className="checkbox checkbox-sm"
+                            checked={selectedNodes.has(node.name)}
+                            onChange={() => toggleSelectNode(node.name)}
+                          />
+                        </td>
+                        <td>
+                          <div className="font-semibold text-sm flex items-center gap-2">
+                            {node.region && <span className="text-lg leading-none filter drop-shadow-sm">{regionFlag(node.region)}</span>}
+                            <span className="truncate max-w-[200px]" title={node.name}>{node.name}</span>
+                          </div>
+                          <div className="mt-1 flex flex-wrap items-center gap-2 text-xs">
+                            {node.quality_grade ? (
+                              <span className={`badge badge-sm ${qualityStatusTone(node.quality_status)}`}>
+                                {node.quality_grade} · {node.quality_status || 'unknown'}
+                              </span>
+                            ) : (
+                              <span className="text-base-content/35">未做质量检测</span>
+                            )}
+                            {typeof node.quality_score === 'number' && (
+                              <span className="font-mono text-base-content/55">分数 {node.quality_score}</span>
+                            )}
+                            {(node.quality_checked || detail?.quality_checked_at) && (
+                              <span className="text-base-content/45">
+                                {node.quality_checked ? formatQualityChecked(node.quality_checked) : formatQualityCheckedAt(detail?.quality_checked_at)}
+                              </span>
+                            )}
+                            {canShowQuality && (
+                              <button
+                                className="link link-hover text-info"
+                                onClick={() => void handleToggleQualityDetails(node)}
+                                type="button"
+                              >
+                                {isExpanded ? '收起详情' : '查看详情'}
+                              </button>
+                            )}
+                          </div>
+                        </td>
+                        <td><StatusBadge status={node.runtimeStatus} /></td>
+                        <td className={`font-mono text-sm font-medium ${latencyColor(node.latency_ms)}`}>
+                          {node.latency_ms < 0 ? <span className="text-base-content/30">-</span> : `${node.latency_ms} ms`}
+                        </td>
+                        <td className="hidden md:table-cell text-sm text-base-content/70">
+                          {node.country || node.region
+                            ? <div className="badge badge-ghost badge-sm">{node.country || node.region}</div>
+                            : '-'}
+                        </td>
+                        <td className="hidden md:table-cell font-mono text-sm text-base-content/70">{node.port || '-'}</td>
+                        <td className="hidden lg:table-cell">
+                          <div className="badge badge-ghost badge-sm opacity-70 bg-transparent border-base-300">{sourceLabel(node.source)}</div>
+                        </td>
+                        <td>
+                          <div className="flex gap-1.5 opacity-60 group-hover:opacity-100 transition-opacity">
+                            {!node.disabled && node.tag && (
+                              <button
+                                className="btn btn-sm btn-square btn-ghost text-primary hover:bg-primary/10"
+                                onClick={() => handleProbe(node.tag!)}
+                                disabled={probingTag === node.tag || qualityBatchRunning}
+                                title="探测延迟"
+                              >
+                                {probingTag === node.tag
+                                  ? <span className="loading loading-spinner loading-xs"></span>
+                                  : <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M13 10V3L4 14h7v7l9-11h-7z" /></svg>}
+                              </button>
+                            )}
+                            {!node.disabled && node.tag && (
+                              <button
+                                className="btn btn-sm btn-square btn-ghost text-secondary hover:bg-secondary/10"
+                                onClick={() => void handleQualityCheck(node)}
+                                disabled={isCheckingQuality || qualityBatchRunning}
+                                title="执行质量检测"
+                              >
+                                {isCheckingQuality
+                                  ? <span className="loading loading-spinner loading-xs"></span>
+                                  : <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 12l2 2 4-4m5-2a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>}
+                              </button>
+                            )}
+                            {node.runtimeStatus === 'blacklisted' && node.tag && (
+                              <button
+                                className="btn btn-sm btn-square btn-ghost text-warning hover:bg-warning/10"
+                                onClick={() => handleRelease(node.tag!)}
+                                title="解除黑名单"
+                              >
+                                <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M8 11V7a4 4 0 118 0m-4 8v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2z" /></svg>
+                              </button>
+                            )}
+                            <button
+                              className={`btn btn-sm btn-square btn-ghost ${node.disabled ? 'text-success hover:bg-success/10' : 'text-warning hover:bg-warning/10'}`}
+                              onClick={() => handleToggle(node)}
+                              disabled={toggling === node.name || qualityBatchRunning}
+                              title={node.disabled ? '启用该节点' : '禁用该节点'}
+                            >
+                              {toggling === node.name
+                                ? <span className="loading loading-spinner loading-xs"></span>
+                                : node.disabled
+                                    ? <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M5 13l4 4L19 7" /></svg>
+                                    : <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M18.364 18.364A9 9 0 005.636 5.636m12.728 12.728A9 9 0 015.636 5.636m12.728 12.728L5.636 5.636" /></svg>
+                              }
+                            </button>
+                            <button
+                              className="btn btn-sm btn-square btn-ghost text-info hover:bg-info/10"
+                              onClick={() => openEditModal(node)}
+                              title="编辑节点配置"
+                            >
+                              <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" /></svg>
+                            </button>
+                            <button
+                              className="btn btn-sm btn-square btn-ghost text-error hover:bg-error/10"
+                              onClick={() => setDeleteTarget(node.name)}
+                              title="删除节点"
+                            >
+                              <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                      {isExpanded && (
+                        <tr className="bg-base-200/20 border-b border-base-200/50">
+                          <td colSpan={8} className="px-4 py-4">
+                            <div className="rounded-2xl border border-base-300/50 bg-base-100 px-4 py-4 shadow-sm">
+                              <div className="flex flex-col lg:flex-row lg:items-start gap-4">
+                                <div className="flex-1 space-y-3">
+                                  <div className="flex flex-wrap items-center gap-2">
+                                    <span className={`badge badge-sm ${qualityStatusTone(detail?.quality_status)}`}>
+                                      {detail?.quality_grade || node.quality_grade || '-'} · {detail?.quality_status || node.quality_status || 'unknown'}
+                                    </span>
+                                    {typeof (detail?.quality_score ?? node.quality_score) === 'number' && (
+                                      <span className="badge badge-ghost badge-sm">分数 {detail?.quality_score ?? node.quality_score}</span>
+                                    )}
+                                    <span className="text-xs text-base-content/50">
+                                      {detail?.quality_checked_at ? formatQualityCheckedAt(detail.quality_checked_at) : formatQualityChecked(node.quality_checked)}
+                                    </span>
+                                    {isLoadingDetail && <span className="loading loading-spinner loading-xs text-primary"></span>}
+                                  </div>
+                                  <div className="text-sm text-base-content/75">
+                                    {detail?.quality_summary || node.quality_summary || '暂无质量检测摘要'}
+                                  </div>
+                                  <div className="flex flex-wrap gap-2 text-xs text-base-content/60">
+                                    {(detail?.exit_ip || node.exit_ip) && <span className="badge badge-ghost badge-sm">出口 IP {detail?.exit_ip || node.exit_ip}</span>}
+                                    {(detail?.exit_country || node.exit_country) && (
+                                      <span className="badge badge-ghost badge-sm">
+                                        {(detail?.exit_country_code || node.exit_country_code || '').toUpperCase()} {detail?.exit_country || node.exit_country}
+                                      </span>
+                                    )}
+                                    {(detail?.exit_region || node.exit_region) && <span className="badge badge-ghost badge-sm">区域 {detail?.exit_region || node.exit_region}</span>}
+                                  </div>
+                                </div>
+                                {node.tag && (
+                                  <button
+                                    className="btn btn-sm btn-secondary"
+                                    onClick={() => void handleQualityCheck(node)}
+                                    disabled={isCheckingQuality}
+                                  >
+                                    {isCheckingQuality ? <span className="loading loading-spinner loading-xs"></span> : '重新检测'}
+                                  </button>
+                                )}
+                              </div>
+                              <div className="mt-4">
+                                {detail?.items && detail.items.length > 0 ? (
+                                  <div className="grid gap-2">
+                                    {detail.items.map((item, index) => (
+                                      <div key={`${item.target}-${index}`} className="flex flex-col lg:flex-row lg:items-center gap-2 rounded-xl border border-base-300/40 bg-base-200/20 px-3 py-2 text-sm">
+                                        <div className="font-medium text-base-content min-w-[120px]">{item.target}</div>
+                                        <div className={`badge badge-sm ${qualityStatusTone(item.status)}`}>{item.status}</div>
+                                        {typeof item.http_status === 'number' && <div className="text-base-content/55">HTTP {item.http_status}</div>}
+                                        {typeof item.latency_ms === 'number' && <div className="text-base-content/55">{item.latency_ms} ms</div>}
+                                        {item.message && <div className="text-base-content/60 break-all">{item.message}</div>}
+                                      </div>
+                                    ))}
+                                  </div>
+                                ) : (
+                                  <div className="text-sm text-base-content/45">
+                                    {node.tag ? '暂无详细检查项，展开时会按需加载。' : '当前仅能展示已持久化的质量摘要。'}
+                                  </div>
+                                )}
+                              </div>
+                            </div>
+                          </td>
+                        </tr>
+                      )}
+                    </Fragment>
+                  )
+                })
               )}
             </tbody>
           </table>
@@ -1172,13 +1468,13 @@ export default function ManagePanel() {
               确定要删除选中的 <strong>{selectedNodes.size}</strong> 个节点吗？此操作不可撤销。
             </p>
             <div className="modal-action">
-              <button className="btn btn-ghost" onClick={() => setBatchDeleteConfirm(false)} disabled={batchProcessing || probeJobRunning}>取消</button>
-              <button className="btn btn-error" onClick={handleBatchDelete} disabled={batchProcessing || probeJobRunning}>
-                {batchProcessing || probeJobRunning ? <span className="loading loading-spinner loading-xs"></span> : `删除 ${selectedNodes.size} 个节点`}
+              <button className="btn btn-ghost" onClick={() => setBatchDeleteConfirm(false)} disabled={batchProcessing || probeJobRunning || qualityBatchRunning}>取消</button>
+              <button className="btn btn-error" onClick={handleBatchDelete} disabled={batchProcessing || probeJobRunning || qualityBatchRunning}>
+                {batchProcessing || probeJobRunning || qualityBatchRunning ? <span className="loading loading-spinner loading-xs"></span> : `删除 ${selectedNodes.size} 个节点`}
               </button>
             </div>
           </div>
-          <form method="dialog" className="modal-backdrop" onClick={() => !(batchProcessing || probeJobRunning) && setBatchDeleteConfirm(false)}>
+          <form method="dialog" className="modal-backdrop" onClick={() => !(batchProcessing || probeJobRunning || qualityBatchRunning) && setBatchDeleteConfirm(false)}>
             <button>close</button>
           </form>
         </div>

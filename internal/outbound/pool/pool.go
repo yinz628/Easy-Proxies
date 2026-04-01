@@ -296,7 +296,7 @@ func (p *poolOutbound) probeAllMembersOnStartup() {
 		}
 
 		// Perform HTTP probe to measure actual latency (TTFB)
-		_, err = httpProbe(conn, destination.AddrString())
+		_, err = httpProbe(ctx, conn, destination.AddrString())
 		conn.Close()
 
 		if err != nil {
@@ -312,6 +312,16 @@ func (p *poolOutbound) probeAllMembersOnStartup() {
 
 		// Total latency = dial + HTTP probe
 		latency := time.Since(start)
+		if err := monitor.ProbeLatencyError(latency); err != nil {
+			p.logger.Warn("initial probe exceeded latency threshold for ", member.tag, ": ", err)
+			failedCount++
+			if member.entry != nil {
+				member.entry.RecordFailure(err, probeDst)
+				member.entry.MarkInitialCheckDone(false)
+			}
+			cancel()
+			continue
+		}
 		latencyMs := latency.Milliseconds()
 		p.logger.Info("initial probe success for ", member.tag, ", latency: ", latencyMs, "ms")
 		availableCount++
@@ -521,12 +531,15 @@ func (p *poolOutbound) makeReleaseFunc(member *memberState) func() {
 
 // httpProbe performs an HTTP probe through the connection and measures TTFB.
 // It sends a minimal HTTP request and waits for the first byte of response.
-func httpProbe(conn net.Conn, host string) (time.Duration, error) {
+func httpProbe(ctx context.Context, conn net.Conn, host string) (time.Duration, error) {
 	// Build HTTP request
 	req := fmt.Sprintf("GET /generate_204 HTTP/1.1\r\nHost: %s\r\nConnection: close\r\nUser-Agent: Mozilla/5.0\r\n\r\n", host)
 
-	// Try to set write deadline (ignore errors for connections that don't support it)
-	_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	stopCancelWatch := watchProbeContext(ctx, conn)
+	defer stopCancelWatch()
+
+	// Use the earlier deadline between the probe context and the fallback probe window.
+	_ = conn.SetDeadline(probeDeadline(ctx, 10*time.Second))
 
 	// Record time just before sending request
 	start := time.Now()
@@ -536,19 +549,42 @@ func httpProbe(conn net.Conn, host string) (time.Duration, error) {
 		return 0, fmt.Errorf("write request: %w", err)
 	}
 
-	// Try to set read deadline (ignore errors for connections that don't support it)
-	_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
-
 	// Read first byte (TTFB - Time To First Byte)
 	reader := bufio.NewReader(conn)
 	_, err := reader.ReadByte()
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return 0, fmt.Errorf("probe cancelled: %w", ctxErr)
+		}
 		return 0, fmt.Errorf("read response: %w", err)
 	}
 
 	// Calculate TTFB
 	ttfb := time.Since(start)
 	return ttfb, nil
+}
+
+func probeDeadline(ctx context.Context, fallback time.Duration) time.Time {
+	deadline := time.Now().Add(fallback)
+	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
+		return ctxDeadline
+	}
+	return deadline
+}
+
+func watchProbeContext(ctx context.Context, conn net.Conn) func() {
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = conn.SetDeadline(time.Now())
+			_ = conn.Close()
+		case <-done:
+		}
+	}()
+	return func() {
+		close(done)
+	}
 }
 
 func (p *poolOutbound) makeProbeFunc(member *memberState) func(ctx context.Context) (time.Duration, error) {
@@ -578,7 +614,7 @@ func (p *poolOutbound) makeProbeFunc(member *memberState) func(ctx context.Conte
 		defer conn.Close()
 
 		// Perform HTTP probe to measure actual latency (TTFB)
-		_, err = httpProbe(conn, destination.AddrString())
+		_, err = httpProbe(ctx, conn, destination.AddrString())
 		if err != nil {
 			if member.entry != nil {
 				member.entry.RecordFailure(err, probeDst)
@@ -588,6 +624,12 @@ func (p *poolOutbound) makeProbeFunc(member *memberState) func(ctx context.Conte
 
 		// Total duration = dial time + HTTP probe
 		duration := time.Since(start)
+		if err := monitor.ProbeLatencyError(duration); err != nil {
+			if member.entry != nil {
+				member.entry.RecordFailure(err, probeDst)
+			}
+			return 0, err
+		}
 		if member.entry != nil {
 			member.entry.RecordSuccessWithLatency(duration)
 		}
@@ -736,7 +778,7 @@ func (p *poolOutbound) makeProbeByTagFunc(tag string) func(ctx context.Context) 
 		defer conn.Close()
 
 		// Perform HTTP probe to measure actual latency (TTFB)
-		_, err = httpProbe(conn, destination.AddrString())
+		_, err = httpProbe(ctx, conn, destination.AddrString())
 		if err != nil {
 			if member.entry != nil {
 				member.entry.RecordFailure(err, probeDst)
@@ -746,6 +788,12 @@ func (p *poolOutbound) makeProbeByTagFunc(tag string) func(ctx context.Context) 
 
 		// Total duration = dial time + TTFB
 		duration := time.Since(start)
+		if err := monitor.ProbeLatencyError(duration); err != nil {
+			if member.entry != nil {
+				member.entry.RecordFailure(err, probeDst)
+			}
+			return 0, err
+		}
 		if member.entry != nil {
 			member.entry.RecordSuccessWithLatency(duration)
 		}

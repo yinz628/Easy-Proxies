@@ -64,3 +64,143 @@ func TestBatchProbeJobManagerTracksProgressAndCompletion(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 }
+
+func TestBatchProbeJobManagerTreatsHighLatencyAsFailure(t *testing.T) {
+	manager := NewBatchProbeJobManager(1)
+	job, err := manager.Start(
+		[]string{"slow"},
+		[]Snapshot{{NodeInfo: NodeInfo{Tag: "slow", Name: "slow-node"}}},
+		func(ctx context.Context, snap Snapshot) (int64, error) {
+			return 10001, nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		current := manager.Status()
+		if current != nil && current.ID == job.ID && current.Status == BatchProbeCompleted {
+			if current.Completed != 1 {
+				t.Fatalf("Completed = %d, want 1", current.Completed)
+			}
+			if current.Success != 0 {
+				t.Fatalf("Success = %d, want 0", current.Success)
+			}
+			if current.Failed != 1 {
+				t.Fatalf("Failed = %d, want 1", current.Failed)
+			}
+			if current.LastResult == nil || current.LastResult.Error == "" {
+				t.Fatalf("LastResult = %+v, want timeout error", current.LastResult)
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("job did not complete before deadline: %+v", current)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestBatchProbeJobManagerCancelCompletesHungProbe(t *testing.T) {
+	manager := NewBatchProbeJobManager(1)
+	release := make(chan struct{})
+	t.Cleanup(func() {
+		close(release)
+	})
+
+	job, err := manager.Start(
+		[]string{"hung"},
+		[]Snapshot{{NodeInfo: NodeInfo{Tag: "hung", Name: "hung-node"}}},
+		func(ctx context.Context, snap Snapshot) (int64, error) {
+			<-release
+			return 0, nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+
+	startDeadline := time.Now().Add(300 * time.Millisecond)
+	for {
+		current := manager.Status()
+		if current != nil && current.ID == job.ID && current.ActiveWorkers == 1 {
+			break
+		}
+		if time.Now().After(startDeadline) {
+			t.Fatalf("worker did not start before deadline: %+v", current)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if err := manager.Cancel(job.ID); err != nil {
+		t.Fatalf("Cancel() error = %v", err)
+	}
+
+	deadline := time.Now().Add(300 * time.Millisecond)
+	for {
+		current := manager.Status()
+		if current != nil && current.ID == job.ID && current.Status == BatchProbeCancelled {
+			if current.ActiveWorkers != 0 {
+				t.Fatalf("ActiveWorkers = %d, want 0", current.ActiveWorkers)
+			}
+			if current.Completed != 1 {
+				t.Fatalf("Completed = %d, want 1", current.Completed)
+			}
+			if current.Failed != 1 {
+				t.Fatalf("Failed = %d, want 1", current.Failed)
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("job did not cancel before deadline: %+v", current)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestBatchProbeJobManagerTimesOutHungProbe(t *testing.T) {
+	manager := NewBatchProbeJobManager(1)
+	manager.probeTimeout = 20 * time.Millisecond
+	release := make(chan struct{})
+	t.Cleanup(func() {
+		close(release)
+	})
+
+	job, err := manager.Start(
+		[]string{"timeout"},
+		[]Snapshot{{NodeInfo: NodeInfo{Tag: "timeout", Name: "timeout-node"}}},
+		func(ctx context.Context, snap Snapshot) (int64, error) {
+			<-release
+			return 0, nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+
+	deadline := time.Now().Add(300 * time.Millisecond)
+	for {
+		current := manager.Status()
+		if current != nil && current.ID == job.ID && current.Status == BatchProbeCompleted {
+			if current.ActiveWorkers != 0 {
+				t.Fatalf("ActiveWorkers = %d, want 0", current.ActiveWorkers)
+			}
+			if current.Completed != 1 {
+				t.Fatalf("Completed = %d, want 1", current.Completed)
+			}
+			if current.Failed != 1 {
+				t.Fatalf("Failed = %d, want 1", current.Failed)
+			}
+			if current.LastResult == nil || current.LastResult.Error == "" {
+				t.Fatalf("LastResult = %+v, want timeout error", current.LastResult)
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("job did not time out before deadline: %+v", current)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}

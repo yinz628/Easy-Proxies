@@ -20,6 +20,8 @@ const (
 
 var ErrBatchProbeJobRunning = errors.New("a batch probe job is already running")
 
+const defaultBatchProbeTimeout = 10 * time.Second
+
 type BatchProbeJobResult struct {
 	Tag       string `json:"tag"`
 	Name      string `json:"name"`
@@ -28,33 +30,39 @@ type BatchProbeJobResult struct {
 }
 
 type BatchProbeJob struct {
-	ID            string              `json:"id"`
-	Status        BatchProbeJobStatus `json:"status"`
-	StartedAt     time.Time           `json:"started_at"`
-	UpdatedAt     time.Time           `json:"updated_at"`
-	CompletedAt   *time.Time          `json:"completed_at,omitempty"`
-	Total         int                 `json:"total"`
-	Completed     int                 `json:"completed"`
-	Success       int                 `json:"success"`
-	Failed        int                 `json:"failed"`
-	ActiveWorkers int                 `json:"active_workers"`
-	RequestedTags []string            `json:"requested_tags"`
+	ID            string               `json:"id"`
+	Status        BatchProbeJobStatus  `json:"status"`
+	StartedAt     time.Time            `json:"started_at"`
+	UpdatedAt     time.Time            `json:"updated_at"`
+	CompletedAt   *time.Time           `json:"completed_at,omitempty"`
+	Total         int                  `json:"total"`
+	Completed     int                  `json:"completed"`
+	Success       int                  `json:"success"`
+	Failed        int                  `json:"failed"`
+	ActiveWorkers int                  `json:"active_workers"`
+	RequestedTags []string             `json:"requested_tags"`
 	LastResult    *BatchProbeJobResult `json:"last_result,omitempty"`
-	LastError     string              `json:"last_error,omitempty"`
+	LastError     string               `json:"last_error,omitempty"`
 }
 
 type BatchProbeJobManager struct {
-	mu      sync.RWMutex
-	job     *BatchProbeJob
-	cancel  context.CancelFunc
-	workers int
+	mu                 sync.RWMutex
+	job                *BatchProbeJob
+	cancel             context.CancelFunc
+	workers            int
+	probeTimeout       time.Duration
+	unavailableLatency time.Duration
 }
 
 func NewBatchProbeJobManager(workers int) *BatchProbeJobManager {
 	if workers <= 0 {
 		workers = 8
 	}
-	return &BatchProbeJobManager{workers: workers}
+	return &BatchProbeJobManager{
+		workers:            workers,
+		probeTimeout:       defaultBatchProbeTimeout,
+		unavailableLatency: defaultBatchProbeTimeout,
+	}
 }
 
 func (m *BatchProbeJobManager) Start(tags []string, snapshots []Snapshot, probeFn func(ctx context.Context, snap Snapshot) (int64, error)) (*BatchProbeJob, error) {
@@ -124,7 +132,7 @@ func (m *BatchProbeJobManager) run(ctx context.Context, job *BatchProbeJob, snap
 					current.UpdatedAt = time.Now()
 				})
 
-				latency, err := probeFn(ctx, snap)
+				latency, err := m.runProbe(ctx, snap, probeFn)
 				result := BatchProbeJobResult{
 					Tag:       snap.Tag,
 					Name:      snap.Name,
@@ -179,6 +187,61 @@ func (m *BatchProbeJobManager) run(ctx context.Context, job *BatchProbeJob, snap
 	m.job.ActiveWorkers = 0
 	m.job.UpdatedAt = now
 	m.cancel = nil
+}
+
+type batchProbeResult struct {
+	latency int64
+	err     error
+}
+
+func (m *BatchProbeJobManager) runProbe(ctx context.Context, snap Snapshot, probeFn func(ctx context.Context, snap Snapshot) (int64, error)) (int64, error) {
+	timeout := m.effectiveProbeTimeout()
+	probeCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	resultCh := make(chan batchProbeResult, 1)
+	go func() {
+		latency, err := probeFn(probeCtx, snap)
+		resultCh <- batchProbeResult{latency: latency, err: err}
+	}()
+
+	select {
+	case <-probeCtx.Done():
+		return -1, batchProbeContextError(probeCtx.Err(), timeout)
+	case result := <-resultCh:
+		if err := probeCtx.Err(); err != nil {
+			return -1, batchProbeContextError(err, timeout)
+		}
+		if result.err != nil {
+			return -1, result.err
+		}
+		maxLatency := m.effectiveUnavailableLatency()
+		if result.latency > maxLatency.Milliseconds() {
+			return -1, fmt.Errorf("probe exceeded %dms", maxLatency.Milliseconds())
+		}
+		return result.latency, nil
+	}
+}
+
+func (m *BatchProbeJobManager) effectiveProbeTimeout() time.Duration {
+	if m.probeTimeout > 0 {
+		return m.probeTimeout
+	}
+	return defaultBatchProbeTimeout
+}
+
+func (m *BatchProbeJobManager) effectiveUnavailableLatency() time.Duration {
+	if m.unavailableLatency > 0 {
+		return m.unavailableLatency
+	}
+	return m.effectiveProbeTimeout()
+}
+
+func batchProbeContextError(err error, timeout time.Duration) error {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Errorf("probe timeout after %dms", timeout.Milliseconds())
+	}
+	return fmt.Errorf("probe cancelled: %w", err)
 }
 
 func (m *BatchProbeJobManager) update(jobID string, mutate func(job *BatchProbeJob)) {
