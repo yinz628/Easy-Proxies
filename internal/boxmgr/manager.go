@@ -30,7 +30,7 @@ const (
 	defaultHealthCheckTimeout = 30 * time.Second
 	healthCheckPollInterval   = 500 * time.Millisecond
 	// periodicHealthInterval is configured via cfg.Management.HealthCheckInterval
-	periodicHealthTimeout     = 10 * time.Second
+	periodicHealthTimeout = 10 * time.Second
 )
 
 // Logger defines logging interface for the manager.
@@ -479,6 +479,8 @@ func (m *Manager) ensureMonitor(ctx context.Context) error {
 	}
 	monitorMgr.SetLogger(monitorLoggerAdapter{logger: m.logger})
 	m.monitorMgr = monitorMgr
+	storeRef := m.store
+	loggerRef := m.logger
 
 	var serverToStart *monitor.Server
 	if m.monitorCfg.Enabled {
@@ -494,9 +496,69 @@ func (m *Manager) ensureMonitor(ctx context.Context) error {
 	}
 	m.mu.Unlock()
 
+	if storeRef != nil {
+		if err := restoreMonitorStateFromStore(ctx, monitorMgr, storeRef); err != nil && loggerRef != nil {
+			loggerRef.Warnf("failed to preload persisted monitor state: %v", err)
+		}
+	}
+
 	if serverToStart != nil {
 		serverToStart.Start(ctx)
 	}
+	return nil
+}
+
+func restoreMonitorStateFromStore(ctx context.Context, mgr *monitor.Manager, s store.Store) error {
+	if mgr == nil || s == nil {
+		return nil
+	}
+
+	nodes, err := s.ListNodes(ctx, store.NodeFilter{})
+	if err != nil {
+		return fmt.Errorf("list nodes from store: %w", err)
+	}
+	if len(nodes) == 0 {
+		return nil
+	}
+
+	statsByNodeID, err := s.GetAllNodeStats(ctx)
+	if err != nil {
+		return fmt.Errorf("load node stats from store: %w", err)
+	}
+	if len(statsByNodeID) == 0 {
+		return nil
+	}
+
+	restores := make([]monitor.RestoreEntry, 0, len(nodes))
+	for _, node := range nodes {
+		if !node.Enabled {
+			continue
+		}
+		stats := statsByNodeID[node.ID]
+		if stats == nil {
+			continue
+		}
+		restores = append(restores, monitor.RestoreEntry{
+			URI:  node.URI,
+			Name: node.Name,
+			State: monitor.RestoredNodeState{
+				FailureCount:     stats.FailureCount,
+				SuccessCount:     stats.SuccessCount,
+				Blacklisted:      stats.Blacklisted,
+				BlacklistedUntil: stats.BlacklistedUntil,
+				LastError:        stats.LastError,
+				LastFailure:      stats.LastFailureAt,
+				LastSuccess:      stats.LastSuccessAt,
+				LastLatencyMs:    stats.LastLatencyMs,
+				Available:        stats.Available,
+				InitialCheckDone: stats.InitialCheckDone,
+				TotalUpload:      stats.TotalUploadBytes,
+				TotalDownload:    stats.TotalDownloadBytes,
+			},
+		})
+	}
+
+	mgr.PreloadNodeStates(restores)
 	return nil
 }
 

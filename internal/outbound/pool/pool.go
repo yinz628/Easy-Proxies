@@ -259,6 +259,9 @@ func (p *poolOutbound) probeAllMembersOnStartup() {
 		p.mu.Lock()
 		for _, member := range p.members {
 			if member.entry != nil {
+				if member.entry.Snapshot().InitialCheckDone {
+					continue
+				}
 				member.entry.MarkInitialCheckDone(true)
 			}
 		}
@@ -277,6 +280,16 @@ func (p *poolOutbound) probeAllMembersOnStartup() {
 	failedCount := 0
 
 	for _, member := range members {
+		if member.entry != nil {
+			snap := member.entry.Snapshot()
+			if snap.InitialCheckDone {
+				if member.shared != nil && snap.Blacklisted {
+					member.shared.restoreBlacklist(snap.BlacklistedUntil)
+				}
+				continue
+			}
+		}
+
 		// Create a timeout context for each probe
 		ctx, cancel := context.WithTimeout(p.ctx, 15*time.Second)
 

@@ -73,6 +73,29 @@ type Snapshot struct {
 	Timeline          []TimelineEvent `json:"timeline,omitempty"`
 }
 
+// RestoredNodeState is the persisted runtime state loaded from the store.
+type RestoredNodeState struct {
+	FailureCount     int
+	SuccessCount     int64
+	Blacklisted      bool
+	BlacklistedUntil time.Time
+	LastError        string
+	LastFailure      time.Time
+	LastSuccess      time.Time
+	LastLatencyMs    int64
+	Available        bool
+	InitialCheckDone bool
+	TotalUpload      int64
+	TotalDownload    int64
+}
+
+// RestoreEntry maps persisted runtime state to a node identity.
+type RestoreEntry struct {
+	URI   string
+	Name  string
+	State RestoredNodeState
+}
+
 type NodeTrafficSpeed struct {
 	Tag           string `json:"tag"`
 	UploadSpeed   int64  `json:"upload_speed"`   // bytes/sec
@@ -136,22 +159,24 @@ type entry struct {
 
 // Manager aggregates all node states for the UI/API.
 type Manager struct {
-	cfg        Config
-	reloadGen  uint64 // current reload generation
-	probeDst   M.Socksaddr
-	probeReady bool
-	mu         sync.RWMutex
-	nodes      map[string]*entry
-	ctx        context.Context
-	cancel     context.CancelFunc
-	logger     Logger
+	cfg           Config
+	reloadGen     uint64 // current reload generation
+	probeDst      M.Socksaddr
+	probeReady    bool
+	mu            sync.RWMutex
+	nodes         map[string]*entry
+	restoreByURI  map[string]RestoredNodeState
+	restoreByName map[string]RestoredNodeState
+	ctx           context.Context
+	cancel        context.CancelFunc
+	logger        Logger
 
 	// periodic health check control
-	healthMu        sync.Mutex
-	healthInterval  time.Duration
-	healthTimeout   time.Duration
-	healthTicker    *time.Ticker
-	healthIntervalC chan time.Duration
+	healthMu         sync.Mutex
+	healthInterval   time.Duration
+	healthTimeout    time.Duration
+	healthTicker     *time.Ticker
+	healthIntervalC  chan time.Duration
 	probeAllInFlight atomic.Bool
 }
 
@@ -165,10 +190,12 @@ type Logger interface {
 func NewManager(cfg Config) (*Manager, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	m := &Manager{
-		cfg:    cfg,
-		nodes:  make(map[string]*entry),
-		ctx:    ctx,
-		cancel: cancel,
+		cfg:           cfg,
+		nodes:         make(map[string]*entry),
+		restoreByURI:  make(map[string]RestoredNodeState),
+		restoreByName: make(map[string]RestoredNodeState),
+		ctx:           ctx,
+		cancel:        cancel,
 	}
 	if cfg.ProbeTarget != "" {
 		target := cfg.ProbeTarget
@@ -239,7 +266,7 @@ func (m *Manager) StartPeriodicHealthCheck(interval, timeout time.Duration) {
 
 	go func() {
 		// 启动后立即进行一次检查（走去重）
-		m.RequestProbeAllOnce(timeout)
+		m.RequestProbePendingOnce(timeout)
 
 		for {
 			select {
@@ -303,12 +330,29 @@ func (m *Manager) RequestProbeAllOnce(timeout time.Duration) {
 	}
 	go func() {
 		defer m.probeAllInFlight.Store(false)
-		m.probeAllNodes(timeout)
+		m.probeNodes(timeout, false)
 	}()
 }
 
-// probeAllNodes checks all registered nodes concurrently.
-func (m *Manager) probeAllNodes(timeout time.Duration) {
+// RequestProbePendingOnce triggers a probe round for nodes that have not
+// completed their initial check yet. If another probe round is already
+// running, it returns immediately.
+func (m *Manager) RequestProbePendingOnce(timeout time.Duration) {
+	if !m.probeReady {
+		return
+	}
+	if m.probeAllInFlight.Swap(true) {
+		return
+	}
+	go func() {
+		defer m.probeAllInFlight.Store(false)
+		m.probeNodes(timeout, true)
+	}()
+}
+
+// probeNodes checks registered nodes concurrently.
+// If onlyPending is true, nodes that already completed the initial check are skipped.
+func (m *Manager) probeNodes(timeout time.Duration, onlyPending bool) {
 	m.mu.RLock()
 	entries := make([]*entry, 0, len(m.nodes))
 	for _, e := range m.nodes {
@@ -335,10 +379,14 @@ func (m *Manager) probeAllNodes(timeout time.Duration) {
 
 	for _, e := range entries {
 		e.mu.RLock()
+		initialCheckDone := e.initialCheckDone
 		probeFn := e.probe
 		tag := e.info.Tag
 		e.mu.RUnlock()
 
+		if onlyPending && initialCheckDone {
+			continue
+		}
 		if probeFn == nil {
 			continue
 		}
@@ -467,12 +515,55 @@ func (m *Manager) Register(info NodeInfo) *EntryHandle {
 			timeline:  make([]TimelineEvent, 0, maxTimelineSize),
 			reloadGen: m.reloadGen,
 		}
+		if restored, exists := m.takeRestoredStateLocked(info); exists {
+			e.applyRestoredState(restored)
+		}
 		m.nodes[info.Tag] = e
 	} else {
 		e.info = info
 		e.reloadGen = m.reloadGen
 	}
 	return &EntryHandle{ref: e}
+}
+
+// PreloadNodeStates stores persisted runtime state that should be applied when
+// matching nodes are registered.
+func (m *Manager) PreloadNodeStates(entries []RestoreEntry) {
+	if len(entries) == 0 {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, item := range entries {
+		if uri := strings.TrimSpace(item.URI); uri != "" {
+			m.restoreByURI[uri] = item.State
+		}
+		if name := strings.TrimSpace(item.Name); name != "" {
+			m.restoreByName[name] = item.State
+		}
+	}
+}
+
+func (m *Manager) takeRestoredStateLocked(info NodeInfo) (RestoredNodeState, bool) {
+	if info.URI != "" {
+		if state, ok := m.restoreByURI[info.URI]; ok {
+			delete(m.restoreByURI, info.URI)
+			if info.Name != "" {
+				delete(m.restoreByName, info.Name)
+			}
+			return state, true
+		}
+	}
+	if info.Name != "" {
+		if state, ok := m.restoreByName[info.Name]; ok {
+			delete(m.restoreByName, info.Name)
+			if info.URI != "" {
+				delete(m.restoreByURI, info.URI)
+			}
+			return state, true
+		}
+	}
+	return RestoredNodeState{}, false
 }
 
 // DestinationForProbe exposes the configured destination for health checks.
@@ -723,6 +814,33 @@ func (e *entry) snapshot(includeTimeline bool) Snapshot {
 		DownloadSpeed:     e.downloadSpeed,
 		Timeline:          timelineCopy,
 	}
+}
+
+func (e *entry) applyRestoredState(state RestoredNodeState) {
+	if e == nil {
+		return
+	}
+	e.failure = state.FailureCount
+	e.success = state.SuccessCount
+	e.lastError = state.LastError
+	e.lastFail = state.LastFailure
+	e.lastOK = state.LastSuccess
+	e.available = state.Available
+	e.initialCheckDone = state.InitialCheckDone
+	if state.LastLatencyMs > 0 {
+		e.lastProbe = time.Duration(state.LastLatencyMs) * time.Millisecond
+	} else {
+		e.lastProbe = 0
+	}
+	if state.Blacklisted && state.BlacklistedUntil.After(time.Now()) {
+		e.blacklist = true
+		e.until = state.BlacklistedUntil
+	} else {
+		e.blacklist = false
+		e.until = time.Time{}
+	}
+	e.totalUpload.Store(state.TotalUpload)
+	e.totalDownload.Store(state.TotalDownload)
 }
 
 func (e *entry) recordFailure(err error, destination string) {
@@ -984,4 +1102,12 @@ func (h *EntryHandle) SetTraffic(upload, download int64) {
 	}
 	h.ref.totalUpload.Store(upload)
 	h.ref.totalDownload.Store(download)
+}
+
+// Snapshot returns the current entry snapshot.
+func (h *EntryHandle) Snapshot() Snapshot {
+	if h == nil || h.ref == nil {
+		return Snapshot{}
+	}
+	return h.ref.snapshot(false)
 }
