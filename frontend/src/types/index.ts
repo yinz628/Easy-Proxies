@@ -345,7 +345,6 @@ export interface BatchProbeJob {
   success: number
   failed: number
   active_workers: number
-  requested_tags: string[]
   last_result?: BatchProbeJobResult
   last_error?: string
 }
@@ -396,5 +395,5 @@ export interface TrafficStreamEvent {
   upload_speed: number
   download_speed: number
   sampled_at: string
-  nodes: TrafficStreamNode[]
+  nodes?: TrafficStreamNode[]
 }

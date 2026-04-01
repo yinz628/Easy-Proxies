@@ -796,7 +796,7 @@ func (s *Server) handleProbeAll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.streamProbeSnapshots(w, r, s.mgr.Snapshot())
+	s.streamProbeSnapshots(w, r, probeTargetsFromSnapshots(s.mgr.Snapshot()))
 }
 
 func (s *Server) handleProbeBatch(w http.ResponseWriter, r *http.Request) {
@@ -846,10 +846,10 @@ func (s *Server) handleProbeBatchStart(w http.ResponseWriter, r *http.Request) {
 	}
 
 	allSnapshots := s.mgr.Snapshot()
-	filtered := make([]Snapshot, 0, len(selectedTags))
+	filtered := make([]BatchProbeTarget, 0, len(selectedTags))
 	for _, snap := range allSnapshots {
 		if _, ok := selectedTags[snap.Tag]; ok {
-			filtered = append(filtered, snap)
+			filtered = append(filtered, BatchProbeTarget{Tag: snap.Tag, Name: snap.Name})
 		}
 	}
 	if len(filtered) == 0 {
@@ -858,7 +858,7 @@ func (s *Server) handleProbeBatchStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	job, err := s.probeJobs.Start(req.Tags, filtered, func(ctx context.Context, snap Snapshot) (int64, error) {
+	job, err := s.probeJobs.Start(filtered, func(ctx context.Context, target BatchProbeTarget) (int64, error) {
 		probeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		defer cancel()
 
@@ -867,7 +867,7 @@ func (s *Server) handleProbeBatchStart(w http.ResponseWriter, r *http.Request) {
 		}
 		defer s.probeSem.Release(1)
 
-		latency, err := s.mgr.Probe(probeCtx, snap.Tag)
+		latency, err := s.mgr.Probe(probeCtx, target.Tag)
 		if err != nil {
 			return -1, err
 		}
@@ -930,7 +930,7 @@ func (s *Server) handleProbeBatchCancel(w http.ResponseWriter, r *http.Request) 
 	writeJSON(w, map[string]any{"message": "批量探测已取消", "job_id": req.JobID})
 }
 
-func (s *Server) streamProbeSnapshots(w http.ResponseWriter, r *http.Request, snapshots []Snapshot) {
+func (s *Server) streamProbeSnapshots(w http.ResponseWriter, r *http.Request, targets []BatchProbeTarget) {
 
 	// Set SSE headers
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -943,7 +943,7 @@ func (s *Server) streamProbeSnapshots(w http.ResponseWriter, r *http.Request, sn
 		return
 	}
 
-	total := len(snapshots)
+	total := len(targets)
 	if total == 0 {
 		fmt.Fprintf(w, "data: %s\n\n", `{"type":"complete","total":0,"success":0,"failed":0}`)
 		flusher.Flush()
@@ -969,16 +969,16 @@ func (s *Server) streamProbeSnapshots(w http.ResponseWriter, r *http.Request, sn
 	var wg sync.WaitGroup
 
 	// Launch probes with semaphore control
-	for _, snap := range snapshots {
+	for _, target := range targets {
 		wg.Add(1)
-		go func(snap Snapshot) {
+		go func(target BatchProbeTarget) {
 			defer wg.Done()
 
 			// Acquire semaphore permit
 			if err := s.probeSem.Acquire(ctx, 1); err != nil {
 				results <- probeResult{
-					tag:  snap.Tag,
-					name: snap.Name,
+					tag:  target.Tag,
+					name: target.Name,
 					err:  "probe cancelled: " + err.Error(),
 				}
 				return
@@ -989,23 +989,23 @@ func (s *Server) streamProbeSnapshots(w http.ResponseWriter, r *http.Request, sn
 			probeCtx, probeCancel := context.WithTimeout(ctx, 10*time.Second)
 			defer probeCancel()
 
-			latency, err := s.mgr.Probe(probeCtx, snap.Tag)
+			latency, err := s.mgr.Probe(probeCtx, target.Tag)
 			if err != nil {
 				results <- probeResult{
-					tag:     snap.Tag,
-					name:    snap.Name,
+					tag:     target.Tag,
+					name:    target.Name,
 					latency: -1,
 					err:     err.Error(),
 				}
 			} else {
 				results <- probeResult{
-					tag:     snap.Tag,
-					name:    snap.Name,
+					tag:     target.Tag,
+					name:    target.Name,
 					latency: latency.Milliseconds(),
 					err:     "",
 				}
 			}
-		}(snap)
+		}(target)
 	}
 
 	// Wait for all probes to complete
@@ -1087,7 +1087,7 @@ func (s *Server) handleQualityCheckBatch(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	snapshots := s.mgr.Snapshot()
+	snapshots := s.mgr.SnapshotDetailed()
 	filtered := make([]Snapshot, 0, len(selectedTags))
 	for _, snap := range snapshots {
 		if _, ok := selectedTags[snap.Tag]; ok {
@@ -1258,7 +1258,7 @@ func (s *Server) handleTrafficStream(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Initial snapshot
-	initial := s.mgr.TrafficSummary(true)
+	initial := s.mgr.TrafficSummary(false)
 	if !send(map[string]any{
 		"type":           "traffic",
 		"node_count":     initial.NodeCount,
@@ -1267,7 +1267,6 @@ func (s *Server) handleTrafficStream(w http.ResponseWriter, r *http.Request) {
 		"upload_speed":   initial.UploadSpeed,
 		"download_speed": initial.DownloadSpeed,
 		"sampled_at":     initial.SampledAt,
-		"nodes":          initial.Nodes,
 	}) {
 		return
 	}
@@ -1282,7 +1281,7 @@ func (s *Server) handleTrafficStream(w http.ResponseWriter, r *http.Request) {
 		case <-s.done:
 			return
 		case <-ticker.C:
-			summary := s.mgr.TrafficSummary(true)
+			summary := s.mgr.TrafficSummary(false)
 			ok := send(map[string]any{
 				"type":           "traffic",
 				"node_count":     summary.NodeCount,
@@ -1291,7 +1290,6 @@ func (s *Server) handleTrafficStream(w http.ResponseWriter, r *http.Request) {
 				"upload_speed":   summary.UploadSpeed,
 				"download_speed": summary.DownloadSpeed,
 				"sampled_at":     summary.SampledAt,
-				"nodes":          summary.Nodes,
 			})
 			if !ok {
 				return
@@ -1325,14 +1323,14 @@ func (s *Server) handleProbeBatchStartV2(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	snapshotsByTag := make(map[string]Snapshot)
+	snapshotsByTag := make(map[string]BatchProbeTarget)
 	for _, snap := range s.mgr.Snapshot() {
 		if snap.Tag != "" {
-			snapshotsByTag[snap.Tag] = snap
+			snapshotsByTag[snap.Tag] = BatchProbeTarget{Tag: snap.Tag, Name: snap.Name}
 		}
 	}
 
-	filtered := make([]Snapshot, 0, len(requestedTags))
+	filtered := make([]BatchProbeTarget, 0, len(requestedTags))
 	for _, tag := range requestedTags {
 		if snap, ok := snapshotsByTag[tag]; ok {
 			filtered = append(filtered, snap)
@@ -1344,7 +1342,7 @@ func (s *Server) handleProbeBatchStartV2(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	job, err := s.probeJobs.Start(requestedTags, filtered, func(ctx context.Context, snap Snapshot) (int64, error) {
+	job, err := s.probeJobs.Start(filtered, func(ctx context.Context, target BatchProbeTarget) (int64, error) {
 		probeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		defer cancel()
 
@@ -1353,7 +1351,7 @@ func (s *Server) handleProbeBatchStartV2(w http.ResponseWriter, r *http.Request)
 		}
 		defer s.probeSem.Release(1)
 
-		latency, err := s.mgr.Probe(probeCtx, snap.Tag)
+		latency, err := s.mgr.Probe(probeCtx, target.Tag)
 		if err != nil {
 			return -1, err
 		}
@@ -1786,6 +1784,20 @@ func tagsFromRows(rows []ManageRow) []string {
 		tags = append(tags, row.Tag)
 	}
 	return tags
+}
+
+func probeTargetsFromSnapshots(snapshots []Snapshot) []BatchProbeTarget {
+	targets := make([]BatchProbeTarget, 0, len(snapshots))
+	for _, snap := range snapshots {
+		if strings.TrimSpace(snap.Tag) == "" {
+			continue
+		}
+		targets = append(targets, BatchProbeTarget{
+			Tag:  snap.Tag,
+			Name: snap.Name,
+		})
+	}
+	return targets
 }
 
 func urisFromRows(rows []ManageRow) []string {

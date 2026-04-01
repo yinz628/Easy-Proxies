@@ -211,11 +211,11 @@ func TestHandleProbeBatchStartResolvesFilterSelection(t *testing.T) {
 		t.Fatalf("status = %d, want %d body=%s", rec.Code, http.StatusOK, rec.Body.String())
 	}
 	text := rec.Body.String()
-	if !strings.Contains(text, `"tag-alpha"`) {
-		t.Fatalf("response missing selected runtime tag: %s", text)
+	if !strings.Contains(text, `"total": 1`) {
+		t.Fatalf("response missing resolved selection count: %s", text)
 	}
-	if strings.Contains(text, `"tag-delta"`) {
-		t.Fatalf("response should exclude tag-delta: %s", text)
+	if strings.Contains(text, `"requested_tags"`) {
+		t.Fatalf("response should not expose requested tags payload: %s", text)
 	}
 }
 
@@ -317,11 +317,8 @@ func TestHandleProbeBatchStreamsSelectedNodesOnly(t *testing.T) {
 	if !strings.Contains(text, `"total": 2`) {
 		t.Fatalf("response missing total=2 job payload: %s", text)
 	}
-	if !strings.Contains(text, `"requested_tags": [`) || !strings.Contains(text, `"a"`) || !strings.Contains(text, `"c"`) {
-		t.Fatalf("response missing selected tags: %s", text)
-	}
-	if strings.Contains(text, `"b"`) {
-		t.Fatalf("response should not include unselected tag b: %s", text)
+	if strings.Contains(text, `"requested_tags"`) {
+		t.Fatalf("response should not expose requested tags payload: %s", text)
 	}
 }
 
@@ -403,8 +400,43 @@ func TestHandleProbeBatchStatusReturnsRunningJob(t *testing.T) {
 	if !strings.Contains(statusRec.Body.String(), `"total": 1`) {
 		t.Fatalf("status response missing total: %s", statusRec.Body.String())
 	}
+	if strings.Contains(statusRec.Body.String(), `"requested_tags"`) {
+		t.Fatalf("status response should not expose requested tags payload: %s", statusRec.Body.String())
+	}
 
 	close(block)
+}
+
+func TestHandleNodesOmitsTimelinePayload(t *testing.T) {
+	server, _ := newManageListTestServer(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/nodes", nil)
+	rec := httptest.NewRecorder()
+
+	server.srv.Handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), `"timeline"`) {
+		t.Fatalf("/api/nodes should omit timeline payload: %s", rec.Body.String())
+	}
+}
+
+func TestHandleDebugIncludesTimelinePayload(t *testing.T) {
+	server, _ := newManageListTestServer(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/debug", nil)
+	rec := httptest.NewRecorder()
+
+	server.srv.Handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"timeline"`) {
+		t.Fatalf("/api/debug should include timeline payload: %s", rec.Body.String())
+	}
 }
 
 func TestHandleProbeBatchStartRejectsWhenJobAlreadyRunning(t *testing.T) {

@@ -523,13 +523,22 @@ func (m *Manager) UpdateProbeTarget(target string) error {
 // Snapshot returns a sorted copy of current node states.
 // If onlyAvailable is true, only returns nodes that passed initial health check.
 func (m *Manager) Snapshot() []Snapshot {
-	return m.SnapshotFiltered(false)
+	return m.snapshotFiltered(false, false)
+}
+
+// SnapshotDetailed returns a sorted copy of current node states including timeline data.
+func (m *Manager) SnapshotDetailed() []Snapshot {
+	return m.snapshotFiltered(false, true)
 }
 
 // SnapshotFiltered returns a sorted copy of current node states.
 // If onlyAvailable is true, only returns nodes that passed initial health check.
 // Nodes that haven't been checked yet are also included (they will be checked on first use).
 func (m *Manager) SnapshotFiltered(onlyAvailable bool) []Snapshot {
+	return m.snapshotFiltered(onlyAvailable, false)
+}
+
+func (m *Manager) snapshotFiltered(onlyAvailable bool, includeTimeline bool) []Snapshot {
 	m.mu.RLock()
 	list := make([]*entry, 0, len(m.nodes))
 	for _, e := range m.nodes {
@@ -538,7 +547,7 @@ func (m *Manager) SnapshotFiltered(onlyAvailable bool) []Snapshot {
 	m.mu.RUnlock()
 	snapshots := make([]Snapshot, 0, len(list))
 	for _, e := range list {
-		snap := e.snapshot()
+		snap := e.snapshot(includeTimeline)
 		// 如果只要可用节点：
 		// - 跳过已完成检查但不可用的节点
 		// - 保留未完成检查的节点（它们会在首次使用时被检查）
@@ -676,7 +685,7 @@ func (m *Manager) entry(tag string) (*entry, error) {
 	return e, nil
 }
 
-func (e *entry) snapshot() Snapshot {
+func (e *entry) snapshot(includeTimeline bool) Snapshot {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 
@@ -689,7 +698,7 @@ func (e *entry) snapshot() Snapshot {
 	}
 
 	var timelineCopy []TimelineEvent
-	if len(e.timeline) > 0 {
+	if includeTimeline && len(e.timeline) > 0 {
 		timelineCopy = make([]TimelineEvent, len(e.timeline))
 		copy(timelineCopy, e.timeline)
 	}

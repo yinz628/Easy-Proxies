@@ -72,8 +72,18 @@ const emptySummary = {
   disabled: 0,
 }
 
+const maxManagePageCacheEntries = 8
+
 function createEmptySelection(): SelectionState {
   return { mode: 'names', names: new Set() }
+}
+
+function trimManagePageCache(cache: Map<string, ManageListResponse>) {
+  while (cache.size > maxManagePageCacheEntries) {
+    const oldestKey = cache.keys().next().value
+    if (!oldestKey) return
+    cache.delete(oldestKey)
+  }
 }
 
 function latencyColor(ms: number): string {
@@ -286,6 +296,7 @@ export default function ManagePanelPage() {
       }
 
       pageCacheRef.current.set(key, res)
+      trimManagePageCache(pageCacheRef.current)
       setPageData(res)
       setError('')
     } catch (err) {
