@@ -1,11 +1,12 @@
-import { useState, useEffect, useCallback, useMemo } from 'react'
+﻿import { useState, useEffect, useCallback, useMemo } from 'react'
 import type { ConfigNodeConfig, ConfigNodePayload, NodeSnapshot, NodesResponse } from '../types'
 import {
   fetchConfigNodes, createConfigNode, updateConfigNode, deleteConfigNode,
   toggleConfigNode, batchToggleConfigNodes, batchDeleteConfigNodes, triggerReload,
   importNodes, exportProxies,
-  fetchNodes, probeNode, releaseNode, probeBatchNodes,
+  fetchNodes, probeNode, releaseNode, startProbeBatchJob, fetchProbeBatchJobStatus, cancelProbeBatchJob,
 } from '../api/client'
+import type { BatchProbeJob } from '../types'
 
 // ---- Merged node type ----
 interface MergedNode extends ConfigNodeConfig {
@@ -157,6 +158,8 @@ export default function ManagePanel() {
   const [batchProcessing, setBatchProcessing] = useState(false)
   const [batchDeleteConfirm, setBatchDeleteConfirm] = useState(false)
   const [batchProbeProgress, setBatchProbeProgress] = useState<{ current: number; total: number } | null>(null)
+  const [activeProbeJob, setActiveProbeJob] = useState<BatchProbeJob | null>(null)
+  const [lastProbeJobStatus, setLastProbeJobStatus] = useState<string | null>(null)
 
   // Filters
   const [filter, setFilter] = useState('')
@@ -203,6 +206,38 @@ export default function ManagePanel() {
       return () => clearTimeout(timer)
     }
   }, [success])
+
+  useEffect(() => {
+    let disposed = false
+
+    const syncBatchProbeJob = async () => {
+      try {
+        const res = await fetchProbeBatchJobStatus()
+        if (disposed) return
+        setActiveProbeJob(res.job)
+        if (res.job && (res.job.status === 'queued' || res.job.status === 'running')) {
+          setBatchProbeProgress({ current: res.job.completed, total: res.job.total })
+        } else {
+          setBatchProbeProgress(null)
+        }
+      } catch {
+        if (!disposed) {
+          setActiveProbeJob(null)
+          setBatchProbeProgress(null)
+        }
+      }
+    }
+
+    void syncBatchProbeJob()
+    const timer = window.setInterval(() => {
+      void syncBatchProbeJob()
+    }, 1000)
+
+    return () => {
+      disposed = true
+      window.clearInterval(timer)
+    }
+  }, [])
 
   // ---- Merge config + monitor data ----
 
@@ -308,6 +343,18 @@ export default function ManagePanel() {
   const sortedNodes = useMemo(() => {
     return [...filteredNodes].sort((a, b) => compareManageNodes(a, b, sortKey, sortDir))
   }, [filteredNodes, sortKey, sortDir])
+
+  const probeJobRunning = activeProbeJob?.status === 'queued' || activeProbeJob?.status === 'running'
+
+  useEffect(() => {
+    const current = activeProbeJob?.status ?? null
+    if (lastProbeJobStatus && current && current !== lastProbeJobStatus && current !== 'queued' && current !== 'running') {
+      void loadData()
+    }
+    if (current !== lastProbeJobStatus) {
+      setLastProbeJobStatus(current)
+    }
+  }, [activeProbeJob?.status, lastProbeJobStatus, loadData])
 
   // ---- Handlers ----
 
@@ -458,42 +505,29 @@ export default function ManagePanel() {
       return
     }
 
-    setBatchProcessing(true)
-    setBatchProbeProgress({ current: 0, total: nodesToProbe.length })
-    await new Promise<void>((resolve) => {
-      probeBatchNodes(
-        nodesToProbe.map(n => n.tag!),
-        (event) => {
-          if (event.type === 'start') {
-            setBatchProbeProgress({ current: 0, total: event.total })
-            return
-          }
+    try {
+      const res = await startProbeBatchJob(nodesToProbe.map(n => n.tag!))
+      setActiveProbeJob(res.job)
+      setBatchProbeProgress({ current: res.job.completed, total: res.job.total })
+      setSuccess('批量探测任务已启动')
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '批量探测启动失败')
+    }
+  }
 
-          if (event.type === 'progress') {
-            setBatchProbeProgress({ current: event.current, total: event.total })
-            return
-          }
-
-          setBatchProbeProgress(null)
-          setBatchProcessing(false)
-          setSuccess(`鎵归噺鎺㈡祴瀹屾垚锛?${event.success} 鎴愬姛锛?${event.failed} 澶辫触`)
-          void loadData().finally(resolve)
-        },
-        (err) => {
-          setBatchProbeProgress(null)
-          setBatchProcessing(false)
-          setError(err instanceof Error ? err.message : '鎵归噺鎺㈡祴澶辫触')
-          resolve()
-        }
-      )
-    })
-/*
-
-    setBatchProbeProgress(null)
-    setBatchProcessing(false)
-    setSuccess(`批量探测完成：${successCount} 成功，${failCount} 失败`)
-    await loadData()
-*/
+  const handleBatchProbeCancel = async () => {
+    if (!activeProbeJob) return
+    try {
+      await cancelProbeBatchJob(activeProbeJob.id)
+      setSuccess('批量探测任务已取消')
+      const res = await fetchProbeBatchJobStatus()
+      setActiveProbeJob(res.job)
+      if (!res.job || (res.job.status !== 'queued' && res.job.status !== 'running')) {
+        setBatchProbeProgress(null)
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '取消批量探测失败')
+    }
   }
 
   const handleBatchDelete = async () => {
@@ -677,6 +711,37 @@ export default function ManagePanel() {
           <span>配置已变更，请点击「重载配置」使其生效</span>
         </div>
       )}
+      {activeProbeJob && (
+        <div className={`rounded-2xl border px-5 py-4 shadow-sm ${probeJobRunning ? 'border-primary/30 bg-primary/5' : 'border-base-300/50 bg-base-100'}`}>
+          <div className="flex flex-col lg:flex-row lg:items-center gap-3">
+            <div className="flex-1">
+              <div className="text-sm font-semibold text-base-content">
+                批量探测任务
+                <span className="ml-2 badge badge-sm">{activeProbeJob.status}</span>
+              </div>
+              <div className="text-xs text-base-content/60 mt-1">
+                进度 {activeProbeJob.completed}/{activeProbeJob.total} · 成功 {activeProbeJob.success} · 失败 {activeProbeJob.failed} · 活跃工作线程 {activeProbeJob.active_workers}
+              </div>
+              {activeProbeJob.last_result && (
+                <div className="text-xs text-base-content/50 mt-1">
+                  最近完成: {activeProbeJob.last_result.name}
+                  {activeProbeJob.last_result.error ? ` · ${activeProbeJob.last_result.error}` : ` · ${activeProbeJob.last_result.latency_ms} ms`}
+                </div>
+              )}
+            </div>
+            {probeJobRunning && (
+              <button className="btn btn-sm btn-warning" onClick={handleBatchProbeCancel}>
+                取消批量探测
+              </button>
+            )}
+          </div>
+          <progress
+            className="progress progress-primary w-full h-2 mt-3"
+            value={activeProbeJob.completed}
+            max={activeProbeJob.total || 1}
+          ></progress>
+        </div>
+      )}
 
       {/* Filters Area */}
       <div className="bg-base-100 border border-base-300/50 rounded-2xl p-4 shadow-sm">
@@ -731,7 +796,7 @@ export default function ManagePanel() {
               <button
                 className="btn btn-sm btn-primary shadow-sm gap-1.5"
                 onClick={handleBatchProbe}
-                disabled={batchProcessing}
+                disabled={batchProcessing || probeJobRunning}
                 title="对选中的已启用节点逐个探测"
               >
                 {batchProbeProgress
@@ -742,21 +807,21 @@ export default function ManagePanel() {
               <button
                 className="btn btn-sm btn-success border-none bg-success/15 text-success hover:bg-success hover:text-success-content"
                 onClick={() => handleBatchToggle(true)}
-                disabled={batchProcessing}
+                disabled={batchProcessing || probeJobRunning}
               >
                 启用
               </button>
               <button
                 className="btn btn-sm btn-warning border-none bg-warning/15 text-warning-content hover:bg-warning hover:text-warning-content"
                 onClick={() => handleBatchToggle(false)}
-                disabled={batchProcessing}
+                disabled={batchProcessing || probeJobRunning}
               >
                 禁用
               </button>
               <button
                 className="btn btn-sm btn-error border-none bg-error/15 text-error hover:bg-error hover:text-error-content"
                 onClick={() => setBatchDeleteConfirm(true)}
-                disabled={batchProcessing}
+                disabled={batchProcessing || probeJobRunning}
               >
                 删除
               </button>
@@ -764,7 +829,7 @@ export default function ManagePanel() {
               <button
                 className="btn btn-sm btn-ghost hover:bg-base-300"
                 onClick={() => setSelectedNodes(new Set())}
-                disabled={batchProcessing}
+                disabled={batchProcessing || probeJobRunning}
               >
                 取消选择
               </button>
@@ -1107,13 +1172,13 @@ export default function ManagePanel() {
               确定要删除选中的 <strong>{selectedNodes.size}</strong> 个节点吗？此操作不可撤销。
             </p>
             <div className="modal-action">
-              <button className="btn btn-ghost" onClick={() => setBatchDeleteConfirm(false)} disabled={batchProcessing}>取消</button>
-              <button className="btn btn-error" onClick={handleBatchDelete} disabled={batchProcessing}>
-                {batchProcessing ? <span className="loading loading-spinner loading-xs"></span> : `删除 ${selectedNodes.size} 个节点`}
+              <button className="btn btn-ghost" onClick={() => setBatchDeleteConfirm(false)} disabled={batchProcessing || probeJobRunning}>取消</button>
+              <button className="btn btn-error" onClick={handleBatchDelete} disabled={batchProcessing || probeJobRunning}>
+                {batchProcessing || probeJobRunning ? <span className="loading loading-spinner loading-xs"></span> : `删除 ${selectedNodes.size} 个节点`}
               </button>
             </div>
           </div>
-          <form method="dialog" className="modal-backdrop" onClick={() => !batchProcessing && setBatchDeleteConfirm(false)}>
+          <form method="dialog" className="modal-backdrop" onClick={() => !(batchProcessing || probeJobRunning) && setBatchDeleteConfirm(false)}>
             <button>close</button>
           </form>
         </div>

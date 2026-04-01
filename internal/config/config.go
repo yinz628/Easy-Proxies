@@ -162,6 +162,15 @@ type NodeConfig struct {
 	Source   NodeSource `yaml:"-" json:"source,omitempty"`   // Runtime only, not persisted in YAML
 	Disabled bool       `yaml:"-" json:"disabled,omitempty"` // Runtime only, not persisted in YAML; true = node is disabled
 	FeedKey  string     `yaml:"-" json:"feed_key,omitempty"`
+	QualityStatus   string     `yaml:"-" json:"quality_status,omitempty"`
+	QualityScore    *int       `yaml:"-" json:"quality_score,omitempty"`
+	QualityGrade    string     `yaml:"-" json:"quality_grade,omitempty"`
+	QualitySummary  string     `yaml:"-" json:"quality_summary,omitempty"`
+	QualityChecked  *int64     `yaml:"-" json:"quality_checked,omitempty"`
+	ExitIP          string     `yaml:"-" json:"exit_ip,omitempty"`
+	ExitCountry     string     `yaml:"-" json:"exit_country,omitempty"`
+	ExitCountryCode string     `yaml:"-" json:"exit_country_code,omitempty"`
+	ExitRegion      string     `yaml:"-" json:"exit_region,omitempty"`
 }
 
 // NodeKey returns a unique identifier for the node based on its URI.

@@ -163,6 +163,15 @@ export interface ConfigNodeConfig {
   password: string
   source?: string
   disabled?: boolean
+  quality_status?: string
+  quality_score?: number
+  quality_grade?: string
+  quality_summary?: string
+  quality_checked?: number
+  exit_ip?: string
+  exit_country?: string
+  exit_country_code?: string
+  exit_region?: string
 }
 
 export interface ConfigNodesResponse {
@@ -206,6 +215,78 @@ export interface SubscriptionStatus {
   is_refreshing?: boolean
   message?: string
   feeds?: SubscriptionFeedStatus[]
+}
+
+export interface NodeQualityCheckItem {
+  target: string
+  status: string
+  http_status?: number
+  latency_ms?: number
+  message?: string
+}
+
+export interface NodeQualityCheckResult {
+  node_id: number
+  quality_status: string
+  quality_score?: number
+  quality_grade: string
+  quality_summary: string
+  quality_checked_at?: string
+  exit_ip?: string
+  exit_country?: string
+  exit_country_code?: string
+  exit_region?: string
+  items: NodeQualityCheckItem[]
+}
+
+export interface QualityCheckBatchStart {
+  type: 'start'
+  total: number
+}
+
+export interface QualityCheckBatchProgress {
+  type: 'progress'
+  tag: string
+  name: string
+  status: 'success' | 'error'
+  error: string
+  quality_status?: string
+  quality_score?: number
+  quality_grade?: string
+  current: number
+  total: number
+}
+
+export interface QualityCheckBatchComplete {
+  type: 'complete'
+  total: number
+  success: number
+  failed: number
+}
+
+export type QualityCheckBatchEvent = QualityCheckBatchStart | QualityCheckBatchProgress | QualityCheckBatchComplete
+
+export interface BatchProbeJobResult {
+  tag: string
+  name: string
+  latency_ms: number
+  error?: string
+}
+
+export interface BatchProbeJob {
+  id: string
+  status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled'
+  started_at: string
+  updated_at: string
+  completed_at?: string
+  total: number
+  completed: number
+  success: number
+  failed: number
+  active_workers: number
+  requested_tags: string[]
+  last_result?: BatchProbeJobResult
+  last_error?: string
 }
 
 // ---- SSE Probe types ----

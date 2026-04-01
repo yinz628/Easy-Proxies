@@ -127,6 +127,34 @@ CREATE TABLE IF NOT EXISTS txt_feed_memberships (
 CREATE INDEX IF NOT EXISTS idx_txt_feed_memberships_uri ON txt_feed_memberships(uri);
 `,
 		},
+		{
+			Version:     5,
+			Description: "add proxy quality summary and details",
+			Up: `
+ALTER TABLE node_stats ADD COLUMN quality_status TEXT NOT NULL DEFAULT '';
+ALTER TABLE node_stats ADD COLUMN quality_score INTEGER;
+ALTER TABLE node_stats ADD COLUMN quality_grade TEXT NOT NULL DEFAULT '';
+ALTER TABLE node_stats ADD COLUMN quality_summary TEXT NOT NULL DEFAULT '';
+ALTER TABLE node_stats ADD COLUMN quality_checked_at TEXT NOT NULL DEFAULT '';
+ALTER TABLE node_stats ADD COLUMN exit_ip TEXT NOT NULL DEFAULT '';
+ALTER TABLE node_stats ADD COLUMN exit_country TEXT NOT NULL DEFAULT '';
+ALTER TABLE node_stats ADD COLUMN exit_country_code TEXT NOT NULL DEFAULT '';
+ALTER TABLE node_stats ADD COLUMN exit_region TEXT NOT NULL DEFAULT '';
+
+CREATE TABLE IF NOT EXISTS node_quality_checks (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    node_id    INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+    target     TEXT    NOT NULL,
+    status     TEXT    NOT NULL,
+    http_status INTEGER NOT NULL DEFAULT 0,
+    latency_ms INTEGER NOT NULL DEFAULT 0,
+    message    TEXT    NOT NULL DEFAULT '',
+    checked_at TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_node_quality_checks_node_id ON node_quality_checks(node_id);
+`,
+		},
 	}
 }
 

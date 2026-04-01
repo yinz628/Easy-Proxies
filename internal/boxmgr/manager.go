@@ -584,6 +584,11 @@ func (m *Manager) ListConfigNodes(ctx context.Context) ([]config.NodeConfig, err
 		m.logger.Warnf("failed to list nodes from store: %v, falling back to config", err)
 		return cloneNodes(m.cfg.Nodes), nil
 	}
+	statsByNodeID, err := m.store.GetAllNodeStats(ctx)
+	if err != nil {
+		m.logger.Warnf("failed to load node stats from store: %v", err)
+		statsByNodeID = map[int64]*store.NodeStats{}
+	}
 
 	// Build result from store nodes (preserves disabled status)
 	// Merge runtime port assignments from active config
@@ -594,15 +599,48 @@ func (m *Manager) ListConfigNodes(ctx context.Context) ([]config.NodeConfig, err
 		if runtimePort, ok := runtimePorts[n.URI]; ok && runtimePort > 0 {
 			port = runtimePort
 		}
+		var qualityChecked *int64
+		var qualityScore *int
+		var qualityStatus string
+		var qualityGrade string
+		var qualitySummary string
+		var exitIP string
+		var exitCountry string
+		var exitCountryCode string
+		var exitRegion string
+		if stats := statsByNodeID[n.ID]; stats != nil {
+			qualityStatus = stats.QualityStatus
+			qualityScore = stats.QualityScore
+			qualityGrade = stats.QualityGrade
+			qualitySummary = stats.QualitySummary
+			exitIP = stats.ExitIP
+			exitCountry = stats.ExitCountry
+			exitCountryCode = stats.ExitCountryCode
+			exitRegion = stats.ExitRegion
+			if !stats.QualityCheckedAt.IsZero() {
+				value := stats.QualityCheckedAt.Unix()
+				qualityChecked = &value
+			}
+		}
+
 		result = append(result, config.NodeConfig{
-			Name:     n.Name,
-			URI:      n.URI,
-			Port:     port,
-			Username: n.Username,
-			Password: n.Password,
-			Source:   config.NodeSource(n.Source),
-			FeedKey:  n.FeedKey,
-			Disabled: !n.Enabled,
+			Name:            n.Name,
+			URI:             n.URI,
+			Port:            port,
+			Username:        n.Username,
+			Password:        n.Password,
+			Source:          config.NodeSource(n.Source),
+			FeedKey:         n.FeedKey,
+			Disabled:        !n.Enabled,
+			QualityStatus:   qualityStatus,
+			QualityScore:    qualityScore,
+			QualityGrade:    qualityGrade,
+			QualitySummary:  qualitySummary,
+			QualityChecked:  qualityChecked,
+			ExitIP:          exitIP,
+			ExitCountry:     exitCountry,
+			ExitCountryCode: exitCountryCode,
+			ExitRegion:      exitRegion,
 		})
 	}
 

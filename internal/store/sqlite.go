@@ -419,11 +419,14 @@ func (s *sqliteStore) GetNodeStats(ctx context.Context, nodeID int64) (*NodeStat
 	row := s.conn().QueryRowContext(ctx,
 		`SELECT node_id, failure_count, success_count, blacklisted, blacklisted_until,
 		 last_error, last_failure_at, last_success_at, last_latency_ms,
-		 available, initial_check_done, total_upload_bytes, total_download_bytes, updated_at
+		 available, initial_check_done, total_upload_bytes, total_download_bytes,
+		 quality_status, quality_score, quality_grade, quality_summary, quality_checked_at,
+		 exit_ip, exit_country, exit_country_code, exit_region, updated_at
 		 FROM node_stats WHERE node_id = ?`, nodeID)
 
 	stats := &NodeStats{}
-	var blacklistedUntilStr, lastFailureStr, lastSuccessStr, updatedAtStr string
+	var blacklistedUntilStr, lastFailureStr, lastSuccessStr, qualityCheckedAtStr, updatedAtStr string
+	var qualityScore sql.NullInt64
 	var blacklisted, available, initialCheckDone int
 
 	err := row.Scan(
@@ -431,7 +434,9 @@ func (s *sqliteStore) GetNodeStats(ctx context.Context, nodeID int64) (*NodeStat
 		&blacklisted, &blacklistedUntilStr,
 		&stats.LastError, &lastFailureStr, &lastSuccessStr,
 		&stats.LastLatencyMs, &available, &initialCheckDone,
-		&stats.TotalUploadBytes, &stats.TotalDownloadBytes, &updatedAtStr,
+		&stats.TotalUploadBytes, &stats.TotalDownloadBytes,
+		&stats.QualityStatus, &qualityScore, &stats.QualityGrade, &stats.QualitySummary, &qualityCheckedAtStr,
+		&stats.ExitIP, &stats.ExitCountry, &stats.ExitCountryCode, &stats.ExitRegion, &updatedAtStr,
 	)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -446,6 +451,11 @@ func (s *sqliteStore) GetNodeStats(ctx context.Context, nodeID int64) (*NodeStat
 	stats.BlacklistedUntil = parseTime(blacklistedUntilStr)
 	stats.LastFailureAt = parseTime(lastFailureStr)
 	stats.LastSuccessAt = parseTime(lastSuccessStr)
+	if qualityScore.Valid {
+		value := int(qualityScore.Int64)
+		stats.QualityScore = &value
+	}
+	stats.QualityCheckedAt = parseTime(qualityCheckedAtStr)
 	stats.UpdatedAt = parseTime(updatedAtStr)
 
 	return stats, nil
@@ -465,12 +475,17 @@ func (s *sqliteStore) UpsertNodeStats(ctx context.Context, stats *NodeStats) err
 	if stats.InitialCheckDone {
 		initialCheckDone = 1
 	}
+	var qualityScore any
+	if stats.QualityScore != nil {
+		qualityScore = *stats.QualityScore
+	}
 
 	_, err := s.conn().ExecContext(ctx,
 		`INSERT INTO node_stats (node_id, failure_count, success_count, blacklisted, blacklisted_until,
 		 last_error, last_failure_at, last_success_at, last_latency_ms, available, initial_check_done,
-		 total_upload_bytes, total_download_bytes, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		 total_upload_bytes, total_download_bytes, quality_status, quality_score, quality_grade, quality_summary,
+		 quality_checked_at, exit_ip, exit_country, exit_country_code, exit_region, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(node_id) DO UPDATE SET
 		   failure_count=excluded.failure_count, success_count=excluded.success_count,
 		   blacklisted=excluded.blacklisted, blacklisted_until=excluded.blacklisted_until,
@@ -478,12 +493,20 @@ func (s *sqliteStore) UpsertNodeStats(ctx context.Context, stats *NodeStats) err
 		   last_success_at=excluded.last_success_at, last_latency_ms=excluded.last_latency_ms,
 		   available=excluded.available, initial_check_done=excluded.initial_check_done,
 		   total_upload_bytes=excluded.total_upload_bytes, total_download_bytes=excluded.total_download_bytes,
+		   quality_status=excluded.quality_status, quality_score=excluded.quality_score,
+		   quality_grade=excluded.quality_grade, quality_summary=excluded.quality_summary,
+		   quality_checked_at=excluded.quality_checked_at, exit_ip=excluded.exit_ip,
+		   exit_country=excluded.exit_country, exit_country_code=excluded.exit_country_code,
+		   exit_region=excluded.exit_region,
 		   updated_at=excluded.updated_at`,
 		stats.NodeID, stats.FailureCount, stats.SuccessCount,
 		blacklisted, formatTime(stats.BlacklistedUntil),
 		stats.LastError, formatTime(stats.LastFailureAt), formatTime(stats.LastSuccessAt),
 		stats.LastLatencyMs, available, initialCheckDone,
-		stats.TotalUploadBytes, stats.TotalDownloadBytes, now,
+		stats.TotalUploadBytes, stats.TotalDownloadBytes,
+		stats.QualityStatus, qualityScore, stats.QualityGrade, stats.QualitySummary,
+		formatTime(stats.QualityCheckedAt), stats.ExitIP, stats.ExitCountry, stats.ExitCountryCode, stats.ExitRegion,
+		now,
 	)
 	return err
 }
@@ -619,7 +642,9 @@ func (s *sqliteStore) GetAllNodeStats(ctx context.Context) (map[int64]*NodeStats
 	rows, err := s.conn().QueryContext(ctx,
 		`SELECT node_id, failure_count, success_count, blacklisted, blacklisted_until,
 		 last_error, last_failure_at, last_success_at, last_latency_ms,
-		 available, initial_check_done, total_upload_bytes, total_download_bytes, updated_at
+		 available, initial_check_done, total_upload_bytes, total_download_bytes,
+		 quality_status, quality_score, quality_grade, quality_summary, quality_checked_at,
+		 exit_ip, exit_country, exit_country_code, exit_region, updated_at
 		 FROM node_stats`)
 	if err != nil {
 		return nil, fmt.Errorf("get all node stats: %w", err)
@@ -629,7 +654,8 @@ func (s *sqliteStore) GetAllNodeStats(ctx context.Context) (map[int64]*NodeStats
 	result := make(map[int64]*NodeStats)
 	for rows.Next() {
 		stats := &NodeStats{}
-		var blacklistedUntilStr, lastFailureStr, lastSuccessStr, updatedAtStr string
+		var blacklistedUntilStr, lastFailureStr, lastSuccessStr, qualityCheckedAtStr, updatedAtStr string
+		var qualityScore sql.NullInt64
 		var blacklisted, available, initialCheckDone int
 
 		err := rows.Scan(
@@ -637,7 +663,9 @@ func (s *sqliteStore) GetAllNodeStats(ctx context.Context) (map[int64]*NodeStats
 			&blacklisted, &blacklistedUntilStr,
 			&stats.LastError, &lastFailureStr, &lastSuccessStr,
 			&stats.LastLatencyMs, &available, &initialCheckDone,
-			&stats.TotalUploadBytes, &stats.TotalDownloadBytes, &updatedAtStr,
+			&stats.TotalUploadBytes, &stats.TotalDownloadBytes,
+			&stats.QualityStatus, &qualityScore, &stats.QualityGrade, &stats.QualitySummary, &qualityCheckedAtStr,
+			&stats.ExitIP, &stats.ExitCountry, &stats.ExitCountryCode, &stats.ExitRegion, &updatedAtStr,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("scan node stats: %w", err)
@@ -649,11 +677,130 @@ func (s *sqliteStore) GetAllNodeStats(ctx context.Context) (map[int64]*NodeStats
 		stats.BlacklistedUntil = parseTime(blacklistedUntilStr)
 		stats.LastFailureAt = parseTime(lastFailureStr)
 		stats.LastSuccessAt = parseTime(lastSuccessStr)
+		if qualityScore.Valid {
+			value := int(qualityScore.Int64)
+			stats.QualityScore = &value
+		}
+		stats.QualityCheckedAt = parseTime(qualityCheckedAtStr)
 		stats.UpdatedAt = parseTime(updatedAtStr)
 
 		result[stats.NodeID] = stats
 	}
 	return result, rows.Err()
+}
+
+func (s *sqliteStore) GetNodeQualityCheck(ctx context.Context, nodeID int64) (*NodeQualityCheck, error) {
+	stats, err := s.GetNodeStats(ctx, nodeID)
+	if err != nil {
+		return nil, err
+	}
+	if stats == nil {
+		return nil, nil
+	}
+
+	rows, err := s.conn().QueryContext(ctx,
+		`SELECT target, status, http_status, latency_ms, message
+		   FROM node_quality_checks
+		  WHERE node_id = ?
+		  ORDER BY id ASC`, nodeID)
+	if err != nil {
+		return nil, fmt.Errorf("get node quality check items %d: %w", nodeID, err)
+	}
+	defer rows.Close()
+
+	items := make([]NodeQualityCheckItem, 0)
+	for rows.Next() {
+		var item NodeQualityCheckItem
+		if err := rows.Scan(&item.Target, &item.Status, &item.HTTPStatus, &item.LatencyMs, &item.Message); err != nil {
+			return nil, fmt.Errorf("scan node quality check item: %w", err)
+		}
+		items = append(items, item)
+	}
+
+	return &NodeQualityCheck{
+		NodeID:           nodeID,
+		QualityStatus:    stats.QualityStatus,
+		QualityScore:     stats.QualityScore,
+		QualityGrade:     stats.QualityGrade,
+		QualitySummary:   stats.QualitySummary,
+		QualityCheckedAt: stats.QualityCheckedAt,
+		ExitIP:           stats.ExitIP,
+		ExitCountry:      stats.ExitCountry,
+		ExitCountryCode:  stats.ExitCountryCode,
+		ExitRegion:       stats.ExitRegion,
+		Items:            items,
+	}, rows.Err()
+}
+
+func (s *sqliteStore) SaveNodeQualityCheck(ctx context.Context, check *NodeQualityCheck) error {
+	if check == nil {
+		return nil
+	}
+
+	execFn := func(txStore *sqliteStore) error {
+		score := any(nil)
+		if check.QualityScore != nil {
+			score = *check.QualityScore
+		}
+
+		_, err := txStore.conn().ExecContext(ctx,
+			`UPDATE node_stats
+			    SET quality_status = ?,
+			        quality_score = ?,
+			        quality_grade = ?,
+			        quality_summary = ?,
+			        quality_checked_at = ?,
+			        exit_ip = ?,
+			        exit_country = ?,
+			        exit_country_code = ?,
+			        exit_region = ?,
+			        updated_at = ?
+			  WHERE node_id = ?`,
+			check.QualityStatus,
+			score,
+			check.QualityGrade,
+			check.QualitySummary,
+			formatTime(check.QualityCheckedAt),
+			check.ExitIP,
+			check.ExitCountry,
+			check.ExitCountryCode,
+			check.ExitRegion,
+			time.Now().UTC().Format(time.RFC3339),
+			check.NodeID,
+		)
+		if err != nil {
+			return fmt.Errorf("update node quality summary %d: %w", check.NodeID, err)
+		}
+
+		if _, err := txStore.conn().ExecContext(ctx, "DELETE FROM node_quality_checks WHERE node_id = ?", check.NodeID); err != nil {
+			return fmt.Errorf("delete old node quality items %d: %w", check.NodeID, err)
+		}
+
+		for _, item := range check.Items {
+			if _, err := txStore.conn().ExecContext(ctx,
+				`INSERT INTO node_quality_checks (node_id, target, status, http_status, latency_ms, message, checked_at)
+				 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+				check.NodeID,
+				item.Target,
+				item.Status,
+				item.HTTPStatus,
+				item.LatencyMs,
+				item.Message,
+				formatTime(check.QualityCheckedAt),
+			); err != nil {
+				return fmt.Errorf("insert node quality item %d/%s: %w", check.NodeID, item.Target, err)
+			}
+		}
+
+		return nil
+	}
+
+	if s.tx != nil {
+		return execFn(s)
+	}
+	return s.WithTx(ctx, func(tx Store) error {
+		return execFn(tx.(*sqliteStore))
+	})
 }
 
 // ===================== Timeline =====================

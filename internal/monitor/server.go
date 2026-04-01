@@ -101,7 +101,9 @@ type Server struct {
 	sessionTTL time.Duration
 
 	// Concurrency control
-	probeSem *semaphore.Weighted
+	probeSem   *semaphore.Weighted
+	qualitySem *semaphore.Weighted
+	probeJobs  *BatchProbeJobManager
 
 	// Lifecycle
 	done chan struct{} // closed on Shutdown to stop background goroutines
@@ -132,6 +134,8 @@ func NewServer(cfg Config, mgr *Manager, logger *log.Logger) *Server {
 		sessions:   make(map[string]*Session),
 		sessionTTL: 24 * time.Hour,
 		probeSem:   semaphore.NewWeighted(maxConcurrentProbes),
+		qualitySem: semaphore.NewWeighted(5),
+		probeJobs:  NewBatchProbeJobManager(10),
 		done:       make(chan struct{}),
 	}
 
@@ -148,6 +152,10 @@ func NewServer(cfg Config, mgr *Manager, logger *log.Logger) *Server {
 	mux.HandleFunc("/api/nodes/config/", s.withAuth(s.handleConfigNodeItem))
 	mux.HandleFunc("/api/nodes/probe-all", s.withAuth(s.handleProbeAll))
 	mux.HandleFunc("/api/nodes/probe-batch", s.withAuth(s.handleProbeBatch))
+	mux.HandleFunc("/api/nodes/probe-batch/start", s.withAuth(s.handleProbeBatchStart))
+	mux.HandleFunc("/api/nodes/probe-batch/status", s.withAuth(s.handleProbeBatchStatus))
+	mux.HandleFunc("/api/nodes/probe-batch/cancel", s.withAuth(s.handleProbeBatchCancel))
+	mux.HandleFunc("/api/nodes/quality-check-batch", s.withAuth(s.handleQualityCheckBatch))
 	mux.HandleFunc("/api/nodes/traffic/stream", s.withAuth(s.handleTrafficStream))
 	mux.HandleFunc("/api/nodes/", s.withAuth(s.handleNodeAction))
 	mux.HandleFunc("/api/debug", s.withAuth(s.handleDebug))
@@ -692,6 +700,53 @@ func (s *Server) handleNodeAction(w http.ResponseWriter, r *http.Request) {
 			latencyMs = 1 // Round up sub-millisecond latencies to 1ms
 		}
 		writeJSON(w, map[string]any{"message": "探测成功", "latency_ms": latencyMs})
+	case "quality-check":
+		if s.store == nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			writeJSON(w, map[string]any{"error": "数据存储未初始化"})
+			return
+		}
+		if r.Method == http.MethodGet {
+			snapshot, found := s.snapshotByTag(tag)
+			if !found {
+				w.WriteHeader(http.StatusNotFound)
+				writeJSON(w, map[string]any{"error": fmt.Sprintf("node %s not found", tag)})
+				return
+			}
+			node, err := s.store.GetNodeByURI(r.Context(), snapshot.URI)
+			if err != nil {
+				writeJSON(w, map[string]any{"error": err.Error()})
+				return
+			}
+			if node == nil {
+				w.WriteHeader(http.StatusNotFound)
+				writeJSON(w, map[string]any{"error": "node not found in store"})
+				return
+			}
+			result, err := s.store.GetNodeQualityCheck(r.Context(), node.ID)
+			if err != nil {
+				writeJSON(w, map[string]any{"error": err.Error()})
+				return
+			}
+			if result == nil {
+				w.WriteHeader(http.StatusNotFound)
+				writeJSON(w, map[string]any{"error": "quality check result not found"})
+				return
+			}
+			writeJSON(w, map[string]any{"result": result})
+			return
+		}
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		checker := NewQualityChecker(s.mgr, s.store)
+		result, err := checker.CheckNode(r.Context(), tag)
+		if err != nil {
+			writeJSON(w, map[string]any{"error": err.Error()})
+			return
+		}
+		writeJSON(w, map[string]any{"message": "质量检测完成", "result": result})
 	case "release":
 		if r.Method != http.MethodPost {
 			w.WriteHeader(http.StatusMethodNotAllowed)
@@ -718,6 +773,10 @@ func (s *Server) handleProbeAll(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleProbeBatch(w http.ResponseWriter, r *http.Request) {
+	s.handleProbeBatchStart(w, r)
+}
+
+func (s *Server) handleProbeBatchStart(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
@@ -764,7 +823,76 @@ func (s *Server) handleProbeBatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.streamProbeSnapshots(w, r, filtered)
+	job, err := s.probeJobs.Start(req.Tags, filtered, func(ctx context.Context, snap Snapshot) (int64, error) {
+		probeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+
+		if err := s.probeSem.Acquire(probeCtx, 1); err != nil {
+			return -1, fmt.Errorf("probe cancelled: %w", err)
+		}
+		defer s.probeSem.Release(1)
+
+		latency, err := s.mgr.Probe(probeCtx, snap.Tag)
+		if err != nil {
+			return -1, err
+		}
+		return latency.Milliseconds(), nil
+	})
+	if err != nil {
+		if errors.Is(err, ErrBatchProbeJobRunning) {
+			w.WriteHeader(http.StatusConflict)
+		} else {
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+		writeJSON(w, map[string]any{"error": err.Error()})
+		return
+	}
+
+	writeJSON(w, map[string]any{"job": job})
+}
+
+func (s *Server) handleProbeBatchStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	job := s.probeJobs.Status()
+	if job == nil {
+		writeJSON(w, map[string]any{"job": nil})
+		return
+	}
+
+	writeJSON(w, map[string]any{"job": job})
+}
+
+func (s *Server) handleProbeBatchCancel(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		JobID string `json:"job_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		writeJSON(w, map[string]any{"error": "请求格式错误"})
+		return
+	}
+	if strings.TrimSpace(req.JobID) == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		writeJSON(w, map[string]any{"error": "job_id 不能为空"})
+		return
+	}
+
+	if err := s.probeJobs.Cancel(req.JobID); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		writeJSON(w, map[string]any{"error": err.Error()})
+		return
+	}
+
+	writeJSON(w, map[string]any{"message": "批量探测已取消", "job_id": req.JobID})
 }
 
 func (s *Server) streamProbeSnapshots(w http.ResponseWriter, r *http.Request, snapshots []Snapshot) {
@@ -881,6 +1009,148 @@ func (s *Server) streamProbeSnapshots(w http.ResponseWriter, r *http.Request, sn
 	flusher.Flush()
 }
 
+func (s *Server) handleQualityCheckBatch(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	if s.store == nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		writeJSON(w, map[string]any{"error": "数据存储未初始化"})
+		return
+	}
+
+	var req struct {
+		Tags []string `json:"tags"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		writeJSON(w, map[string]any{"error": "请求格式错误"})
+		return
+	}
+	if len(req.Tags) == 0 {
+		w.WriteHeader(http.StatusBadRequest)
+		writeJSON(w, map[string]any{"error": "tags 不能为空"})
+		return
+	}
+
+	selectedTags := make(map[string]struct{}, len(req.Tags))
+	for _, tag := range req.Tags {
+		tag = strings.TrimSpace(tag)
+		if tag == "" {
+			continue
+		}
+		selectedTags[tag] = struct{}{}
+	}
+	if len(selectedTags) == 0 {
+		w.WriteHeader(http.StatusBadRequest)
+		writeJSON(w, map[string]any{"error": "没有可检测的节点"})
+		return
+	}
+
+	snapshots := s.mgr.Snapshot()
+	filtered := make([]Snapshot, 0, len(selectedTags))
+	for _, snap := range snapshots {
+		if _, ok := selectedTags[snap.Tag]; ok {
+			filtered = append(filtered, snap)
+		}
+	}
+	if len(filtered) == 0 {
+		w.WriteHeader(http.StatusBadRequest)
+		writeJSON(w, map[string]any{"error": "没有可检测的节点"})
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "SSE not supported", http.StatusInternalServerError)
+		return
+	}
+
+	total := len(filtered)
+	fmt.Fprintf(w, "data: %s\n\n", fmt.Sprintf(`{"type":"start","total":%d}`, total))
+	flusher.Flush()
+
+	type qualityResult struct {
+		tag           string
+		name          string
+		qualityStatus string
+		qualityScore  int
+		qualityGrade  string
+		err           string
+	}
+
+	checker := NewQualityChecker(s.mgr, s.store)
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
+	defer cancel()
+
+	results := make(chan qualityResult, total)
+	var wg sync.WaitGroup
+
+	for _, snap := range filtered {
+		wg.Add(1)
+		go func(snap Snapshot) {
+			defer wg.Done()
+
+			if err := s.qualitySem.Acquire(ctx, 1); err != nil {
+				results <- qualityResult{tag: snap.Tag, name: snap.Name, err: "quality check cancelled: " + err.Error()}
+				return
+			}
+			defer s.qualitySem.Release(1)
+
+			check, err := checker.CheckNode(ctx, snap.Tag)
+			if err != nil {
+				results <- qualityResult{tag: snap.Tag, name: snap.Name, err: err.Error()}
+				return
+			}
+
+			score := 0
+			if check.QualityScore != nil {
+				score = *check.QualityScore
+			}
+			results <- qualityResult{
+				tag:           snap.Tag,
+				name:          snap.Name,
+				qualityStatus: check.QualityStatus,
+				qualityScore:  score,
+				qualityGrade:  check.QualityGrade,
+			}
+		}(snap)
+	}
+
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	successCount := 0
+	failedCount := 0
+	count := 0
+
+	for result := range results {
+		count++
+		status := "success"
+		if result.err != "" {
+			status = "error"
+			failedCount++
+		} else {
+			successCount++
+		}
+
+		eventData := fmt.Sprintf(`{"type":"progress","tag":"%s","name":"%s","status":"%s","error":"%s","quality_status":"%s","quality_score":%d,"quality_grade":"%s","current":%d,"total":%d}`,
+			result.tag, result.name, status, result.err, result.qualityStatus, result.qualityScore, result.qualityGrade, count, total)
+		fmt.Fprintf(w, "data: %s\n\n", eventData)
+		flusher.Flush()
+	}
+
+	fmt.Fprintf(w, "data: %s\n\n", fmt.Sprintf(`{"type":"complete","total":%d,"success":%d,"failed":%d}`, total, successCount, failedCount))
+	flusher.Flush()
+}
+
 func (s *Server) handleTrafficStream(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		w.WriteHeader(http.StatusMethodNotAllowed)
@@ -957,6 +1227,15 @@ func writeJSON(w http.ResponseWriter, payload any) {
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
 	_ = enc.Encode(payload)
+}
+
+func (s *Server) snapshotByTag(tag string) (Snapshot, bool) {
+	for _, snap := range s.mgr.Snapshot() {
+		if snap.Tag == tag {
+			return snap, true
+		}
+	}
+	return Snapshot{}, false
 }
 
 // withAuth 认证中间件，如果配置了密码则需要验证

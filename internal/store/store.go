@@ -80,6 +80,12 @@ type Store interface {
 	// GetAllNodeStats returns stats for all nodes (used for bulk restore).
 	GetAllNodeStats(ctx context.Context) (map[int64]*NodeStats, error)
 
+	// GetNodeQualityCheck returns the latest quality-check summary and items for a node.
+	GetNodeQualityCheck(ctx context.Context, nodeID int64) (*NodeQualityCheck, error)
+
+	// SaveNodeQualityCheck replaces the latest quality-check summary and detail rows for a node.
+	SaveNodeQualityCheck(ctx context.Context, check *NodeQualityCheck) error
+
 	// --- Timeline ---
 
 	// AppendTimeline adds an event to a node's timeline.
@@ -166,7 +172,38 @@ type NodeStats struct {
 	InitialCheckDone   bool      `json:"initial_check_done"`
 	TotalUploadBytes   int64     `json:"total_upload_bytes"`
 	TotalDownloadBytes int64     `json:"total_download_bytes"`
+	QualityStatus      string    `json:"quality_status"`
+	QualityScore       *int      `json:"quality_score,omitempty"`
+	QualityGrade       string    `json:"quality_grade"`
+	QualitySummary     string    `json:"quality_summary"`
+	QualityCheckedAt   time.Time `json:"quality_checked_at"`
+	ExitIP             string    `json:"exit_ip"`
+	ExitCountry        string    `json:"exit_country"`
+	ExitCountryCode    string    `json:"exit_country_code"`
+	ExitRegion         string    `json:"exit_region"`
 	UpdatedAt          time.Time `json:"updated_at"`
+}
+
+type NodeQualityCheck struct {
+	NodeID           int64
+	QualityStatus    string
+	QualityScore     *int
+	QualityGrade     string
+	QualitySummary   string
+	QualityCheckedAt time.Time
+	ExitIP           string
+	ExitCountry      string
+	ExitCountryCode  string
+	ExitRegion       string
+	Items            []NodeQualityCheckItem
+}
+
+type NodeQualityCheckItem struct {
+	Target     string
+	Status     string
+	HTTPStatus int
+	LatencyMs  int64
+	Message    string
 }
 
 // StatsUpdate represents a batch update for node statistics.

@@ -3,9 +3,13 @@ package pool
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"fmt"
+	"io"
 	"math/rand"
 	"net"
+	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -137,6 +141,9 @@ func newPool(ctx context.Context, _ adapter.Router, logger log.ContextLogger, ta
 				if probeFn := p.makeProbeByTagFunc(memberTag); probeFn != nil {
 					entry.SetProbe(probeFn)
 				}
+				if requestFn := p.makeHTTPRequestByTagFunc(memberTag); requestFn != nil {
+					entry.SetHTTPRequest(requestFn)
+				}
 			} else {
 				logger.Warn("failed to register node: ", memberTag)
 			}
@@ -229,6 +236,9 @@ func (p *poolOutbound) initializeMembersLocked() error {
 				entry.SetRelease(p.makeReleaseFunc(member))
 				if probe := p.makeProbeFunc(member); probe != nil {
 					entry.SetProbe(probe)
+				}
+				if requestFn := p.makeHTTPRequestFunc(member); requestFn != nil {
+					entry.SetHTTPRequest(requestFn)
 				}
 			}
 		}
@@ -585,6 +595,96 @@ func (p *poolOutbound) makeProbeFunc(member *memberState) func(ctx context.Conte
 	}
 }
 
+func (p *poolOutbound) makeHTTPRequestFunc(member *memberState) func(ctx context.Context, method, rawURL string, headers map[string]string, maxBodyBytes int64) (*monitor.HTTPCheckResult, error) {
+	return func(ctx context.Context, method, rawURL string, headers map[string]string, maxBodyBytes int64) (*monitor.HTTPCheckResult, error) {
+		transport := &http.Transport{
+			DisableKeepAlives:     true,
+			ForceAttemptHTTP2:     true,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ResponseHeaderTimeout: 10 * time.Second,
+			TLSClientConfig: &tls.Config{
+				MinVersion: tls.VersionTLS12,
+			},
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				host, port, err := net.SplitHostPort(addr)
+				if err != nil {
+					return nil, err
+				}
+				return member.outbound.DialContext(ctx, network, M.ParseSocksaddrHostPort(host, parseDialPort(port)))
+			},
+		}
+		defer transport.CloseIdleConnections()
+
+		client := &http.Client{Transport: transport}
+		req, err := http.NewRequestWithContext(ctx, method, rawURL, nil)
+		if err != nil {
+			return nil, err
+		}
+		for key, value := range headers {
+			req.Header.Set(key, value)
+		}
+
+		start := time.Now()
+		resp, err := client.Do(req)
+		latencyMs := time.Since(start).Milliseconds()
+		if err != nil {
+			return nil, err
+		}
+		defer resp.Body.Close()
+
+		if maxBodyBytes <= 0 {
+			maxBodyBytes = 8 * 1024
+		}
+		body, err := io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes+1))
+		if err != nil {
+			return nil, err
+		}
+		if int64(len(body)) > maxBodyBytes {
+			body = body[:maxBodyBytes]
+		}
+
+		headerMap := make(map[string]string, len(resp.Header))
+		for key, values := range resp.Header {
+			if len(values) > 0 {
+				headerMap[key] = values[0]
+			}
+		}
+
+		return &monitor.HTTPCheckResult{
+			StatusCode: resp.StatusCode,
+			LatencyMs:  latencyMs,
+			Headers:    headerMap,
+			Body:       body,
+		}, nil
+	}
+}
+
+func (p *poolOutbound) makeHTTPRequestByTagFunc(tag string) func(ctx context.Context, method, rawURL string, headers map[string]string, maxBodyBytes int64) (*monitor.HTTPCheckResult, error) {
+	return func(ctx context.Context, method, rawURL string, headers map[string]string, maxBodyBytes int64) (*monitor.HTTPCheckResult, error) {
+		p.mu.Lock()
+		if len(p.members) == 0 {
+			if err := p.initializeMembersLocked(); err != nil {
+				p.mu.Unlock()
+				return nil, err
+			}
+		}
+
+		var member *memberState
+		for _, current := range p.members {
+			if current.tag == tag {
+				member = current
+				break
+			}
+		}
+		p.mu.Unlock()
+
+		if member == nil {
+			return nil, E.New("member not found: ", tag)
+		}
+		return p.makeHTTPRequestFunc(member)(ctx, method, rawURL, headers, maxBodyBytes)
+	}
+}
+
 // makeProbeByTagFunc creates a probe function that works before member initialization
 func (p *poolOutbound) makeProbeByTagFunc(tag string) func(ctx context.Context) (time.Duration, error) {
 	if p.monitor == nil {
@@ -746,4 +846,12 @@ func (p *poolOutbound) putCandidateBuffer(buf []*memberState) {
 		return
 	}
 	p.candidatesPool.Put(buf[:0])
+}
+
+func parseDialPort(value string) uint16 {
+	port, err := strconv.Atoi(value)
+	if err != nil || port <= 0 || port > 65535 {
+		return 80
+	}
+	return uint16(port)
 }

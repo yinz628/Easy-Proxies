@@ -92,7 +92,15 @@ type TrafficSummary struct {
 }
 
 type probeFunc func(ctx context.Context) (time.Duration, error)
+type httpRequestFunc func(ctx context.Context, method, rawURL string, headers map[string]string, maxBodyBytes int64) (*HTTPCheckResult, error)
 type releaseFunc func()
+
+type HTTPCheckResult struct {
+	StatusCode int
+	LatencyMs  int64
+	Headers    map[string]string
+	Body       []byte
+}
 
 type EntryHandle struct {
 	ref *entry
@@ -118,6 +126,7 @@ type entry struct {
 	lastSpeedDown    int64
 	lastSpeedAt      time.Time
 	probe            probeFunc
+	httpRequest      httpRequestFunc
 	release          releaseFunc
 	initialCheckDone bool
 	available        bool
@@ -633,6 +642,17 @@ func (m *Manager) Probe(ctx context.Context, tag string) (time.Duration, error) 
 	return latency, nil
 }
 
+func (m *Manager) HTTPRequest(ctx context.Context, tag, method, rawURL string, headers map[string]string, maxBodyBytes int64) (*HTTPCheckResult, error) {
+	e, err := m.entry(tag)
+	if err != nil {
+		return nil, err
+	}
+	if e.httpRequest == nil {
+		return nil, errors.New("http request not available for this node")
+	}
+	return e.httpRequest(ctx, method, rawURL, headers, maxBodyBytes)
+}
+
 // Release clears blacklist state for the given node.
 func (m *Manager) Release(tag string) error {
 	e, err := m.entry(tag)
@@ -779,6 +799,12 @@ func (e *entry) setProbe(fn probeFunc) {
 	e.probe = fn
 }
 
+func (e *entry) setHTTPRequest(fn httpRequestFunc) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.httpRequest = fn
+}
+
 func (e *entry) setRelease(fn releaseFunc) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -890,6 +916,14 @@ func (h *EntryHandle) SetProbe(fn func(ctx context.Context) (time.Duration, erro
 		return
 	}
 	h.ref.setProbe(fn)
+}
+
+// SetHTTPRequest assigns a per-node HTTP request function used by quality checks.
+func (h *EntryHandle) SetHTTPRequest(fn func(ctx context.Context, method, rawURL string, headers map[string]string, maxBodyBytes int64) (*HTTPCheckResult, error)) {
+	if h == nil || h.ref == nil {
+		return
+	}
+	h.ref.setHTTPRequest(fn)
 }
 
 // SetRelease assigns a release function.

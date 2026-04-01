@@ -8,7 +8,10 @@ import type {
   ConfigNodePayload,
   ConfigNodeMutationResponse,
   SubscriptionStatus,
+  BatchProbeJob,
   ProbeSSEEvent,
+  NodeQualityCheckResult,
+  QualityCheckBatchEvent,
   TrafficStreamEvent,
 } from '../types'
 
@@ -132,6 +135,14 @@ export async function probeNode(tag: string): Promise<{ message: string; latency
 
 export async function releaseNode(tag: string): Promise<{ message: string }> {
   return request(`/api/nodes/${encodeURIComponent(tag)}/release`, { method: 'POST' })
+}
+
+export async function checkNodeQuality(tag: string): Promise<{ message: string; result: NodeQualityCheckResult }> {
+  return request(`/api/nodes/${encodeURIComponent(tag)}/quality-check`, { method: 'POST' })
+}
+
+export async function getNodeQuality(tag: string): Promise<{ result: NodeQualityCheckResult }> {
+  return request(`/api/nodes/${encodeURIComponent(tag)}/quality-check`)
 }
 
 /** Probe all nodes with SSE progress updates */
@@ -392,6 +403,92 @@ export function probeBatchNodes(
           if (trimmed.startsWith('data: ')) {
             try {
               const data = JSON.parse(trimmed.slice(6)) as ProbeSSEEvent
+              onEvent(data)
+            } catch { /* skip malformed events */ }
+          }
+        }
+      }
+    } catch (err) {
+      if ((err as Error).name !== 'AbortError') {
+        onError?.(err as Error)
+      }
+    }
+  }
+
+  doFetch()
+  return controller
+}
+
+export async function startProbeBatchJob(tags: string[]): Promise<{ job: BatchProbeJob }> {
+  return request('/api/nodes/probe-batch/start', {
+    method: 'POST',
+    body: JSON.stringify({ tags }),
+  })
+}
+
+export async function fetchProbeBatchJobStatus(): Promise<{ job: BatchProbeJob | null }> {
+  return request('/api/nodes/probe-batch/status')
+}
+
+export async function cancelProbeBatchJob(jobId: string): Promise<{ message: string; job_id: string }> {
+  return request('/api/nodes/probe-batch/cancel', {
+    method: 'POST',
+    body: JSON.stringify({ job_id: jobId }),
+  })
+}
+
+export function checkNodeQualityBatch(
+  tags: string[],
+  onEvent: (event: QualityCheckBatchEvent) => void,
+  onError?: (error: Error) => void
+): AbortController {
+  const controller = new AbortController()
+
+  const doFetch = async () => {
+    try {
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+      }
+      if (authToken) {
+        headers['Authorization'] = `Bearer ${authToken}`
+      }
+
+      const res = await fetch('/api/nodes/quality-check-batch', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ tags }),
+        credentials: 'include',
+        signal: controller.signal,
+      })
+
+      if (!res.ok) {
+        let message = `鎵归噺璐ㄩ噺妫€鏌ュけ璐? HTTP ${res.status}`
+        try {
+          const body = await res.json()
+          if (body.error) message = body.error
+        } catch { /* ignore parse errors */ }
+        throw new ApiError(message, res.status)
+      }
+
+      const reader = res.body?.getReader()
+      if (!reader) throw new Error('No response body')
+
+      const decoder = new TextDecoder()
+      let buffer = ''
+
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+
+        buffer += decoder.decode(value, { stream: true })
+        const lines = buffer.split('\n')
+        buffer = lines.pop() || ''
+
+        for (const line of lines) {
+          const trimmed = line.trim()
+          if (trimmed.startsWith('data: ')) {
+            try {
+              const data = JSON.parse(trimmed.slice(6)) as QualityCheckBatchEvent
               onEvent(data)
             } catch { /* skip malformed events */ }
           }
