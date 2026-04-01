@@ -340,6 +340,74 @@ export async function refreshSubscription(): Promise<{ message: string; node_cou
   return request('/api/subscription/refresh', { method: 'POST' })
 }
 
+export function probeBatchNodes(
+  tags: string[],
+  onEvent: (event: ProbeSSEEvent) => void,
+  onError?: (error: Error) => void
+): AbortController {
+  const controller = new AbortController()
+
+  const doFetch = async () => {
+    try {
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+      }
+      if (authToken) {
+        headers['Authorization'] = `Bearer ${authToken}`
+      }
+
+      const res = await fetch('/api/nodes/probe-batch', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ tags }),
+        credentials: 'include',
+        signal: controller.signal,
+      })
+
+      if (!res.ok) {
+        let message = `批量探测失败: HTTP ${res.status}`
+        try {
+          const body = await res.json()
+          if (body.error) message = body.error
+        } catch { /* ignore parse errors */ }
+        throw new ApiError(message, res.status)
+      }
+
+      const reader = res.body?.getReader()
+      if (!reader) throw new Error('No response body')
+
+      const decoder = new TextDecoder()
+      let buffer = ''
+
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+
+        buffer += decoder.decode(value, { stream: true })
+        const lines = buffer.split('\n')
+        buffer = lines.pop() || ''
+
+        for (const line of lines) {
+          const trimmed = line.trim()
+          if (trimmed.startsWith('data: ')) {
+            try {
+              const data = JSON.parse(trimmed.slice(6)) as ProbeSSEEvent
+              onEvent(data)
+            } catch { /* skip malformed events */ }
+          }
+        }
+      }
+    } catch (err) {
+      if ((err as Error).name !== 'AbortError') {
+        onError?.(err as Error)
+      }
+    }
+  }
+
+  doFetch()
+  return controller
+}
+
 export async function refreshSubscriptionFeed(feedKey: string): Promise<{ message: string; feed_key: string }> {
   return request('/api/subscription/refresh-feed', {
     method: 'POST',

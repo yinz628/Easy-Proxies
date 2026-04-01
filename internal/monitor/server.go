@@ -147,6 +147,7 @@ func NewServer(cfg Config, mgr *Manager, logger *log.Logger) *Server {
 	mux.HandleFunc("/api/nodes/config/batch-delete", s.withAuth(s.handleConfigNodesBatchDelete))
 	mux.HandleFunc("/api/nodes/config/", s.withAuth(s.handleConfigNodeItem))
 	mux.HandleFunc("/api/nodes/probe-all", s.withAuth(s.handleProbeAll))
+	mux.HandleFunc("/api/nodes/probe-batch", s.withAuth(s.handleProbeBatch))
 	mux.HandleFunc("/api/nodes/traffic/stream", s.withAuth(s.handleTrafficStream))
 	mux.HandleFunc("/api/nodes/", s.withAuth(s.handleNodeAction))
 	mux.HandleFunc("/api/debug", s.withAuth(s.handleDebug))
@@ -713,6 +714,61 @@ func (s *Server) handleProbeAll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.streamProbeSnapshots(w, r, s.mgr.Snapshot())
+}
+
+func (s *Server) handleProbeBatch(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		Tags []string `json:"tags"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		writeJSON(w, map[string]any{"error": "请求格式错误"})
+		return
+	}
+	if len(req.Tags) == 0 {
+		w.WriteHeader(http.StatusBadRequest)
+		writeJSON(w, map[string]any{"error": "tags 不能为空"})
+		return
+	}
+
+	selectedTags := make(map[string]struct{}, len(req.Tags))
+	for _, tag := range req.Tags {
+		tag = strings.TrimSpace(tag)
+		if tag == "" {
+			continue
+		}
+		selectedTags[tag] = struct{}{}
+	}
+	if len(selectedTags) == 0 {
+		w.WriteHeader(http.StatusBadRequest)
+		writeJSON(w, map[string]any{"error": "没有可探测的节点"})
+		return
+	}
+
+	allSnapshots := s.mgr.Snapshot()
+	filtered := make([]Snapshot, 0, len(selectedTags))
+	for _, snap := range allSnapshots {
+		if _, ok := selectedTags[snap.Tag]; ok {
+			filtered = append(filtered, snap)
+		}
+	}
+	if len(filtered) == 0 {
+		w.WriteHeader(http.StatusBadRequest)
+		writeJSON(w, map[string]any{"error": "没有可探测的节点"})
+		return
+	}
+
+	s.streamProbeSnapshots(w, r, filtered)
+}
+
+func (s *Server) streamProbeSnapshots(w http.ResponseWriter, r *http.Request, snapshots []Snapshot) {
+
 	// Set SSE headers
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -724,8 +780,6 @@ func (s *Server) handleProbeAll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Get all nodes
-	snapshots := s.mgr.Snapshot()
 	total := len(snapshots)
 	if total == 0 {
 		fmt.Fprintf(w, "data: %s\n\n", `{"type":"complete","total":0,"success":0,"failed":0}`)

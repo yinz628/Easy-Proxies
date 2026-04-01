@@ -97,3 +97,84 @@ func TestDeleteNodesByFeedKeyOnlyRemovesMatchingRows(t *testing.T) {
 		t.Fatalf("remaining node FeedKey = %q, want %q", got, want)
 	}
 }
+
+func TestReplaceTXTFeedNodesDeduplicatesAcrossFeeds(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "store.db")
+	st, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer st.Close()
+
+	ctx := context.Background()
+	if err := st.ReplaceTXTFeedNodes(ctx, "txt:https://example.com/a.txt", []Node{
+		{URI: "http://1.1.1.1:80", Name: "a-1", Source: NodeSourceTXTSubscription, Enabled: true},
+		{URI: "http://2.2.2.2:80", Name: "a-2", Source: NodeSourceTXTSubscription, Enabled: true},
+	}); err != nil {
+		t.Fatalf("ReplaceTXTFeedNodes(feed A) error = %v", err)
+	}
+
+	if err := st.ReplaceTXTFeedNodes(ctx, "txt:https://example.com/b.txt", []Node{
+		{URI: "http://1.1.1.1:80", Name: "b-1", Source: NodeSourceTXTSubscription, Enabled: true},
+	}); err != nil {
+		t.Fatalf("ReplaceTXTFeedNodes(feed B) error = %v", err)
+	}
+
+	nodes, err := st.ListNodes(ctx, NodeFilter{Source: NodeSourceTXTSubscription})
+	if err != nil {
+		t.Fatalf("ListNodes() error = %v", err)
+	}
+	if len(nodes) != 2 {
+		t.Fatalf("len(nodes) = %d, want 2", len(nodes))
+	}
+
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("sql.Open() error = %v", err)
+	}
+	defer db.Close()
+
+	var membershipCount int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM txt_feed_memberships WHERE uri = ?`, "http://1.1.1.1:80").Scan(&membershipCount); err != nil {
+		t.Fatalf("QueryRow(membershipCount) error = %v", err)
+	}
+	if membershipCount != 2 {
+		t.Fatalf("membershipCount = %d, want 2", membershipCount)
+	}
+}
+
+func TestReplaceTXTFeedNodesKeepsSharedURIReferencedByAnotherFeed(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "store.db")
+	st, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer st.Close()
+
+	ctx := context.Background()
+	if err := st.ReplaceTXTFeedNodes(ctx, "txt:https://example.com/a.txt", []Node{
+		{URI: "http://1.1.1.1:80", Name: "a-1", Source: NodeSourceTXTSubscription, Enabled: true},
+	}); err != nil {
+		t.Fatalf("ReplaceTXTFeedNodes(feed A initial) error = %v", err)
+	}
+	if err := st.ReplaceTXTFeedNodes(ctx, "txt:https://example.com/b.txt", []Node{
+		{URI: "http://1.1.1.1:80", Name: "b-1", Source: NodeSourceTXTSubscription, Enabled: true},
+	}); err != nil {
+		t.Fatalf("ReplaceTXTFeedNodes(feed B initial) error = %v", err)
+	}
+
+	if err := st.ReplaceTXTFeedNodes(ctx, "txt:https://example.com/a.txt", []Node{}); err != nil {
+		t.Fatalf("ReplaceTXTFeedNodes(feed A replace empty) error = %v", err)
+	}
+
+	nodes, err := st.ListNodes(ctx, NodeFilter{Source: NodeSourceTXTSubscription})
+	if err != nil {
+		t.Fatalf("ListNodes() error = %v", err)
+	}
+	if len(nodes) != 1 {
+		t.Fatalf("len(nodes) = %d, want 1", len(nodes))
+	}
+	if got, want := nodes[0].URI, "http://1.1.1.1:80"; got != want {
+		t.Fatalf("remaining node URI = %q, want %q", got, want)
+	}
+}

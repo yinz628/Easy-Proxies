@@ -113,6 +113,20 @@ ALTER TABLE nodes ADD COLUMN feed_key TEXT NOT NULL DEFAULT '';
 CREATE INDEX IF NOT EXISTS idx_nodes_feed_key ON nodes(feed_key);
 `,
 		},
+		{
+			Version:     4,
+			Description: "add txt feed memberships",
+			Up: `
+CREATE TABLE IF NOT EXISTS txt_feed_memberships (
+    feed_key   TEXT NOT NULL,
+    uri        TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (feed_key, uri)
+);
+
+CREATE INDEX IF NOT EXISTS idx_txt_feed_memberships_uri ON txt_feed_memberships(uri);
+`,
+		},
 	}
 }
 

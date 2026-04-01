@@ -509,42 +509,8 @@ func (m *Manager) doRefresh(includeDisabledTXT bool) {
 			continue
 		}
 
-		if _, err := m.store.DeleteNodesByFeedKey(m.ctx, feed.FeedKey); err != nil {
-			lastErr = fmt.Sprintf("delete old nodes for %s: %v", feed.FeedKey, err)
-			if hasStatus {
-				feedStatuses[statusIdx].LastError = lastErr
-			}
-			continue
-		}
-
-		storeNodes := make([]store.Node, 0, len(fetched.Nodes))
-		for _, n := range fetched.Nodes {
-			name := strings.TrimSpace(n.Name)
-			uri := strings.TrimSpace(n.URI)
-			if name == "" {
-				if parsed, parseErr := url.Parse(uri); parseErr == nil && parsed.Fragment != "" {
-					if decoded, decErr := url.QueryUnescape(parsed.Fragment); decErr == nil {
-						name = decoded
-					} else {
-						name = parsed.Fragment
-					}
-				}
-			}
-			if name == "" {
-				name = fmt.Sprintf("sub-node-%d", len(storeNodes)+1)
-			}
-			storeNodes = append(storeNodes, store.Node{
-				URI:      uri,
-				Name:     name,
-				Source:   string(n.Source),
-				FeedKey:  feed.FeedKey,
-				Port:     n.Port,
-				Username: n.Username,
-				Password: n.Password,
-				Enabled:  true,
-			})
-		}
-		if err := m.store.BulkUpsertNodes(m.ctx, storeNodes); err != nil {
+		storeNodes := buildStoreNodesForFeed(feed, fetched.Nodes)
+		if err := m.persistFeedNodes(feed, storeNodes); err != nil {
 			lastErr = fmt.Sprintf("save feed %s: %v", feed.FeedKey, err)
 			if hasStatus {
 				feedStatuses[statusIdx].LastError = lastErr
@@ -705,24 +671,8 @@ func (m *Manager) RefreshFeed(feedKey string) error {
 		return fmt.Errorf("store not available")
 	}
 
-	if _, err := m.store.DeleteNodesByFeedKey(m.ctx, feed.FeedKey); err != nil {
-		return err
-	}
-
-	storeNodes := make([]store.Node, 0, len(fetched.Nodes))
-	for _, n := range fetched.Nodes {
-		storeNodes = append(storeNodes, store.Node{
-			URI:      n.URI,
-			Name:     n.Name,
-			Source:   string(n.Source),
-			FeedKey:  n.FeedKey,
-			Port:     n.Port,
-			Username: n.Username,
-			Password: n.Password,
-			Enabled:  true,
-		})
-	}
-	if err := m.store.BulkUpsertNodes(m.ctx, storeNodes); err != nil {
+	storeNodes := buildStoreNodesForFeed(feed, fetched.Nodes)
+	if err := m.persistFeedNodes(feed, storeNodes); err != nil {
 		return err
 	}
 
@@ -835,6 +785,49 @@ func (m *Manager) fetchTXTSubscription(feed feedRequest) (feedFetchResult, error
 		ValidNodes:   len(nodes),
 		SkippedLines: result.SkippedLines,
 	}, nil
+}
+
+func (m *Manager) persistFeedNodes(feed feedRequest, nodes []store.Node) error {
+	switch feed.Kind {
+	case feedKindTXT:
+		return m.store.ReplaceTXTFeedNodes(m.ctx, feed.FeedKey, nodes)
+	default:
+		if _, err := m.store.DeleteNodesByFeedKey(m.ctx, feed.FeedKey); err != nil {
+			return err
+		}
+		return m.store.BulkUpsertNodes(m.ctx, nodes)
+	}
+}
+
+func buildStoreNodesForFeed(feed feedRequest, nodes []config.NodeConfig) []store.Node {
+	storeNodes := make([]store.Node, 0, len(nodes))
+	for _, n := range nodes {
+		name := strings.TrimSpace(n.Name)
+		uri := strings.TrimSpace(n.URI)
+		if name == "" {
+			if parsed, parseErr := url.Parse(uri); parseErr == nil && parsed.Fragment != "" {
+				if decoded, decErr := url.QueryUnescape(parsed.Fragment); decErr == nil {
+					name = decoded
+				} else {
+					name = parsed.Fragment
+				}
+			}
+		}
+		if name == "" {
+			name = fmt.Sprintf("sub-node-%d", len(storeNodes)+1)
+		}
+		storeNodes = append(storeNodes, store.Node{
+			URI:      uri,
+			Name:     name,
+			Source:   string(n.Source),
+			FeedKey:  feed.FeedKey,
+			Port:     n.Port,
+			Username: n.Username,
+			Password: n.Password,
+			Enabled:  true,
+		})
+	}
+	return storeNodes
 }
 
 // createNewConfig creates a new config with updated subscription nodes while

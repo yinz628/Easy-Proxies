@@ -186,12 +186,13 @@ func loadNodesFromStore(ctx context.Context, cfg *config.Config, s store.Store) 
 // This is called once on first startup when the database is empty.
 func seedStoreFromConfig(ctx context.Context, cfg *config.Config, s store.Store) error {
 	var storeNodes []store.Node
+	txtFeedNodes := make(map[string][]store.Node)
 	for _, n := range cfg.Nodes {
 		source := string(n.Source)
 		if source == "" {
 			source = store.NodeSourceSubscription
 		}
-		storeNodes = append(storeNodes, store.Node{
+		node := store.Node{
 			URI:      n.URI,
 			Name:     n.Name,
 			Source:   source,
@@ -200,14 +201,25 @@ func seedStoreFromConfig(ctx context.Context, cfg *config.Config, s store.Store)
 			Username: n.Username,
 			Password: n.Password,
 			Enabled:  true,
-		})
+		}
+		if source == store.NodeSourceTXTSubscription && n.FeedKey != "" {
+			txtFeedNodes[n.FeedKey] = append(txtFeedNodes[n.FeedKey], node)
+			continue
+		}
+		storeNodes = append(storeNodes, node)
 	}
 
 	if err := s.BulkUpsertNodes(ctx, storeNodes); err != nil {
 		return fmt.Errorf("bulk upsert seed nodes: %w", err)
 	}
 
-	log.Printf("[app] seeded %d nodes into store", len(storeNodes))
+	for feedKey, nodes := range txtFeedNodes {
+		if err := s.ReplaceTXTFeedNodes(ctx, feedKey, nodes); err != nil {
+			return fmt.Errorf("replace txt feed nodes for %q: %w", feedKey, err)
+		}
+	}
+
+	log.Printf("[app] seeded %d non-txt nodes and %d txt feeds into store", len(storeNodes), len(txtFeedNodes))
 	return nil
 }
 

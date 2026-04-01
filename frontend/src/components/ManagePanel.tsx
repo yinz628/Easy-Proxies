@@ -4,7 +4,7 @@ import {
   fetchConfigNodes, createConfigNode, updateConfigNode, deleteConfigNode,
   toggleConfigNode, batchToggleConfigNodes, batchDeleteConfigNodes, triggerReload,
   importNodes, exportProxies,
-  fetchNodes, probeNode, releaseNode,
+  fetchNodes, probeNode, releaseNode, probeBatchNodes,
 } from '../api/client'
 
 // ---- Merged node type ----
@@ -460,33 +460,40 @@ export default function ManagePanel() {
 
     setBatchProcessing(true)
     setBatchProbeProgress({ current: 0, total: nodesToProbe.length })
-    let successCount = 0
-    let failCount = 0
-    let completed = 0
+    await new Promise<void>((resolve) => {
+      probeBatchNodes(
+        nodesToProbe.map(n => n.tag!),
+        (event) => {
+          if (event.type === 'start') {
+            setBatchProbeProgress({ current: 0, total: event.total })
+            return
+          }
 
-    const probeOne = async (tag: string) => {
-      try {
-        await probeNode(tag)
-        successCount++
-      } catch {
-        failCount++
-      } finally {
-        completed++
-        setBatchProbeProgress({ current: completed, total: nodesToProbe.length })
-      }
-    }
+          if (event.type === 'progress') {
+            setBatchProbeProgress({ current: event.current, total: event.total })
+            return
+          }
 
-    // Probe concurrently in batches of 10 (matching backend concurrency)
-    const concurrency = 10
-    for (let i = 0; i < nodesToProbe.length; i += concurrency) {
-      const batch = nodesToProbe.slice(i, i + concurrency)
-      await Promise.allSettled(batch.map(n => probeOne(n.tag!)))
-    }
+          setBatchProbeProgress(null)
+          setBatchProcessing(false)
+          setSuccess(`鎵归噺鎺㈡祴瀹屾垚锛?${event.success} 鎴愬姛锛?${event.failed} 澶辫触`)
+          void loadData().finally(resolve)
+        },
+        (err) => {
+          setBatchProbeProgress(null)
+          setBatchProcessing(false)
+          setError(err instanceof Error ? err.message : '鎵归噺鎺㈡祴澶辫触')
+          resolve()
+        }
+      )
+    })
+/*
 
     setBatchProbeProgress(null)
     setBatchProcessing(false)
     setSuccess(`批量探测完成：${successCount} 成功，${failCount} 失败`)
     await loadData()
+*/
   }
 
   const handleBatchDelete = async () => {

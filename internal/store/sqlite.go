@@ -220,6 +220,107 @@ func (s *sqliteStore) DeleteNodesByFeedKey(ctx context.Context, feedKey string) 
 	return result.RowsAffected()
 }
 
+func (s *sqliteStore) ReplaceTXTFeedNodes(ctx context.Context, feedKey string, nodes []Node) error {
+	feedKey = strings.TrimSpace(feedKey)
+	if feedKey == "" {
+		return fmt.Errorf("replace txt feed nodes: empty feed key")
+	}
+
+	execFn := func(txStore *sqliteStore) error {
+		now := time.Now().UTC().Format(time.RFC3339)
+
+		if _, err := txStore.conn().ExecContext(ctx, "DELETE FROM txt_feed_memberships WHERE feed_key = ?", feedKey); err != nil {
+			return fmt.Errorf("delete old txt feed memberships %q: %w", feedKey, err)
+		}
+
+		for i := range nodes {
+			n := &nodes[i]
+			n.Source = NodeSourceTXTSubscription
+			n.FeedKey = feedKey
+			enabled := 0
+			if n.Enabled {
+				enabled = 1
+			}
+
+			if _, err := txStore.conn().ExecContext(ctx,
+				`INSERT OR IGNORE INTO nodes (uri, name, source, feed_key, port, username, password, region, country, enabled, created_at, updated_at)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				n.URI, n.Name, n.Source, feedKey, n.Port, n.Username, n.Password, n.Region, n.Country, enabled, now, now,
+			); err != nil {
+				return fmt.Errorf("insert txt node %q: %w", n.URI, err)
+			}
+
+			if _, err := txStore.conn().ExecContext(ctx,
+				`UPDATE nodes
+				   SET name = CASE WHEN source = ? THEN ? ELSE name END,
+				       port = CASE WHEN source = ? THEN ? ELSE port END,
+				       username = CASE WHEN source = ? THEN ? ELSE username END,
+				       password = CASE WHEN source = ? THEN ? ELSE password END,
+				       region = CASE WHEN source = ? THEN ? ELSE region END,
+				       country = CASE WHEN source = ? THEN ? ELSE country END,
+				       enabled = CASE WHEN source = ? THEN ? ELSE enabled END,
+				       updated_at = ?
+				 WHERE uri = ?`,
+				NodeSourceTXTSubscription, n.Name,
+				NodeSourceTXTSubscription, n.Port,
+				NodeSourceTXTSubscription, n.Username,
+				NodeSourceTXTSubscription, n.Password,
+				NodeSourceTXTSubscription, n.Region,
+				NodeSourceTXTSubscription, n.Country,
+				NodeSourceTXTSubscription, enabled,
+				now, n.URI,
+			); err != nil {
+				return fmt.Errorf("update txt node %q: %w", n.URI, err)
+			}
+
+			if _, err := txStore.conn().ExecContext(ctx,
+				"INSERT OR IGNORE INTO node_stats (node_id) SELECT id FROM nodes WHERE uri = ?",
+				n.URI,
+			); err != nil {
+				return fmt.Errorf("create txt node stats %q: %w", n.URI, err)
+			}
+
+			if _, err := txStore.conn().ExecContext(ctx,
+				`INSERT OR REPLACE INTO txt_feed_memberships (feed_key, uri, created_at)
+				 VALUES (?, ?, ?)`,
+				feedKey, n.URI, now,
+			); err != nil {
+				return fmt.Errorf("insert txt feed membership %q/%q: %w", feedKey, n.URI, err)
+			}
+		}
+
+		if _, err := txStore.conn().ExecContext(ctx,
+			`DELETE FROM nodes
+			  WHERE source = ?
+			    AND uri NOT IN (SELECT uri FROM txt_feed_memberships)`,
+			NodeSourceTXTSubscription,
+		); err != nil {
+			return fmt.Errorf("delete orphan txt nodes: %w", err)
+		}
+
+		if _, err := txStore.conn().ExecContext(ctx,
+			`UPDATE nodes
+			    SET feed_key = COALESCE(
+			        (SELECT MIN(m.feed_key) FROM txt_feed_memberships m WHERE m.uri = nodes.uri),
+			        ''
+			    )
+			  WHERE source = ?`,
+			NodeSourceTXTSubscription,
+		); err != nil {
+			return fmt.Errorf("refresh txt node feed keys: %w", err)
+		}
+
+		return nil
+	}
+
+	if s.tx != nil {
+		return execFn(s)
+	}
+	return s.WithTx(ctx, func(tx Store) error {
+		return execFn(tx.(*sqliteStore))
+	})
+}
+
 func (s *sqliteStore) BulkUpsertNodes(ctx context.Context, nodes []Node) error {
 	if len(nodes) == 0 {
 		return nil

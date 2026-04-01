@@ -40,6 +40,10 @@ type Store interface {
 	// DeleteNodesByFeedKey removes all nodes belonging to a specific subscription feed.
 	DeleteNodesByFeedKey(ctx context.Context, feedKey string) (int64, error)
 
+	// ReplaceTXTFeedNodes replaces one TXT feed membership set while keeping
+	// shared URIs deduplicated across multiple TXT feeds.
+	ReplaceTXTFeedNodes(ctx context.Context, feedKey string, nodes []Node) error
+
 	// BulkUpsertNodes inserts or updates nodes in a single transaction.
 	// Nodes are matched by URI for upsert logic.
 	BulkUpsertNodes(ctx context.Context, nodes []Node) error
