@@ -61,6 +61,26 @@ export function applyQualityResultToConfigNode(node: ConfigNodeConfig, result: N
   }
 }
 
+export function buildQualityResultFromBatchProgress(event: QualityCheckBatchProgress): NodeQualityCheckResult | null {
+  if (event.status !== 'success') {
+    return null
+  }
+
+  return {
+    node_id: 0,
+    quality_status: event.quality_status || 'unknown',
+    quality_score: event.quality_score,
+    quality_grade: event.quality_grade || '-',
+    quality_summary: event.quality_summary || '',
+    quality_checked_at: event.quality_checked_at,
+    exit_ip: event.exit_ip,
+    exit_country: event.exit_country,
+    exit_country_code: event.exit_country_code,
+    exit_region: event.exit_region,
+    items: event.items || [],
+  }
+}
+
 function reduceStart(event: QualityCheckBatchStart): BatchQualityState {
   return {
     status: 'running',

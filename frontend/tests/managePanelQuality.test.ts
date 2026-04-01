@@ -4,6 +4,7 @@ import assert from 'node:assert/strict'
 import type { ConfigNodeConfig, NodeQualityCheckResult, QualityCheckBatchEvent } from '../src/types/index.ts'
 import {
   applyQualityResultToConfigNode,
+  buildQualityResultFromBatchProgress,
   buildQualityCacheEntry,
   reduceBatchQualityEvent,
 } from '../src/components/managePanelQuality.ts'
@@ -128,4 +129,37 @@ test('reduceBatchQualityEvent tracks start, progress and completion', () => {
   assert.equal(state?.success, 2)
   assert.equal(state?.failed, 1)
   assert.equal(state?.current, 3)
+})
+
+test('buildQualityResultFromBatchProgress converts a successful batch event into detail data', () => {
+  const result = buildQualityResultFromBatchProgress({
+    type: 'progress',
+    tag: 'node-a',
+    name: 'Node A',
+    status: 'success',
+    error: '',
+    quality_status: 'warn',
+    quality_score: 80,
+    quality_grade: 'B',
+    quality_summary: '通过 1 项，告警 2 项，失败 0 项',
+    quality_checked_at: '2026-04-01T15:13:44Z',
+    exit_ip: '72.37.216.68',
+    exit_country: 'United States',
+    exit_country_code: 'US',
+    exit_region: 'California',
+    items: [
+      { target: 'base_connectivity', status: 'pass', http_status: 200, latency_ms: 120, message: 'proxy exit reachable' },
+      { target: 'openai', status: 'warn', http_status: 401, latency_ms: 180, message: 'HTTP 401 but target reachable' },
+      { target: 'anthropic', status: 'warn', http_status: 405, latency_ms: 190, message: 'HTTP 405 but target reachable' },
+    ],
+    current: 1,
+    total: 1,
+  } satisfies QualityCheckBatchEvent)
+
+  assert.equal(result?.quality_status, 'warn')
+  assert.equal(result?.quality_summary, '通过 1 项，告警 2 项，失败 0 项')
+  assert.equal(result?.quality_checked_at, '2026-04-01T15:13:44Z')
+  assert.equal(result?.exit_country_code, 'US')
+  assert.equal(result?.items.length, 3)
+  assert.deepEqual(result?.items.map(item => item.target), ['base_connectivity', 'openai', 'anthropic'])
 })

@@ -3,6 +3,7 @@ package monitor
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -48,10 +49,8 @@ func TestHandleQualityCheckReturnsSummary(t *testing.T) {
 			return &HTTPCheckResult{StatusCode: http.StatusUnauthorized, LatencyMs: 180, Headers: map[string]string{}, Body: []byte(`{}`)}, nil
 		case "https://api.anthropic.com/v1/messages":
 			return &HTTPCheckResult{StatusCode: http.StatusMethodNotAllowed, LatencyMs: 190, Headers: map[string]string{}, Body: []byte(`{}`)}, nil
-		case "https://generativelanguage.googleapis.com/$discovery/rest?version=v1beta":
-			return &HTTPCheckResult{StatusCode: http.StatusOK, LatencyMs: 200, Headers: map[string]string{}, Body: []byte(`{}`)}, nil
 		default:
-			return nil, nil
+			return nil, fmt.Errorf("unexpected quality target %s", rawURL)
 		}
 	})
 
@@ -76,6 +75,12 @@ func TestHandleQualityCheckReturnsSummary(t *testing.T) {
 	}
 	if response.Result.QualityGrade == "" {
 		t.Fatalf("quality grade = empty, response=%s", rec.Body.String())
+	}
+	if got, want := len(response.Result.Items), 3; got != want {
+		t.Fatalf("quality item count = %d, want %d response=%s", got, want, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "gemini") {
+		t.Fatalf("response unexpectedly contains gemini target: %s", rec.Body.String())
 	}
 }
 
@@ -167,6 +172,70 @@ func TestHandleQualityCheckBatchRejectsEmptyTags(t *testing.T) {
 
 	if rec.Code != http.StatusServiceUnavailable && rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want bad request or service unavailable", rec.Code)
+	}
+}
+
+func TestHandleQualityCheckBatchIncludesPersistedDetailPayload(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "quality-batch.db"))
+	if err != nil {
+		t.Fatalf("store.Open() error = %v", err)
+	}
+	defer st.Close()
+
+	ctx := context.Background()
+	if err := st.CreateNode(ctx, &store.Node{
+		URI:     "http://4.4.4.4:80",
+		Name:    "node-d",
+		Source:  store.NodeSourceManual,
+		Enabled: true,
+	}); err != nil {
+		t.Fatalf("CreateNode() error = %v", err)
+	}
+
+	mgr, err := NewManager(Config{})
+	if err != nil {
+		t.Fatalf("NewManager() error = %v", err)
+	}
+	entry := mgr.Register(NodeInfo{Tag: "node-d", Name: "node-d", URI: "http://4.4.4.4:80"})
+	entry.SetHTTPRequest(func(ctx context.Context, method, rawURL string, headers map[string]string, maxBodyBytes int64) (*HTTPCheckResult, error) {
+		switch rawURL {
+		case "http://ip-api.com/json/?lang=en":
+			return &HTTPCheckResult{
+				StatusCode: http.StatusOK,
+				LatencyMs:  88,
+				Body:       []byte(`{"status":"success","query":"72.37.216.68","country":"United States","countryCode":"US","regionName":"California"}`),
+				Headers:    map[string]string{},
+			}, nil
+		case "https://api.openai.com/v1/models":
+			return &HTTPCheckResult{StatusCode: http.StatusUnauthorized, LatencyMs: 180, Headers: map[string]string{}, Body: []byte(`{}`)}, nil
+		case "https://api.anthropic.com/v1/messages":
+			return &HTTPCheckResult{StatusCode: http.StatusMethodNotAllowed, LatencyMs: 190, Headers: map[string]string{}, Body: []byte(`{}`)}, nil
+		default:
+			return nil, fmt.Errorf("unexpected quality target %s", rawURL)
+		}
+	})
+
+	server := NewServer(Config{Enabled: true, Listen: "127.0.0.1:0"}, mgr, nil)
+	server.cfg.Password = ""
+	server.SetStore(st)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/nodes/quality-check-batch", strings.NewReader(`{"tags":["node-d"]}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	server.handleQualityCheckBatch(rec, req)
+
+	body := rec.Body.String()
+	if !strings.Contains(body, `"quality_summary":"通过 1 项，告警 2 项，失败 0 项"`) {
+		t.Fatalf("batch response missing quality summary: %s", body)
+	}
+	if !strings.Contains(body, `"quality_checked_at":"`) {
+		t.Fatalf("batch response missing quality_checked_at: %s", body)
+	}
+	if !strings.Contains(body, `"items":[`) {
+		t.Fatalf("batch response missing quality items: %s", body)
+	}
+	if strings.Contains(body, "gemini") {
+		t.Fatalf("batch response unexpectedly contains gemini target: %s", body)
 	}
 }
 

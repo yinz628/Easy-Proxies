@@ -45,17 +45,6 @@ var qualityTargets = []qualityTarget{
 			http.StatusMethodNotAllowed: quality.StatusWarn,
 		},
 	},
-	{
-		Name:   "gemini",
-		URL:    "https://generativelanguage.googleapis.com/$discovery/rest?version=v1beta",
-		Method: http.MethodGet,
-		Statuses: map[int]string{
-			http.StatusOK:               quality.StatusPass,
-			http.StatusUnauthorized:     quality.StatusWarn,
-			http.StatusForbidden:        quality.StatusWarn,
-			http.StatusTooManyRequests:  quality.StatusWarn,
-		},
-	},
 }
 
 type QualityChecker struct {

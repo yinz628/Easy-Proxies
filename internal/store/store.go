@@ -185,25 +185,25 @@ type NodeStats struct {
 }
 
 type NodeQualityCheck struct {
-	NodeID           int64
-	QualityStatus    string
-	QualityScore     *int
-	QualityGrade     string
-	QualitySummary   string
-	QualityCheckedAt time.Time
-	ExitIP           string
-	ExitCountry      string
-	ExitCountryCode  string
-	ExitRegion       string
-	Items            []NodeQualityCheckItem
+	NodeID           int64                  `json:"node_id"`
+	QualityStatus    string                 `json:"quality_status"`
+	QualityScore     *int                   `json:"quality_score,omitempty"`
+	QualityGrade     string                 `json:"quality_grade"`
+	QualitySummary   string                 `json:"quality_summary"`
+	QualityCheckedAt time.Time              `json:"quality_checked_at"`
+	ExitIP           string                 `json:"exit_ip,omitempty"`
+	ExitCountry      string                 `json:"exit_country,omitempty"`
+	ExitCountryCode  string                 `json:"exit_country_code,omitempty"`
+	ExitRegion       string                 `json:"exit_region,omitempty"`
+	Items            []NodeQualityCheckItem `json:"items"`
 }
 
 type NodeQualityCheckItem struct {
-	Target     string
-	Status     string
-	HTTPStatus int
-	LatencyMs  int64
-	Message    string
+	Target     string `json:"target"`
+	Status     string `json:"status"`
+	HTTPStatus int    `json:"http_status,omitempty"`
+	LatencyMs  int64  `json:"latency_ms,omitempty"`
+	Message    string `json:"message,omitempty"`
 }
 
 // StatsUpdate represents a batch update for node statistics.

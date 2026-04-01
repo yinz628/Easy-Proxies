@@ -12,6 +12,7 @@ import type { NodeQualityCheckResult } from '../types'
 import { checkNodeQuality, getNodeQuality, checkNodeQualityBatch } from '../api/client'
 import {
   applyQualityResultToConfigNode,
+  buildQualityResultFromBatchProgress,
   buildQualityCacheEntry,
   reduceBatchQualityEvent,
 } from './managePanelQuality.ts'
@@ -83,9 +84,12 @@ function regionFlag(region?: string): string {
 function qualityStatusTone(status?: string): string {
   switch (status) {
     case 'healthy':
+    case 'pass':
       return 'badge-success border-none bg-success/15 text-success'
+    case 'warn':
     case 'degraded':
       return 'badge-warning border-none bg-warning/15 text-warning-content'
+    case 'fail':
     case 'failed':
     case 'unhealthy':
       return 'badge-error border-none bg-error/15 text-error'
@@ -590,16 +594,10 @@ export default function ManagePanel() {
         if (event.type === 'progress' && event.status === 'success') {
           const nodeName = nameByTag.get(event.tag)
           if (nodeName) {
-            setConfigNodes(prev => prev.map(node => (
-              node.name === nodeName
-                ? {
-                    ...node,
-                    quality_status: event.quality_status ?? node.quality_status,
-                    quality_score: event.quality_score ?? node.quality_score,
-                    quality_grade: event.quality_grade ?? node.quality_grade,
-                  }
-                : node
-            )))
+            const result = buildQualityResultFromBatchProgress(event)
+            if (result) {
+              applyQualityResult(nodeName, result)
+            }
           }
         }
 

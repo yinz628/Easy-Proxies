@@ -253,6 +253,13 @@ export interface QualityCheckBatchProgress {
   quality_status?: string
   quality_score?: number
   quality_grade?: string
+  quality_summary?: string
+  quality_checked_at?: string
+  exit_ip?: string
+  exit_country?: string
+  exit_country_code?: string
+  exit_region?: string
+  items?: NodeQualityCheckItem[]
   current: number
   total: number
 }

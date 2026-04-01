@@ -1076,12 +1076,19 @@ func (s *Server) handleQualityCheckBatch(w http.ResponseWriter, r *http.Request)
 	flusher.Flush()
 
 	type qualityResult struct {
-		tag           string
-		name          string
-		qualityStatus string
-		qualityScore  int
-		qualityGrade  string
-		err           string
+		tag              string
+		name             string
+		qualityStatus    string
+		qualityScore     int
+		qualityGrade     string
+		qualitySummary   string
+		qualityCheckedAt string
+		exitIP           string
+		exitCountry      string
+		exitCountryCode  string
+		exitRegion       string
+		items            []store.NodeQualityCheckItem
+		err              string
 	}
 
 	checker := NewQualityChecker(s.mgr, s.store)
@@ -1112,12 +1119,23 @@ func (s *Server) handleQualityCheckBatch(w http.ResponseWriter, r *http.Request)
 			if check.QualityScore != nil {
 				score = *check.QualityScore
 			}
+			checkedAt := ""
+			if !check.QualityCheckedAt.IsZero() {
+				checkedAt = check.QualityCheckedAt.Format(time.RFC3339)
+			}
 			results <- qualityResult{
-				tag:           snap.Tag,
-				name:          snap.Name,
-				qualityStatus: check.QualityStatus,
-				qualityScore:  score,
-				qualityGrade:  check.QualityGrade,
+				tag:              snap.Tag,
+				name:             snap.Name,
+				qualityStatus:    check.QualityStatus,
+				qualityScore:     score,
+				qualityGrade:     check.QualityGrade,
+				qualitySummary:   check.QualitySummary,
+				qualityCheckedAt: checkedAt,
+				exitIP:           check.ExitIP,
+				exitCountry:      check.ExitCountry,
+				exitCountryCode:  check.ExitCountryCode,
+				exitRegion:       check.ExitRegion,
+				items:            check.Items,
 			}
 		}(snap)
 	}
@@ -1141,8 +1159,29 @@ func (s *Server) handleQualityCheckBatch(w http.ResponseWriter, r *http.Request)
 			successCount++
 		}
 
-		eventData := fmt.Sprintf(`{"type":"progress","tag":"%s","name":"%s","status":"%s","error":"%s","quality_status":"%s","quality_score":%d,"quality_grade":"%s","current":%d,"total":%d}`,
-			result.tag, result.name, status, result.err, result.qualityStatus, result.qualityScore, result.qualityGrade, count, total)
+		payload := map[string]any{
+			"type":               "progress",
+			"tag":                result.tag,
+			"name":               result.name,
+			"status":             status,
+			"error":              result.err,
+			"quality_status":     result.qualityStatus,
+			"quality_score":      result.qualityScore,
+			"quality_grade":      result.qualityGrade,
+			"quality_summary":    result.qualitySummary,
+			"quality_checked_at": result.qualityCheckedAt,
+			"exit_ip":            result.exitIP,
+			"exit_country":       result.exitCountry,
+			"exit_country_code":  result.exitCountryCode,
+			"exit_region":        result.exitRegion,
+			"items":              result.items,
+			"current":            count,
+			"total":              total,
+		}
+		eventData, err := json.Marshal(payload)
+		if err != nil {
+			continue
+		}
 		fmt.Fprintf(w, "data: %s\n\n", eventData)
 		flusher.Flush()
 	}
