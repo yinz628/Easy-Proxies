@@ -182,6 +182,29 @@ func TestHandleManageNodesRejectsInvalidPage(t *testing.T) {
 	}
 }
 
+func TestHandleIndexDisablesCacheForSPAEntry(t *testing.T) {
+	server, _ := newManageListTestServer(t)
+
+	for _, path := range []string{"/", "/monitor"} {
+		t.Run(path, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, path, nil)
+			rec := httptest.NewRecorder()
+
+			server.srv.Handler.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want %d body=%s", rec.Code, http.StatusOK, rec.Body.String())
+			}
+			if got := rec.Header().Get("Cache-Control"); !strings.Contains(got, "no-store") {
+				t.Fatalf("Cache-Control = %q, want header containing no-store", got)
+			}
+			if got := rec.Header().Get("Pragma"); got != "no-cache" {
+				t.Fatalf("Pragma = %q, want no-cache", got)
+			}
+		})
+	}
+}
+
 func TestHandleProbeBatchStartResolvesFilterSelection(t *testing.T) {
 	server, _ := newManageListTestServer(t)
 
