@@ -163,7 +163,10 @@ export interface ConfigNodeConfig {
   password: string
   source?: string
   disabled?: boolean
-  quality_status?: string
+  quality_version?: string
+  quality_status?: QualityStatus
+  quality_openai_status?: ProviderReachability
+  quality_anthropic_status?: ProviderReachability
   quality_score?: number
   quality_grade?: string
   quality_summary?: string
@@ -189,6 +192,7 @@ export interface ManageQuery {
   status: ManageStatus
   region: string
   source: string
+  quality_status: string
   sort_key: ManageSortKey
   sort_dir: ManageSortDir
 }
@@ -198,6 +202,7 @@ export interface ManageFilterSnapshot {
   status: ManageStatus
   region: string
   source: string
+  quality_status: string
 }
 
 export interface ManageNodeRow extends ConfigNodeConfig {
@@ -221,6 +226,7 @@ export interface ManageListResponse {
   facets: {
     regions: string[]
     sources: string[]
+    quality_statuses: string[]
   }
 }
 
@@ -279,9 +285,16 @@ export interface NodeQualityCheckItem {
   message?: string
 }
 
+export type QualityStatus = 'dual_available' | 'openai_only' | 'anthropic_only' | 'unavailable' | 'unchecked'
+export type ProviderReachability = 'pass' | 'fail'
+export type BatchQualityJobStatus = 'queued' | 'running' | 'completed' | 'failed' | 'cancelled'
+
 export interface NodeQualityCheckResult {
   node_id: number
-  quality_status: string
+  quality_version?: string
+  quality_status: QualityStatus
+  quality_openai_status?: ProviderReachability
+  quality_anthropic_status?: ProviderReachability
   quality_score?: number
   quality_grade: string
   quality_summary: string
@@ -295,16 +308,25 @@ export interface NodeQualityCheckResult {
 
 export interface QualityCheckBatchStart {
   type: 'start'
+  job_id: string
+  status: BatchQualityJobStatus
   total: number
+  completed: number
+  success: number
+  failed: number
 }
 
 export interface QualityCheckBatchProgress {
   type: 'progress'
+  job_id: string
   tag: string
   name: string
   status: 'success' | 'error'
   error: string
-  quality_status?: string
+  quality_version?: string
+  quality_status?: QualityStatus
+  quality_openai_status?: ProviderReachability
+  quality_anthropic_status?: ProviderReachability
   quality_score?: number
   quality_grade?: string
   quality_summary?: string
@@ -316,16 +338,51 @@ export interface QualityCheckBatchProgress {
   items?: NodeQualityCheckItem[]
   current: number
   total: number
+  success: number
+  failed: number
 }
 
 export interface QualityCheckBatchComplete {
   type: 'complete'
+  job_id: string
+  status: BatchQualityJobStatus
   total: number
+  completed: number
   success: number
   failed: number
 }
 
 export type QualityCheckBatchEvent = QualityCheckBatchStart | QualityCheckBatchProgress | QualityCheckBatchComplete
+
+export interface BatchQualityJobResult {
+  tag: string
+  name: string
+  error?: string
+  quality_version?: string
+  quality_status?: QualityStatus
+  quality_openai_status?: ProviderReachability
+  quality_anthropic_status?: ProviderReachability
+  quality_score?: number
+  quality_grade?: string
+  quality_summary?: string
+  quality_checked_at?: string
+  items?: NodeQualityCheckItem[]
+}
+
+export interface BatchQualityJob {
+  id: string
+  status: BatchQualityJobStatus
+  started_at: string
+  updated_at: string
+  completed_at?: string
+  total: number
+  completed: number
+  success: number
+  failed: number
+  active_workers: number
+  last_result?: BatchQualityJobResult
+  last_error?: string
+}
 
 export interface BatchProbeJobResult {
   tag: string

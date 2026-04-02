@@ -1,7 +1,7 @@
 import type { ManageQuery, ManageSelectionRequest, SelectionState } from '../types/index.ts'
 import { buildManageFilterSnapshot } from './managePanelQuery.ts'
 
-export function buildSelectionRequest(state: SelectionState, _query: ManageQuery): ManageSelectionRequest {
+export function buildSelectionRequest(state: SelectionState): ManageSelectionRequest {
   if (state.mode === 'names') {
     return {
       selection: {
@@ -85,7 +85,8 @@ export function isNodeSelected(state: SelectionState, name: string, query: Manag
     state.filter.keyword !== currentFilter.keyword ||
     state.filter.status !== currentFilter.status ||
     state.filter.region !== currentFilter.region ||
-    state.filter.source !== currentFilter.source
+    state.filter.source !== currentFilter.source ||
+    state.filter.quality_status !== currentFilter.quality_status
   ) {
     return false
   }
@@ -102,7 +103,8 @@ export function getSelectionCount(state: SelectionState, filteredTotal: number, 
     state.filter.keyword !== currentFilter.keyword ||
     state.filter.status !== currentFilter.status ||
     state.filter.region !== currentFilter.region ||
-    state.filter.source !== currentFilter.source
+    state.filter.source !== currentFilter.source ||
+    state.filter.quality_status !== currentFilter.quality_status
   ) {
     return 0
   }

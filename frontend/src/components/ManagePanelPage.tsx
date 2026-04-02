@@ -4,19 +4,22 @@ import type { ChangeEvent, FormEvent } from 'react'
 import {
   batchDeleteConfigNodes,
   batchToggleConfigNodes,
+  cancelQualityBatchJob,
   cancelProbeBatchJob,
   checkNodeQuality,
-  checkNodeQualityBatch,
   createConfigNode,
   deleteConfigNode,
   exportProxies,
   exportSelectedProxies,
   fetchManageNodes,
+  fetchQualityBatchJobStatus,
   fetchProbeBatchJobStatus,
   getNodeQuality,
   importNodes,
   probeNode,
   releaseNode,
+  startQualityBatchJob,
+  streamQualityBatchJob,
   startProbeBatchJob,
   toggleConfigNode,
   triggerReload,
@@ -37,7 +40,9 @@ import type {
 import {
   applyQualityResultToManageList,
   buildQualityResultFromBatchProgress,
+  buildQualityResultFromJobResult,
   buildQualityCacheEntry,
+  mergeQualityJobSnapshot,
   reduceBatchQualityEvent,
 } from './managePanelQuality.ts'
 import type { BatchQualityState } from './managePanelQuality.ts'
@@ -119,19 +124,66 @@ function sourceLabel(source?: string): string {
 
 function qualityStatusTone(status?: string): string {
   switch (status) {
-    case 'healthy':
+    case 'dual_available':
     case 'pass':
       return 'badge-success border-none bg-success/15 text-success'
-    case 'warn':
-    case 'degraded':
+    case 'openai_only':
+      return 'badge-info border-none bg-info/15 text-info'
+    case 'anthropic_only':
       return 'badge-warning border-none bg-warning/15 text-warning-content'
     case 'fail':
     case 'failed':
-    case 'unhealthy':
+    case 'unavailable':
       return 'badge-error border-none bg-error/15 text-error'
     default:
       return 'badge-ghost border-none bg-base-300/40 text-base-content/50'
   }
+}
+
+function qualityStatusLabel(status?: string): string {
+  if (status === 'dual_available') return '双通'
+  if (status === 'openai_only') return '仅 OpenAI'
+  if (status === 'anthropic_only') return '仅 Anthropic'
+  if (status === 'unavailable') return '不可用'
+  if (status === 'unchecked') return '未检测'
+  if (status === 'pass') return '通过'
+  if (status === 'fail' || status === 'failed') return '失败'
+  if (status === 'queued') return '排队中'
+  if (status === 'running') return '检测中'
+  if (status === 'completed') return '已完成'
+  if (status === 'cancelled') return '已取消'
+
+  switch (status) {
+    case 'dual_available':
+      return '双通'
+    case 'openai_only':
+      return '仅 OpenAI'
+    case 'anthropic_only':
+      return '仅 Anthropic'
+    case 'unavailable':
+      return '不可用'
+    case 'unchecked':
+      return '未检测'
+    case 'pass':
+      return '良好'
+    case 'warn':
+    case 'degraded':
+      return '警告'
+    case 'fail':
+    case 'failed':
+    case 'unhealthy':
+      return '失败'
+    default:
+      return status || '未检测'
+  }
+}
+
+function isBatchQualityActive(status?: BatchQualityState['status'] | null): boolean {
+  return status === 'queued' || status === 'running'
+}
+
+function isBatchQualityTerminal(status?: BatchQualityState['status'] | null): boolean {
+  return status === 'completed' || status === 'failed' || status === 'cancelled'
 }
 
 function formatQualityChecked(epochSeconds?: number): string {
@@ -190,6 +242,11 @@ function StatusBadge({ status }: { status: ManageNodeRow['runtime_status'] }) {
   }
 }
 
+function ProviderQualityBadge({ provider, status }: { provider: string; status?: string }) {
+  if (!status) return null
+  return <span className={`badge badge-sm ${qualityStatusTone(status)}`}>{provider} {qualityStatusLabel(status)}</span>
+}
+
 export default function ManagePanelPage() {
   const [pageData, setPageData] = useState<ManageListResponse | null>(null)
   const [query, setQuery] = useState<ManageQuery>(() => normalizeManageQuery())
@@ -217,6 +274,9 @@ export default function ManagePanelPage() {
   const [qualityDetails, setQualityDetails] = useState<Record<string, NodeQualityCheckResult>>({})
   const [batchQualityState, setBatchQualityState] = useState<BatchQualityState | null>(null)
   const batchQualityControllerRef = useRef<AbortController | null>(null)
+  const batchQualityStreamJobIdRef = useRef<string | null>(null)
+  const batchQualityTouchedNamesRef = useRef(new Set<string>())
+  const [lastQualityJobStatus, setLastQualityJobStatus] = useState<BatchQualityState['status'] | null>(null)
 
   const [selection, setSelection] = useState<SelectionState>(createEmptySelection)
   const [batchProcessing, setBatchProcessing] = useState(false)
@@ -263,10 +323,11 @@ export default function ManagePanelPage() {
       || selection.filter.status !== current.status
       || selection.filter.region !== current.region
       || selection.filter.source !== current.source
+      || selection.filter.quality_status !== current.quality_status
     ) {
       setSelection(createEmptySelection())
     }
-  }, [query.keyword, query.region, query.source, query.status, selection])
+  }, [query, selection])
 
   const loadManagePage = useCallback(async (nextQuery: ManageQuery, force = false) => {
     const normalized = normalizeManageQuery(nextQuery)
@@ -380,8 +441,92 @@ export default function ManagePanelPage() {
     }
   }, [])
 
+  const handleBatchQualityEvent = useCallback((event: Parameters<typeof reduceBatchQualityEvent>[1]) => {
+    setBatchQualityState(prev => reduceBatchQualityEvent(prev, event))
+
+    if (event.type === 'start') {
+      return
+    }
+
+    if (event.type === 'progress') {
+      if (event.status === 'success') {
+        const result = buildQualityResultFromBatchProgress(event)
+        if (result) {
+          batchQualityTouchedNamesRef.current.add(event.name)
+          applyQualityResult(event.name, result)
+        }
+      }
+      return
+    }
+
+    batchQualityControllerRef.current?.abort()
+    batchQualityControllerRef.current = null
+    batchQualityStreamJobIdRef.current = null
+
+    if (event.status === 'completed') {
+      setSuccess(`批量质量检测完成：成功 ${event.success}，失败 ${event.failed}`)
+    } else if (event.status === 'cancelled') {
+      setSuccess('批量质量检测已取消')
+    } else if (event.status === 'failed') {
+      setError('批量质量检测任务失败')
+    }
+  }, [applyQualityResult])
+
+  const handleBatchQualityStreamError = useCallback((err: Error) => {
+    batchQualityControllerRef.current = null
+    batchQualityStreamJobIdRef.current = null
+    setError(err.message || '批量质量检测流中断')
+  }, [])
+
+  useEffect(() => {
+    let disposed = false
+
+    const syncBatchQualityJob = async () => {
+      try {
+        const res = await fetchQualityBatchJobStatus()
+        if (disposed) return
+
+        setBatchQualityState(prev => mergeQualityJobSnapshot(prev, res.job))
+
+        if (res.job?.last_result) {
+          const restored = buildQualityResultFromJobResult(res.job.last_result)
+          if (restored) {
+            applyQualityResult(res.job.last_result.name, restored)
+          }
+        }
+
+        if (res.job && isBatchQualityActive(res.job.status)) {
+          if (batchQualityStreamJobIdRef.current !== res.job.id) {
+            batchQualityControllerRef.current?.abort()
+            batchQualityControllerRef.current = streamQualityBatchJob(
+              res.job.id,
+              handleBatchQualityEvent,
+              handleBatchQualityStreamError,
+            )
+            batchQualityStreamJobIdRef.current = res.job.id
+          }
+          return
+        }
+
+        batchQualityControllerRef.current?.abort()
+        batchQualityControllerRef.current = null
+        batchQualityStreamJobIdRef.current = null
+      } catch {
+        if (disposed) return
+      }
+    }
+
+    void syncBatchQualityJob()
+    const timer = window.setInterval(() => void syncBatchQualityJob(), 1000)
+    return () => {
+      disposed = true
+      window.clearInterval(timer)
+    }
+  }, [applyQualityResult, handleBatchQualityEvent, handleBatchQualityStreamError])
+
   const summary = pageData?.summary ?? emptySummary
-  const nodes = pageData?.items ?? []
+  const nodes = useMemo(() => pageData?.items ?? [], [pageData?.items])
+  const qualityStatusOptions = pageData?.facets.quality_statuses ?? []
   const currentPageNames = useMemo(() => nodes.map(node => node.name), [nodes])
   const currentFilter = useMemo(() => buildManageFilterSnapshot(query), [query])
   const selectionCount = useMemo(
@@ -397,10 +542,11 @@ export default function ManagePanelPage() {
     && selection.filter.status === currentFilter.status
     && selection.filter.region === currentFilter.region
     && selection.filter.source === currentFilter.source
+    && selection.filter.quality_status === currentFilter.quality_status
   const totalPages = Math.max(1, Math.ceil((pageData?.filtered_total ?? 0) / (query.page_size || 100)))
-  const filtersActive = Boolean(query.keyword || query.status || query.region || query.source)
+  const filtersActive = Boolean(query.keyword || query.status || query.region || query.source || query.quality_status)
   const probeJobRunning = activeProbeJob?.status === 'queued' || activeProbeJob?.status === 'running'
-  const qualityBatchRunning = batchQualityState?.status === 'running'
+  const qualityBatchRunning = isBatchQualityActive(batchQualityState?.status)
   const initialLoading = listLoading && !pageData
   const thClass = 'cursor-pointer select-none font-semibold transition-colors hover:text-primary'
 
@@ -414,6 +560,18 @@ export default function ManagePanelPage() {
       setLastProbeJobStatus(current)
     }
   }, [activeProbeJob?.status, lastProbeJobStatus, loadManagePage])
+
+  useEffect(() => {
+    const current = batchQualityState?.status ?? null
+    if (lastQualityJobStatus && current && current !== lastQualityJobStatus && isBatchQualityTerminal(current)) {
+      const touchedNames = Array.from(batchQualityTouchedNamesRef.current)
+      batchQualityTouchedNamesRef.current = new Set()
+      void refreshCurrentPage(touchedNames, touchedNames.length === 0)
+    }
+    if (current !== lastQualityJobStatus) {
+      setLastQualityJobStatus(current)
+    }
+  }, [batchQualityState?.status, lastQualityJobStatus, refreshCurrentPage])
 
   const updateQuery = useCallback((updater: (prev: ManageQuery) => ManageQuery) => {
     setQuery(prev => normalizeManageQuery(updater(prev)))
@@ -579,7 +737,7 @@ export default function ManagePanelPage() {
     if (selectionCount === 0) return
     setBatchProcessing(true)
     try {
-      const res = await batchToggleConfigNodes(buildSelectionRequest(selection, query), enabled)
+      const res = await batchToggleConfigNodes(buildSelectionRequest(selection), enabled)
       setSuccess(res.message || '批量操作完成')
       setSelection(createEmptySelection())
       await refreshCurrentPage(undefined, true)
@@ -588,19 +746,19 @@ export default function ManagePanelPage() {
     } finally {
       setBatchProcessing(false)
     }
-  }, [query, refreshCurrentPage, selection, selectionCount])
+  }, [refreshCurrentPage, selection, selectionCount])
 
   const handleBatchProbe = useCallback(async () => {
     if (selectionCount === 0) return
     try {
-      const res = await startProbeBatchJob(buildSelectionRequest(selection, query))
+      const res = await startProbeBatchJob(buildSelectionRequest(selection))
       setActiveProbeJob(res.job)
       setBatchProbeProgress({ current: res.job.completed, total: res.job.total })
       setSuccess('批量探测任务已启动')
     } catch (err) {
       setError(err instanceof Error ? err.message : '批量探测启动失败')
     }
-  }, [query, selection, selectionCount])
+  }, [selection, selectionCount])
 
   const handleBatchProbeCancel = useCallback(async () => {
     if (!activeProbeJob) return
@@ -617,8 +775,29 @@ export default function ManagePanelPage() {
     }
   }, [activeProbeJob])
 
-  const handleBatchQualityCheck = useCallback(() => {
+  const handleBatchQualityCheck = useCallback(async () => {
     if (selectionCount === 0) return
+
+    batchQualityTouchedNamesRef.current = new Set()
+    batchQualityControllerRef.current?.abort()
+    batchQualityControllerRef.current = null
+    batchQualityStreamJobIdRef.current = null
+
+    try {
+      const res = await startQualityBatchJob(buildSelectionRequest(selection))
+      setBatchQualityState(prev => mergeQualityJobSnapshot(prev, res.job))
+      batchQualityControllerRef.current = streamQualityBatchJob(
+        res.job.id,
+        handleBatchQualityEvent,
+        handleBatchQualityStreamError,
+      )
+      batchQualityStreamJobIdRef.current = res.job.id
+      setSuccess('批量质量检测任务已启动')
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '批量质量检测启动失败')
+    }
+    return
+    /*
 
     batchQualityControllerRef.current?.abort()
     const touchedNames = new Set<string>()
@@ -656,14 +835,27 @@ export default function ManagePanelPage() {
     )
 
     batchQualityControllerRef.current = controller
-  }, [applyQualityResult, query, refreshCurrentPage, selection, selectionCount])
+    */
+  }, [handleBatchQualityEvent, handleBatchQualityStreamError, selection, selectionCount])
+
+  const handleBatchQualityCancel = useCallback(async () => {
+    const jobId = batchQualityState?.jobId ?? batchQualityStreamJobIdRef.current
+    if (!jobId) return
+
+    try {
+      await cancelQualityBatchJob(jobId)
+      setSuccess('已提交批量质量检测取消请求')
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '取消批量质量检测失败')
+    }
+  }, [batchQualityState?.jobId])
 
   const handleBatchDelete = useCallback(async () => {
     if (selectionCount === 0) return
     setBatchProcessing(true)
     setBatchDeleteConfirm(false)
     try {
-      const res = await batchDeleteConfigNodes(buildSelectionRequest(selection, query))
+      const res = await batchDeleteConfigNodes(buildSelectionRequest(selection))
       setSuccess(res.message || '批量删除完成')
       setNeedReload(true)
       setSelection(createEmptySelection())
@@ -674,7 +866,7 @@ export default function ManagePanelPage() {
     } finally {
       setBatchProcessing(false)
     }
-  }, [loadManagePage, query, selection, selectionCount])
+  }, [loadManagePage, selection, selectionCount])
 
   const openImportModal = useCallback(() => {
     setImportContent('')
@@ -737,7 +929,7 @@ export default function ManagePanelPage() {
   const handleExportSelected = useCallback(async () => {
     if (selectionCount === 0) return
     try {
-      const text = await exportSelectedProxies(buildSelectionRequest(selection, query))
+      const text = await exportSelectedProxies(buildSelectionRequest(selection))
       if (!text.trim()) {
         setError('没有可导出的选中节点')
         return
@@ -747,7 +939,7 @@ export default function ManagePanelPage() {
     } catch (err) {
       setError(err instanceof Error ? err.message : '导出选中节点失败')
     }
-  }, [query, selection, selectionCount])
+  }, [selection, selectionCount])
 
   const handleReload = useCallback(async () => {
     try {
@@ -857,6 +1049,7 @@ export default function ManagePanelPage() {
                 <div className="mt-1 text-xs text-base-content/60">进度 {batchQualityState.current}/{batchQualityState.total} · 成功 {batchQualityState.success} · 失败 {batchQualityState.failed}</div>
                 {batchQualityState.lastResult && <div className="mt-1 text-xs text-base-content/50">最近完成: {batchQualityState.lastResult.name}{batchQualityState.lastResult.status === 'error' ? ` · ${batchQualityState.lastResult.error || '检测失败'}` : ` · ${batchQualityState.lastResult.quality_grade || '-'} / ${batchQualityState.lastResult.quality_status || 'unknown'}`}</div>}
               </div>
+              {qualityBatchRunning && <button className="btn btn-sm btn-warning" onClick={() => void handleBatchQualityCancel()}>取消批量质检</button>}
             </div>
             <progress className="progress progress-secondary mt-3 h-2 w-full" value={batchQualityState.current} max={batchQualityState.total || 1}></progress>
           </div>
@@ -892,6 +1085,10 @@ export default function ManagePanelPage() {
                   {pageData?.facets.sources.map(source => <option key={source} value={source}>{sourceLabel(source)}</option>)}
                 </select>
               )}
+              <select className="select select-md flex-1 bg-base-200/50 focus:bg-base-100 sm:w-32" value={query.quality_status} onChange={(event) => updateQuery(prev => ({ ...prev, page: 1, quality_status: event.target.value }))}>
+                <option value="">全部质检</option>
+                {qualityStatusOptions.map(status => <option key={status} value={status}>{qualityStatusLabel(status)}</option>)}
+              </select>
               <button type="button" className={`btn btn-md ${selectionMatchesCurrentFilter ? 'btn-primary' : 'btn-ghost'}`} onClick={() => setSelection({ mode: 'filter', filter: buildManageFilterSnapshot(query), excludeNames: new Set() })} disabled={(pageData?.filtered_total ?? 0) === 0 || batchProcessing || probeJobRunning || qualityBatchRunning}>
                 {selectionMatchesCurrentFilter ? `已选筛选结果 ${selectionCount}` : `全选筛选结果${(pageData?.filtered_total ?? 0) > 0 ? ` (${pageData?.filtered_total ?? 0})` : ''}`}
               </button>
@@ -979,6 +1176,12 @@ export default function ManagePanelPage() {
                               <span className="max-w-[200px] truncate" title={node.name}>{node.name}</span>
                             </div>
                             <div className="mt-1 flex flex-wrap items-center gap-2 text-xs">
+                              {detail && (
+                                <>
+                                  <ProviderQualityBadge provider="OpenAI" status={detail.quality_openai_status} />
+                                  <ProviderQualityBadge provider="Anthropic" status={detail.quality_anthropic_status} />
+                                </>
+                              )}
                               {node.quality_grade ? <span className={`badge badge-sm ${qualityStatusTone(node.quality_status)}`}>{node.quality_grade} · {node.quality_status || 'unknown'}</span> : <span className="text-base-content/35">未做质量检测</span>}
                               {typeof node.quality_score === 'number' && <span className="font-mono text-base-content/55">分数 {node.quality_score}</span>}
                               {(node.quality_checked || detail?.quality_checked_at) && <span className="text-base-content/45">{node.quality_checked ? formatQualityChecked(node.quality_checked) : formatQualityCheckedAt(detail?.quality_checked_at)}</span>}
@@ -1008,13 +1211,15 @@ export default function ManagePanelPage() {
                                 <div className="flex flex-col gap-4 lg:flex-row lg:items-start">
                                   <div className="flex-1 space-y-3">
                                     <div className="flex flex-wrap items-center gap-2">
+                                      <ProviderQualityBadge provider="OpenAI" status={detail?.quality_openai_status || node.quality_openai_status} />
+                                      <ProviderQualityBadge provider="Anthropic" status={detail?.quality_anthropic_status || node.quality_anthropic_status} />
                                       <span className={`badge badge-sm ${qualityStatusTone(detail?.quality_status)}`}>{detail?.quality_grade || node.quality_grade || '-'} · {detail?.quality_status || node.quality_status || 'unknown'}</span>
                                       {typeof (detail?.quality_score ?? node.quality_score) === 'number' && <span className="badge badge-ghost badge-sm">分数 {detail?.quality_score ?? node.quality_score}</span>}
                                       <span className="text-xs text-base-content/50">{detail?.quality_checked_at ? formatQualityCheckedAt(detail.quality_checked_at) : formatQualityChecked(node.quality_checked)}</span>
                                       {isLoadingDetail && <span className="loading loading-spinner loading-xs text-primary"></span>}
                                     </div>
                                     <div className="text-sm text-base-content/75">{detail?.quality_summary || node.quality_summary || '暂无质量检测摘要'}</div>
-                                    <div className="flex flex-wrap gap-2 text-xs text-base-content/60">
+                                    <div className="hidden flex-wrap gap-2 text-xs text-base-content/60">
                                       {(detail?.exit_ip || node.exit_ip) && <span className="badge badge-ghost badge-sm">出口 IP {detail?.exit_ip || node.exit_ip}</span>}
                                       {(detail?.exit_country || node.exit_country) && <span className="badge badge-ghost badge-sm">{(detail?.exit_country_code || node.exit_country_code || '').toUpperCase()} {detail?.exit_country || node.exit_country}</span>}
                                       {(detail?.exit_region || node.exit_region) && <span className="badge badge-ghost badge-sm">区域 {detail?.exit_region || node.exit_region}</span>}

@@ -420,7 +420,8 @@ func (s *sqliteStore) GetNodeStats(ctx context.Context, nodeID int64) (*NodeStat
 		`SELECT node_id, failure_count, success_count, blacklisted, blacklisted_until,
 		 last_error, last_failure_at, last_success_at, last_latency_ms,
 		 available, initial_check_done, total_upload_bytes, total_download_bytes,
-		 quality_status, quality_score, quality_grade, quality_summary, quality_checked_at,
+		 quality_status, quality_version, quality_openai_status, quality_anthropic_status,
+		 quality_score, quality_grade, quality_summary, quality_checked_at,
 		 exit_ip, exit_country, exit_country_code, exit_region, updated_at
 		 FROM node_stats WHERE node_id = ?`, nodeID)
 
@@ -435,7 +436,8 @@ func (s *sqliteStore) GetNodeStats(ctx context.Context, nodeID int64) (*NodeStat
 		&stats.LastError, &lastFailureStr, &lastSuccessStr,
 		&stats.LastLatencyMs, &available, &initialCheckDone,
 		&stats.TotalUploadBytes, &stats.TotalDownloadBytes,
-		&stats.QualityStatus, &qualityScore, &stats.QualityGrade, &stats.QualitySummary, &qualityCheckedAtStr,
+		&stats.QualityStatus, &stats.QualityVersion, &stats.QualityOpenAIStatus, &stats.QualityAnthropicStatus,
+		&qualityScore, &stats.QualityGrade, &stats.QualitySummary, &qualityCheckedAtStr,
 		&stats.ExitIP, &stats.ExitCountry, &stats.ExitCountryCode, &stats.ExitRegion, &updatedAtStr,
 	)
 	if err == sql.ErrNoRows {
@@ -483,9 +485,10 @@ func (s *sqliteStore) UpsertNodeStats(ctx context.Context, stats *NodeStats) err
 	_, err := s.conn().ExecContext(ctx,
 		`INSERT INTO node_stats (node_id, failure_count, success_count, blacklisted, blacklisted_until,
 		 last_error, last_failure_at, last_success_at, last_latency_ms, available, initial_check_done,
-		 total_upload_bytes, total_download_bytes, quality_status, quality_score, quality_grade, quality_summary,
+		 total_upload_bytes, total_download_bytes, quality_status, quality_version, quality_openai_status,
+		 quality_anthropic_status, quality_score, quality_grade, quality_summary,
 		 quality_checked_at, exit_ip, exit_country, exit_country_code, exit_region, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(node_id) DO UPDATE SET
 		   failure_count=excluded.failure_count, success_count=excluded.success_count,
 		   blacklisted=excluded.blacklisted, blacklisted_until=excluded.blacklisted_until,
@@ -493,7 +496,10 @@ func (s *sqliteStore) UpsertNodeStats(ctx context.Context, stats *NodeStats) err
 		   last_success_at=excluded.last_success_at, last_latency_ms=excluded.last_latency_ms,
 		   available=excluded.available, initial_check_done=excluded.initial_check_done,
 		   total_upload_bytes=excluded.total_upload_bytes, total_download_bytes=excluded.total_download_bytes,
-		   quality_status=excluded.quality_status, quality_score=excluded.quality_score,
+		   quality_status=excluded.quality_status, quality_version=excluded.quality_version,
+		   quality_openai_status=excluded.quality_openai_status,
+		   quality_anthropic_status=excluded.quality_anthropic_status,
+		   quality_score=excluded.quality_score,
 		   quality_grade=excluded.quality_grade, quality_summary=excluded.quality_summary,
 		   quality_checked_at=excluded.quality_checked_at, exit_ip=excluded.exit_ip,
 		   exit_country=excluded.exit_country, exit_country_code=excluded.exit_country_code,
@@ -504,7 +510,8 @@ func (s *sqliteStore) UpsertNodeStats(ctx context.Context, stats *NodeStats) err
 		stats.LastError, formatTime(stats.LastFailureAt), formatTime(stats.LastSuccessAt),
 		stats.LastLatencyMs, available, initialCheckDone,
 		stats.TotalUploadBytes, stats.TotalDownloadBytes,
-		stats.QualityStatus, qualityScore, stats.QualityGrade, stats.QualitySummary,
+		stats.QualityStatus, stats.QualityVersion, stats.QualityOpenAIStatus,
+		stats.QualityAnthropicStatus, qualityScore, stats.QualityGrade, stats.QualitySummary,
 		formatTime(stats.QualityCheckedAt), stats.ExitIP, stats.ExitCountry, stats.ExitCountryCode, stats.ExitRegion,
 		now,
 	)
@@ -643,7 +650,8 @@ func (s *sqliteStore) GetAllNodeStats(ctx context.Context) (map[int64]*NodeStats
 		`SELECT node_id, failure_count, success_count, blacklisted, blacklisted_until,
 		 last_error, last_failure_at, last_success_at, last_latency_ms,
 		 available, initial_check_done, total_upload_bytes, total_download_bytes,
-		 quality_status, quality_score, quality_grade, quality_summary, quality_checked_at,
+		 quality_status, quality_version, quality_openai_status, quality_anthropic_status,
+		 quality_score, quality_grade, quality_summary, quality_checked_at,
 		 exit_ip, exit_country, exit_country_code, exit_region, updated_at
 		 FROM node_stats`)
 	if err != nil {
@@ -664,7 +672,8 @@ func (s *sqliteStore) GetAllNodeStats(ctx context.Context) (map[int64]*NodeStats
 			&stats.LastError, &lastFailureStr, &lastSuccessStr,
 			&stats.LastLatencyMs, &available, &initialCheckDone,
 			&stats.TotalUploadBytes, &stats.TotalDownloadBytes,
-			&stats.QualityStatus, &qualityScore, &stats.QualityGrade, &stats.QualitySummary, &qualityCheckedAtStr,
+			&stats.QualityStatus, &stats.QualityVersion, &stats.QualityOpenAIStatus, &stats.QualityAnthropicStatus,
+			&qualityScore, &stats.QualityGrade, &stats.QualitySummary, &qualityCheckedAtStr,
 			&stats.ExitIP, &stats.ExitCountry, &stats.ExitCountryCode, &stats.ExitRegion, &updatedAtStr,
 		)
 		if err != nil {
@@ -718,17 +727,20 @@ func (s *sqliteStore) GetNodeQualityCheck(ctx context.Context, nodeID int64) (*N
 	}
 
 	return &NodeQualityCheck{
-		NodeID:           nodeID,
-		QualityStatus:    stats.QualityStatus,
-		QualityScore:     stats.QualityScore,
-		QualityGrade:     stats.QualityGrade,
-		QualitySummary:   stats.QualitySummary,
-		QualityCheckedAt: stats.QualityCheckedAt,
-		ExitIP:           stats.ExitIP,
-		ExitCountry:      stats.ExitCountry,
-		ExitCountryCode:  stats.ExitCountryCode,
-		ExitRegion:       stats.ExitRegion,
-		Items:            items,
+		NodeID:                 nodeID,
+		QualityStatus:          stats.QualityStatus,
+		QualityVersion:         stats.QualityVersion,
+		QualityOpenAIStatus:    stats.QualityOpenAIStatus,
+		QualityAnthropicStatus: stats.QualityAnthropicStatus,
+		QualityScore:           stats.QualityScore,
+		QualityGrade:           stats.QualityGrade,
+		QualitySummary:         stats.QualitySummary,
+		QualityCheckedAt:       stats.QualityCheckedAt,
+		ExitIP:                 stats.ExitIP,
+		ExitCountry:            stats.ExitCountry,
+		ExitCountryCode:        stats.ExitCountryCode,
+		ExitRegion:             stats.ExitRegion,
+		Items:                  items,
 	}, rows.Err()
 }
 
@@ -746,6 +758,9 @@ func (s *sqliteStore) SaveNodeQualityCheck(ctx context.Context, check *NodeQuali
 		_, err := txStore.conn().ExecContext(ctx,
 			`UPDATE node_stats
 			    SET quality_status = ?,
+			        quality_version = ?,
+			        quality_openai_status = ?,
+			        quality_anthropic_status = ?,
 			        quality_score = ?,
 			        quality_grade = ?,
 			        quality_summary = ?,
@@ -757,6 +772,9 @@ func (s *sqliteStore) SaveNodeQualityCheck(ctx context.Context, check *NodeQuali
 			        updated_at = ?
 			  WHERE node_id = ?`,
 			check.QualityStatus,
+			check.QualityVersion,
+			check.QualityOpenAIStatus,
+			check.QualityAnthropicStatus,
 			score,
 			check.QualityGrade,
 			check.QualitySummary,

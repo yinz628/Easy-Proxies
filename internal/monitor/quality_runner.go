@@ -19,30 +19,30 @@ const (
 )
 
 type qualityTarget struct {
-	Name     string
-	URL      string
-	Method   string
-	Statuses map[int]string
+	Name         string
+	URL          string
+	Method       string
+	PassStatuses map[int]struct{}
 }
 
 var qualityTargets = []qualityTarget{
 	{
-		Name:   "openai",
+		Name:   quality.TargetOpenAIReachability,
 		URL:    "https://api.openai.com/v1/models",
 		Method: http.MethodGet,
-		Statuses: map[int]string{
-			http.StatusUnauthorized: quality.StatusWarn,
+		PassStatuses: map[int]struct{}{
+			http.StatusUnauthorized: {},
+			http.StatusForbidden:    {},
 		},
 	},
 	{
-		Name:   "anthropic",
+		Name:   quality.TargetAnthropicReachability,
 		URL:    "https://api.anthropic.com/v1/messages",
 		Method: http.MethodGet,
-		Statuses: map[int]string{
-			http.StatusBadRequest:       quality.StatusWarn,
-			http.StatusUnauthorized:     quality.StatusWarn,
-			http.StatusNotFound:         quality.StatusWarn,
-			http.StatusMethodNotAllowed: quality.StatusWarn,
+		PassStatuses: map[int]struct{}{
+			http.StatusUnauthorized:     {},
+			http.StatusForbidden:        {},
+			http.StatusMethodNotAllowed: {},
 		},
 	},
 }
@@ -83,18 +83,7 @@ func (c *QualityChecker) CheckNode(ctx context.Context, tag string) (*store.Node
 
 	result := &quality.CheckResult{
 		CheckedAt: time.Now(),
-		Items:     make([]quality.CheckItem, 0, len(qualityTargets)+1),
-	}
-
-	baseItem := c.runBaseConnectivity(ctx, tag, result)
-	result.Items = append(result.Items, baseItem)
-	if baseItem.Status != quality.StatusPass {
-		quality.FinalizeResult(result)
-		check := toStoreQualityCheck(node.ID, result)
-		if err := c.store.SaveNodeQualityCheck(ctx, check); err != nil {
-			return nil, err
-		}
-		return check, nil
+		Items:     make([]quality.CheckItem, 0, len(qualityTargets)),
 	}
 
 	for _, target := range qualityTargets {
@@ -107,44 +96,6 @@ func (c *QualityChecker) CheckNode(ctx context.Context, tag string) (*store.Node
 		return nil, err
 	}
 	return check, nil
-}
-
-func (c *QualityChecker) runBaseConnectivity(ctx context.Context, tag string, result *quality.CheckResult) quality.CheckItem {
-	reqCtx, cancel := context.WithTimeout(ctx, qualityRequestTimeout)
-	defer cancel()
-
-	headers := map[string]string{
-		"Accept":     "application/json,text/plain,*/*",
-		"User-Agent": qualityUserAgent,
-	}
-
-	type exitResponse struct {
-		IP          string `json:"query"`
-		Country     string `json:"country"`
-		CountryCode string `json:"countryCode"`
-		Region      string `json:"regionName"`
-		Status      string `json:"status"`
-	}
-
-	resp, err := c.monitorMgr.HTTPRequest(reqCtx, tag, http.MethodGet, "http://ip-api.com/json/?lang=en", headers, qualityMaxBodyBytes)
-	if err != nil {
-		return quality.CheckItem{Target: "base_connectivity", Status: quality.StatusFail, Message: err.Error()}
-	}
-	if resp.StatusCode != http.StatusOK {
-		return quality.CheckItem{Target: "base_connectivity", Status: quality.StatusFail, HTTPStatus: resp.StatusCode, LatencyMs: resp.LatencyMs, Message: fmt.Sprintf("unexpected status %d", resp.StatusCode)}
-	}
-
-	var exit exitResponse
-	if err := json.Unmarshal(resp.Body, &exit); err != nil || strings.ToLower(exit.Status) != "success" {
-		return quality.CheckItem{Target: "base_connectivity", Status: quality.StatusFail, HTTPStatus: resp.StatusCode, LatencyMs: resp.LatencyMs, Message: "failed to parse exit info"}
-	}
-
-	result.BaseLatencyMs = resp.LatencyMs
-	result.ExitIP = exit.IP
-	result.Country = exit.Country
-	result.CountryCode = exit.CountryCode
-	result.Region = exit.Region
-	return quality.CheckItem{Target: "base_connectivity", Status: quality.StatusPass, HTTPStatus: resp.StatusCode, LatencyMs: resp.LatencyMs, Message: "proxy exit reachable"}
 }
 
 func (c *QualityChecker) runTarget(ctx context.Context, tag string, target qualityTarget) quality.CheckItem {
@@ -161,18 +112,22 @@ func (c *QualityChecker) runTarget(ctx context.Context, tag string, target quali
 		return quality.CheckItem{Target: target.Name, Status: quality.StatusFail, Message: err.Error()}
 	}
 
-	status, ok := target.Statuses[resp.StatusCode]
-	if ok {
-		message := fmt.Sprintf("HTTP %d", resp.StatusCode)
-		if status == quality.StatusWarn {
-			message = fmt.Sprintf("HTTP %d but target reachable", resp.StatusCode)
+	if _, ok := target.PassStatuses[resp.StatusCode]; ok {
+		if matchesOfficialAPISignature(target.Name, resp) {
+			return quality.CheckItem{
+				Target:     target.Name,
+				Status:     quality.StatusPass,
+				HTTPStatus: resp.StatusCode,
+				LatencyMs:  resp.LatencyMs,
+				Message:    fmt.Sprintf("HTTP %d reached official endpoint", resp.StatusCode),
+			}
 		}
 		return quality.CheckItem{
 			Target:     target.Name,
-			Status:     status,
+			Status:     quality.StatusFail,
 			HTTPStatus: resp.StatusCode,
 			LatencyMs:  resp.LatencyMs,
-			Message:    message,
+			Message:    fmt.Sprintf("status %d missing expected official API signature", resp.StatusCode),
 		}
 	}
 
@@ -183,6 +138,105 @@ func (c *QualityChecker) runTarget(ctx context.Context, tag string, target quali
 		LatencyMs:  resp.LatencyMs,
 		Message:    fmt.Sprintf("unexpected status %d", resp.StatusCode),
 	}
+}
+
+func matchesOfficialAPISignature(target string, resp *HTTPCheckResult) bool {
+	if resp == nil {
+		return false
+	}
+
+	headers := normalizeHeaders(resp.Headers)
+	body := strings.TrimSpace(string(resp.Body))
+
+	switch target {
+	case quality.TargetOpenAIReachability:
+		return matchesOpenAISignature(headers, body)
+	case quality.TargetAnthropicReachability:
+		return matchesAnthropicSignature(headers, body)
+	default:
+		return false
+	}
+}
+
+func matchesOpenAISignature(headers map[string]string, body string) bool {
+	return hasHeaderKeyPrefix(headers, "openai-")
+}
+
+func matchesAnthropicSignature(headers map[string]string, body string) bool {
+	if hasHeaderKeyPrefix(headers, "anthropic-") || headers["request-id"] != "" {
+		return true
+	}
+	if body == "" || !looksLikeJSONResponse(headers, body) {
+		return false
+	}
+
+	payload, ok := parseQualityErrorEnvelope(body)
+	if !ok || payload.Type != "error" || payload.Error == nil || payload.Error.Type == "" || payload.Error.Message == "" {
+		return false
+	}
+
+	return payload.RequestID != ""
+}
+
+func looksLikeJSONResponse(headers map[string]string, body string) bool {
+	if contentType := headers["content-type"]; contentType != "" && strings.Contains(contentType, "application/json") {
+		return true
+	}
+	return strings.HasPrefix(body, "{") || strings.HasPrefix(body, "[")
+}
+
+func normalizeHeaders(headers map[string]string) map[string]string {
+	if len(headers) == 0 {
+		return map[string]string{}
+	}
+
+	normalized := make(map[string]string, len(headers))
+	for key, value := range headers {
+		normalized[strings.ToLower(strings.TrimSpace(key))] = strings.ToLower(strings.TrimSpace(value))
+	}
+	return normalized
+}
+
+type qualityErrorEnvelope struct {
+	Type      string              `json:"type"`
+	RequestID string              `json:"request_id"`
+	Error     *qualityErrorDetail `json:"error"`
+}
+
+type qualityErrorDetail struct {
+	Type    string `json:"type"`
+	Message string `json:"message"`
+	Code    string `json:"code"`
+}
+
+func parseQualityErrorEnvelope(body string) (qualityErrorEnvelope, bool) {
+	var payload qualityErrorEnvelope
+	if err := json.Unmarshal([]byte(body), &payload); err != nil {
+		return qualityErrorEnvelope{}, false
+	}
+
+	payload.Type = normalizeErrorValue(payload.Type)
+	payload.RequestID = strings.TrimSpace(payload.RequestID)
+	if payload.Error != nil {
+		payload.Error.Type = normalizeErrorValue(payload.Error.Type)
+		payload.Error.Message = normalizeErrorValue(payload.Error.Message)
+		payload.Error.Code = normalizeErrorValue(payload.Error.Code)
+	}
+
+	return payload, true
+}
+
+func normalizeErrorValue(value string) string {
+	return strings.ToLower(strings.TrimSpace(value))
+}
+
+func hasHeaderKeyPrefix(headers map[string]string, prefix string) bool {
+	for key := range headers {
+		if strings.HasPrefix(key, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func toStoreQualityCheck(nodeID int64, result *quality.CheckResult) *store.NodeQualityCheck {
@@ -199,16 +253,15 @@ func toStoreQualityCheck(nodeID int64, result *quality.CheckResult) *store.NodeQ
 	}
 
 	return &store.NodeQualityCheck{
-		NodeID:           nodeID,
-		QualityStatus:    result.Status,
-		QualityScore:     &score,
-		QualityGrade:     result.Grade,
-		QualitySummary:   result.Summary,
-		QualityCheckedAt: result.CheckedAt,
-		ExitIP:           result.ExitIP,
-		ExitCountry:      result.Country,
-		ExitCountryCode:  result.CountryCode,
-		ExitRegion:       result.Region,
-		Items:            items,
+		NodeID:                 nodeID,
+		QualityStatus:          result.Status,
+		QualityVersion:         result.QualityVersion,
+		QualityOpenAIStatus:    result.OpenAIStatus,
+		QualityAnthropicStatus: result.AnthropicStatus,
+		QualityScore:           &score,
+		QualityGrade:           result.Grade,
+		QualitySummary:         result.Summary,
+		QualityCheckedAt:       result.CheckedAt,
+		Items:                  items,
 	}
 }

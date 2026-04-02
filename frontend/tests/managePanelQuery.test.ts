@@ -18,6 +18,7 @@ test('buildManageQueryKey normalizes default query values', () => {
     status: '',
     region: '',
     source: '',
+    quality_status: '',
     sort_key: 'name',
     sort_dir: 'asc',
   })
@@ -33,6 +34,7 @@ test('buildManageFilterSnapshot strips page and sort fields from query state', (
     status: 'normal',
     region: 'hk',
     source: 'manual',
+    quality_status: 'healthy',
     sort_key: 'latency',
     sort_dir: 'desc',
   })
@@ -42,6 +44,7 @@ test('buildManageFilterSnapshot strips page and sort fields from query state', (
     status: 'normal',
     region: 'hk',
     source: 'manual',
+    quality_status: 'healthy',
   })
 })
 
@@ -67,6 +70,7 @@ test('resolveManageResponsePage clamps an empty out-of-range result back to page
       facets: {
         regions: [],
         sources: [],
+        quality_statuses: [],
       },
     } satisfies ManageListResponse,
   )

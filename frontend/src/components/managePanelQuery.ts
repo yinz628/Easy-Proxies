@@ -7,6 +7,7 @@ export const defaultManageQuery: ManageQuery = {
   status: '',
   region: '',
   source: '',
+  quality_status: '',
   sort_key: 'name',
   sort_dir: 'asc',
 }
@@ -21,6 +22,7 @@ export function normalizeManageQuery(input: Partial<ManageQuery> = {}): ManageQu
     status: input.status ?? '',
     region: input.region?.trim() ?? '',
     source: input.source?.trim() ?? '',
+    quality_status: input.quality_status?.trim() ?? '',
     sort_key: input.sort_key ?? defaultManageQuery.sort_key,
     sort_dir: input.sort_dir === 'desc' ? 'desc' : 'asc',
   }
@@ -33,6 +35,7 @@ export function buildManageFilterSnapshot(query: ManageQuery): ManageFilterSnaps
     status: normalized.status,
     region: normalized.region,
     source: normalized.source,
+    quality_status: normalized.quality_status,
   }
 }
 

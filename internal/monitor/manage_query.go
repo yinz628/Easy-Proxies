@@ -23,49 +23,54 @@ const (
 )
 
 const (
-	defaultManagePage     = 1
-	defaultManagePageSize = 100
-	maxManagePageSize     = 500
+	defaultManagePage            = 1
+	defaultManagePageSize        = 100
+	maxManagePageSize            = 500
+	manageQualityStatusUnchecked = "unchecked"
 )
 
 var errInvalidManageSelection = errors.New("invalid manage selection")
 
 type ManageQuery struct {
-	Page     int
-	PageSize int
-	Keyword  string
-	Status   string
-	Region   string
-	Source   string
-	SortKey  ManageSortKey
-	SortDir  string
+	Page          int
+	PageSize      int
+	Keyword       string
+	Status        string
+	Region        string
+	Source        string
+	QualityStatus string
+	SortKey       ManageSortKey
+	SortDir       string
 }
 
 type ManageRow struct {
-	Name              string `json:"name"`
-	URI               string `json:"uri"`
-	Port              uint16 `json:"port"`
-	Username          string `json:"username"`
-	Password          string `json:"password"`
-	Source            string `json:"source,omitempty"`
-	Disabled          bool   `json:"disabled,omitempty"`
-	RuntimeStatus     string `json:"runtime_status"`
-	Tag               string `json:"tag,omitempty"`
-	LatencyMS         int64  `json:"latency_ms"`
-	Region            string `json:"region,omitempty"`
-	Country           string `json:"country,omitempty"`
-	ActiveConnections int    `json:"active_connections"`
-	SuccessCount      int64  `json:"success_count"`
-	FailureCount      int    `json:"failure_count"`
-	QualityStatus     string `json:"quality_status,omitempty"`
-	QualityScore      *int   `json:"quality_score,omitempty"`
-	QualityGrade      string `json:"quality_grade,omitempty"`
-	QualitySummary    string `json:"quality_summary,omitempty"`
-	QualityChecked    *int64 `json:"quality_checked,omitempty"`
-	ExitIP            string `json:"exit_ip,omitempty"`
-	ExitCountry       string `json:"exit_country,omitempty"`
-	ExitCountryCode   string `json:"exit_country_code,omitempty"`
-	ExitRegion        string `json:"exit_region,omitempty"`
+	Name                   string `json:"name"`
+	URI                    string `json:"uri"`
+	Port                   uint16 `json:"port"`
+	Username               string `json:"username"`
+	Password               string `json:"password"`
+	Source                 string `json:"source,omitempty"`
+	Disabled               bool   `json:"disabled,omitempty"`
+	RuntimeStatus          string `json:"runtime_status"`
+	Tag                    string `json:"tag,omitempty"`
+	LatencyMS              int64  `json:"latency_ms"`
+	Region                 string `json:"region,omitempty"`
+	Country                string `json:"country,omitempty"`
+	ActiveConnections      int    `json:"active_connections"`
+	SuccessCount           int64  `json:"success_count"`
+	FailureCount           int    `json:"failure_count"`
+	QualityVersion         string `json:"quality_version,omitempty"`
+	QualityStatus          string `json:"quality_status,omitempty"`
+	QualityOpenAIStatus    string `json:"quality_openai_status,omitempty"`
+	QualityAnthropicStatus string `json:"quality_anthropic_status,omitempty"`
+	QualityScore           *int   `json:"quality_score,omitempty"`
+	QualityGrade           string `json:"quality_grade,omitempty"`
+	QualitySummary         string `json:"quality_summary,omitempty"`
+	QualityChecked         *int64 `json:"quality_checked,omitempty"`
+	ExitIP                 string `json:"exit_ip,omitempty"`
+	ExitCountry            string `json:"exit_country,omitempty"`
+	ExitCountryCode        string `json:"exit_country_code,omitempty"`
+	ExitRegion             string `json:"exit_region,omitempty"`
 }
 
 type ManageSelection struct {
@@ -76,18 +81,19 @@ type ManageSelection struct {
 }
 
 type ManageFacets struct {
-	Regions []string `json:"regions"`
-	Sources []string `json:"sources"`
+	Regions         []string `json:"regions"`
+	Sources         []string `json:"sources"`
+	QualityStatuses []string `json:"quality_statuses"`
 }
 
 type ManageListResponse struct {
-	Items         []ManageRow     `json:"items"`
-	Page          int             `json:"page"`
-	PageSize      int             `json:"page_size"`
-	Total         int             `json:"total"`
-	FilteredTotal int             `json:"filtered_total"`
-	Summary       map[string]int  `json:"summary"`
-	Facets        ManageFacets    `json:"facets"`
+	Items         []ManageRow    `json:"items"`
+	Page          int            `json:"page"`
+	PageSize      int            `json:"page_size"`
+	Total         int            `json:"total"`
+	FilteredTotal int            `json:"filtered_total"`
+	Summary       map[string]int `json:"summary"`
+	Facets        ManageFacets   `json:"facets"`
 }
 
 func BuildManageRows(configNodes []config.NodeConfig, snapshots []Snapshot) []ManageRow {
@@ -111,25 +117,29 @@ func BuildManageRows(configNodes []config.NodeConfig, snapshots []Snapshot) []Ma
 	rows := make([]ManageRow, 0, len(configNodes))
 	for _, node := range configNodes {
 		row := ManageRow{
-			Name:           node.Name,
-			URI:            node.URI,
-			Port:           node.Port,
-			Username:       node.Username,
-			Password:       node.Password,
-			Source:         string(node.Source),
-			Disabled:       node.Disabled,
-			LatencyMS:      -1,
-			RuntimeStatus:  "pending",
-			QualityStatus:  node.QualityStatus,
-			QualityScore:   node.QualityScore,
-			QualityGrade:   node.QualityGrade,
-			QualitySummary: node.QualitySummary,
-			QualityChecked: node.QualityChecked,
-			ExitIP:         node.ExitIP,
-			ExitCountry:    node.ExitCountry,
-			ExitCountryCode: node.ExitCountryCode,
-			ExitRegion:      node.ExitRegion,
+			Name:                   node.Name,
+			URI:                    node.URI,
+			Port:                   node.Port,
+			Username:               node.Username,
+			Password:               node.Password,
+			Source:                 string(node.Source),
+			Disabled:               node.Disabled,
+			LatencyMS:              -1,
+			RuntimeStatus:          "pending",
+			QualityVersion:         node.QualityVersion,
+			QualityStatus:          node.QualityStatus,
+			QualityOpenAIStatus:    node.QualityOpenAIStatus,
+			QualityAnthropicStatus: node.QualityAnthropicStatus,
+			QualityScore:           node.QualityScore,
+			QualityGrade:           node.QualityGrade,
+			QualitySummary:         node.QualitySummary,
+			QualityChecked:         node.QualityChecked,
+			ExitIP:                 node.ExitIP,
+			ExitCountry:            node.ExitCountry,
+			ExitCountryCode:        node.ExitCountryCode,
+			ExitRegion:             node.ExitRegion,
 		}
+		applyManageQualityCompatibility(&row)
 
 		if node.Disabled {
 			row.RuntimeStatus = "disabled"
@@ -246,14 +256,15 @@ func ResolveManageSelection(rows []ManageRow, selection ManageSelection) ([]Mana
 
 func parseManageQuery(values url.Values) (ManageQuery, error) {
 	query := ManageQuery{
-		Page:     defaultManagePage,
-		PageSize: defaultManagePageSize,
-		Keyword:  strings.TrimSpace(values.Get("keyword")),
-		Status:   strings.TrimSpace(values.Get("status")),
-		Region:   strings.TrimSpace(values.Get("region")),
-		Source:   strings.TrimSpace(values.Get("source")),
-		SortKey:  ManageSortKey(strings.TrimSpace(values.Get("sort_key"))),
-		SortDir:  strings.TrimSpace(values.Get("sort_dir")),
+		Page:          defaultManagePage,
+		PageSize:      defaultManagePageSize,
+		Keyword:       strings.TrimSpace(values.Get("keyword")),
+		Status:        strings.TrimSpace(values.Get("status")),
+		Region:        strings.TrimSpace(values.Get("region")),
+		Source:        strings.TrimSpace(values.Get("source")),
+		QualityStatus: strings.TrimSpace(values.Get("quality_status")),
+		SortKey:       ManageSortKey(strings.TrimSpace(values.Get("sort_key"))),
+		SortDir:       strings.TrimSpace(values.Get("sort_dir")),
 	}
 
 	if page := strings.TrimSpace(values.Get("page")); page != "" {
@@ -290,6 +301,7 @@ func normalizeManageQuery(query ManageQuery) ManageQuery {
 	normalized.Status = strings.TrimSpace(normalized.Status)
 	normalized.Region = strings.TrimSpace(normalized.Region)
 	normalized.Source = strings.TrimSpace(normalized.Source)
+	normalized.QualityStatus = strings.TrimSpace(normalized.QualityStatus)
 	if !isValidManageSortKey(normalized.SortKey) {
 		normalized.SortKey = ManageSortByName
 	}
@@ -330,6 +342,9 @@ func filterManageRows(rows []ManageRow, query ManageQuery) []ManageRow {
 		if query.Source != "" && row.Source != query.Source {
 			continue
 		}
+		if query.QualityStatus != "" && row.QualityStatus != query.QualityStatus {
+			continue
+		}
 		filtered = append(filtered, row)
 	}
 
@@ -353,6 +368,7 @@ func buildManageSummary(rows []ManageRow) map[string]int {
 func buildManageFacets(rows []ManageRow) ManageFacets {
 	regionSet := make(map[string]struct{})
 	sourceSet := make(map[string]struct{})
+	qualityStatusSet := make(map[string]struct{})
 
 	for _, row := range rows {
 		if row.Region != "" {
@@ -360,6 +376,9 @@ func buildManageFacets(rows []ManageRow) ManageFacets {
 		}
 		if row.Source != "" {
 			sourceSet[row.Source] = struct{}{}
+		}
+		if row.QualityStatus != "" {
+			qualityStatusSet[row.QualityStatus] = struct{}{}
 		}
 	}
 
@@ -371,11 +390,20 @@ func buildManageFacets(rows []ManageRow) ManageFacets {
 	for source := range sourceSet {
 		sources = append(sources, source)
 	}
+	qualityStatuses := make([]string, 0, len(qualityStatusSet))
+	for status := range qualityStatusSet {
+		qualityStatuses = append(qualityStatuses, status)
+	}
 
 	slices.Sort(regions)
 	slices.Sort(sources)
+	slices.Sort(qualityStatuses)
 
-	return ManageFacets{Regions: regions, Sources: sources}
+	return ManageFacets{
+		Regions:         regions,
+		Sources:         sources,
+		QualityStatuses: qualityStatuses,
+	}
 }
 
 func compareManageRows(a, b ManageRow, key ManageSortKey, dir string) int {
@@ -482,4 +510,39 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func applyManageQualityCompatibility(row *ManageRow) {
+	if row == nil || row.QualityVersion != "" || !hasLegacyManageQualityResult(row) {
+		return
+	}
+
+	row.QualityStatus = manageQualityStatusUnchecked
+	row.QualityOpenAIStatus = ""
+	row.QualityAnthropicStatus = ""
+	row.QualityScore = nil
+	row.QualityGrade = ""
+	row.QualitySummary = ""
+	row.QualityChecked = nil
+	row.ExitIP = ""
+	row.ExitCountry = ""
+	row.ExitCountryCode = ""
+	row.ExitRegion = ""
+}
+
+func hasLegacyManageQualityResult(row *ManageRow) bool {
+	if row == nil {
+		return false
+	}
+	return row.QualityStatus != "" ||
+		row.QualityOpenAIStatus != "" ||
+		row.QualityAnthropicStatus != "" ||
+		row.QualityScore != nil ||
+		row.QualityGrade != "" ||
+		row.QualitySummary != "" ||
+		row.QualityChecked != nil ||
+		row.ExitIP != "" ||
+		row.ExitCountry != "" ||
+		row.ExitCountryCode != "" ||
+		row.ExitRegion != ""
 }

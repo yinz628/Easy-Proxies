@@ -12,6 +12,7 @@ import type {
   ManageSelectionRequest,
   SubscriptionStatus,
   BatchProbeJob,
+  BatchQualityJob,
   ProbeSSEEvent,
   NodeQualityCheckResult,
   QualityCheckBatchEvent,
@@ -155,6 +156,7 @@ export async function fetchManageNodes(query: ManageQuery, signal?: AbortSignal)
   if (query.status) params.set('status', query.status)
   if (query.region) params.set('region', query.region)
   if (query.source) params.set('source', query.source)
+  if (query.quality_status) params.set('quality_status', query.quality_status)
   params.set('sort_key', query.sort_key)
   params.set('sort_dir', query.sort_dir)
 
@@ -406,8 +408,8 @@ export function probeBatchNodes(
         credentials: 'include',
         signal: controller.signal,
       })
-
       if (!res.ok) {
+
         let message = `批量探测失败: HTTP ${res.status}`
         try {
           const body = await res.json()
@@ -469,36 +471,123 @@ export async function cancelProbeBatchJob(jobId: string): Promise<{ message: str
   })
 }
 
+export async function startQualityBatchJob(selectionOrTags: ManageSelectionRequest | string[]): Promise<{ job: BatchQualityJob }> {
+  return request('/api/nodes/quality-check-batch', {
+    method: 'POST',
+    body: JSON.stringify(normalizeSelectionBody(selectionOrTags, 'tags')),
+  })
+}
+
+async function readQualityBatchStream(
+  jobId: string,
+  controller: AbortController,
+  onEvent: (event: QualityCheckBatchEvent) => void,
+  onError?: (error: Error) => void,
+): Promise<void> {
+  try {
+    const headers: Record<string, string> = {}
+    if (authToken) {
+      headers['Authorization'] = `Bearer ${authToken}`
+    }
+
+    const res = await fetch(`/api/nodes/quality-check-batch/stream?job_id=${encodeURIComponent(jobId)}`, {
+      method: 'GET',
+      headers,
+      credentials: 'include',
+      signal: controller.signal,
+    })
+
+    if (!res.ok) {
+      let message = `批量质量检测任务流订阅失败: HTTP ${res.status}`
+      try {
+        const text = await res.text()
+        if (text) message = text
+      } catch { /* ignore parse errors */ }
+      throw new ApiError(message, res.status)
+    }
+
+    const reader = res.body?.getReader()
+    if (!reader) throw new Error('No response body')
+
+    const decoder = new TextDecoder()
+    let buffer = ''
+
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+
+      buffer += decoder.decode(value, { stream: true })
+      const lines = buffer.split('\n')
+      buffer = lines.pop() || ''
+
+      for (const line of lines) {
+        const trimmed = line.trim()
+        if (trimmed.startsWith('data: ')) {
+          try {
+            const data = JSON.parse(trimmed.slice(6)) as QualityCheckBatchEvent
+            onEvent(data)
+          } catch { /* skip malformed events */ }
+        }
+      }
+    }
+  } catch (err) {
+    if ((err as Error).name !== 'AbortError') {
+      onError?.(err as Error)
+    }
+  }
+}
+
+export async function fetchQualityBatchJobStatus(): Promise<{ job: BatchQualityJob | null }> {
+  return request('/api/nodes/quality-check-batch/status')
+}
+
+export async function cancelQualityBatchJob(jobId: string): Promise<{ message: string; job_id: string }> {
+  return request('/api/nodes/quality-check-batch/cancel', {
+    method: 'POST',
+    body: JSON.stringify({ job_id: jobId }),
+  })
+}
+
+export function streamQualityBatchJob(
+  jobId: string,
+  onEvent: (event: QualityCheckBatchEvent) => void,
+  onError?: (error: Error) => void
+): AbortController {
+  const controller = new AbortController()
+  void readQualityBatchStream(jobId, controller, onEvent, onError)
+  return controller
+}
+
 export function checkNodeQualityBatch(
   selectionOrTags: ManageSelectionRequest | string[],
   onEvent: (event: QualityCheckBatchEvent) => void,
   onError?: (error: Error) => void
 ): AbortController {
   const controller = new AbortController()
+  let jobId: string | null = null
+  let cancelRequested = false
+
+  controller.signal.addEventListener('abort', () => {
+    if (cancelRequested || !jobId) return
+    cancelRequested = true
+    void cancelQualityBatchJob(jobId).catch(() => {})
+  })
 
   const doFetch = async () => {
     try {
-      const headers: Record<string, string> = {
-        'Content-Type': 'application/json',
-      }
-      if (authToken) {
-        headers['Authorization'] = `Bearer ${authToken}`
-      }
+      const start = await startQualityBatchJob(selectionOrTags)
+      jobId = start.job.id
+      void readQualityBatchStream(jobId, controller, onEvent, onError)
+      return
+      /*
 
-      const res = await fetch('/api/nodes/quality-check-batch', {
-        method: 'POST',
-        headers,
-        body: JSON.stringify(normalizeSelectionBody(selectionOrTags, 'tags')),
-        credentials: 'include',
-        signal: controller.signal,
-      })
 
       if (!res.ok) {
         let message = `鎵归噺璐ㄩ噺妫€鏌ュけ璐? HTTP ${res.status}`
         try {
           const body = await res.json()
           if (body.error) message = body.error
-        } catch { /* ignore parse errors */ }
+        } catch {}
         throw new ApiError(message, res.status)
       }
 
@@ -522,10 +611,10 @@ export function checkNodeQualityBatch(
             try {
               const data = JSON.parse(trimmed.slice(6)) as QualityCheckBatchEvent
               onEvent(data)
-            } catch { /* skip malformed events */ }
+            } catch {}
           }
         }
-      }
+      */
     } catch (err) {
       if ((err as Error).name !== 'AbortError') {
         onError?.(err as Error)

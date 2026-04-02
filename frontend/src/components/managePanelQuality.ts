@@ -1,4 +1,7 @@
 import type {
+  BatchQualityJob,
+  BatchQualityJobResult,
+  BatchQualityJobStatus,
   ConfigNodeConfig,
   ManageListResponse,
   NodeQualityCheckResult,
@@ -8,18 +11,23 @@ import type {
   QualityCheckBatchStart,
 } from '../types/index.ts'
 
+const aiQualityVersion = 'ai_reachability_v2'
+
 export interface BatchQualityLastResult {
   tag: string
   name: string
   status: 'success' | 'error'
   error: string
   quality_status?: string
+  quality_openai_status?: string
+  quality_anthropic_status?: string
   quality_score?: number
   quality_grade?: string
 }
 
 export interface BatchQualityState {
-  status: 'running' | 'completed'
+  jobId: string
+  status: BatchQualityJobStatus
   total: number
   current: number
   success: number
@@ -27,22 +35,25 @@ export interface BatchQualityState {
   lastResult: BatchQualityLastResult | null
 }
 
+function isAIVersion(value?: string): boolean {
+  return value === aiQualityVersion
+}
+
 export function buildQualityCacheEntry(node: ConfigNodeConfig): NodeQualityCheckResult | null {
-  if (!node.quality_status && !node.quality_grade && !node.quality_summary && !node.quality_checked) {
+  if (!isAIVersion(node.quality_version) || !node.quality_status) {
     return null
   }
 
   return {
     node_id: 0,
-    quality_status: node.quality_status || 'unknown',
+    quality_version: node.quality_version,
+    quality_status: node.quality_status,
+    quality_openai_status: node.quality_openai_status,
+    quality_anthropic_status: node.quality_anthropic_status,
     quality_score: node.quality_score,
     quality_grade: node.quality_grade || '-',
     quality_summary: node.quality_summary || '',
     quality_checked_at: node.quality_checked ? new Date(node.quality_checked * 1000).toISOString() : undefined,
-    exit_ip: node.exit_ip,
-    exit_country: node.exit_country,
-    exit_country_code: node.exit_country_code,
-    exit_region: node.exit_region,
     items: [],
   }
 }
@@ -50,15 +61,14 @@ export function buildQualityCacheEntry(node: ConfigNodeConfig): NodeQualityCheck
 export function applyQualityResultToConfigNode(node: ConfigNodeConfig, result: NodeQualityCheckResult): ConfigNodeConfig {
   return {
     ...node,
+    quality_version: result.quality_version,
     quality_status: result.quality_status,
+    quality_openai_status: result.quality_openai_status,
+    quality_anthropic_status: result.quality_anthropic_status,
     quality_score: result.quality_score,
     quality_grade: result.quality_grade,
     quality_summary: result.quality_summary,
     quality_checked: result.quality_checked_at ? Math.floor(Date.parse(result.quality_checked_at) / 1000) : undefined,
-    exit_ip: result.exit_ip,
-    exit_country: result.exit_country,
-    exit_country_code: result.exit_country_code,
-    exit_region: result.exit_region,
   }
 }
 
@@ -82,49 +92,89 @@ export function applyQualityResultToManageList(
 }
 
 export function buildQualityResultFromBatchProgress(event: QualityCheckBatchProgress): NodeQualityCheckResult | null {
-  if (event.status !== 'success') {
+  if (event.status !== 'success' || !isAIVersion(event.quality_version) || !event.quality_status) {
     return null
   }
 
   return {
     node_id: 0,
-    quality_status: event.quality_status || 'unknown',
+    quality_version: event.quality_version,
+    quality_status: event.quality_status,
+    quality_openai_status: event.quality_openai_status,
+    quality_anthropic_status: event.quality_anthropic_status,
     quality_score: event.quality_score,
     quality_grade: event.quality_grade || '-',
     quality_summary: event.quality_summary || '',
     quality_checked_at: event.quality_checked_at,
-    exit_ip: event.exit_ip,
-    exit_country: event.exit_country,
-    exit_country_code: event.exit_country_code,
-    exit_region: event.exit_region,
     items: event.items || [],
+  }
+}
+
+export function buildQualityResultFromJobResult(result?: BatchQualityJobResult): NodeQualityCheckResult | null {
+  if (!result || result.error || !isAIVersion(result.quality_version) || !result.quality_status) {
+    return null
+  }
+
+  return {
+    node_id: 0,
+    quality_version: result.quality_version,
+    quality_status: result.quality_status,
+    quality_openai_status: result.quality_openai_status,
+    quality_anthropic_status: result.quality_anthropic_status,
+    quality_score: result.quality_score,
+    quality_grade: result.quality_grade || '-',
+    quality_summary: result.quality_summary || '',
+    quality_checked_at: result.quality_checked_at,
+    items: result.items || [],
+  }
+}
+
+function toLastResult(result?: BatchQualityJobResult): BatchQualityLastResult | null {
+  if (!result) {
+    return null
+  }
+
+  return {
+    tag: result.tag,
+    name: result.name,
+    status: result.error ? 'error' : 'success',
+    error: result.error || '',
+    quality_status: result.quality_status,
+    quality_openai_status: result.quality_openai_status,
+    quality_anthropic_status: result.quality_anthropic_status,
+    quality_score: result.quality_score,
+    quality_grade: result.quality_grade,
   }
 }
 
 function reduceStart(event: QualityCheckBatchStart): BatchQualityState {
   return {
-    status: 'running',
+    jobId: event.job_id,
+    status: event.status,
     total: event.total,
-    current: 0,
-    success: 0,
-    failed: 0,
+    current: event.completed,
+    success: event.success,
+    failed: event.failed,
     lastResult: null,
   }
 }
 
-function reduceProgress(state: BatchQualityState | null, event: QualityCheckBatchProgress): BatchQualityState {
+function reduceProgress(event: QualityCheckBatchProgress): BatchQualityState {
   return {
+    jobId: event.job_id,
     status: 'running',
     total: event.total,
     current: event.current,
-    success: event.status === 'success' ? (state?.success || 0) + 1 : state?.success || 0,
-    failed: event.status === 'error' ? (state?.failed || 0) + 1 : state?.failed || 0,
+    success: event.success,
+    failed: event.failed,
     lastResult: {
       tag: event.tag,
       name: event.name,
       status: event.status,
       error: event.error,
       quality_status: event.quality_status,
+      quality_openai_status: event.quality_openai_status,
+      quality_anthropic_status: event.quality_anthropic_status,
       quality_score: event.quality_score,
       quality_grade: event.quality_grade,
     },
@@ -133,9 +183,10 @@ function reduceProgress(state: BatchQualityState | null, event: QualityCheckBatc
 
 function reduceComplete(state: BatchQualityState | null, event: QualityCheckBatchComplete): BatchQualityState {
   return {
-    status: 'completed',
+    jobId: event.job_id,
+    status: event.status,
     total: event.total,
-    current: event.total,
+    current: event.completed,
     success: event.success,
     failed: event.failed,
     lastResult: state?.lastResult || null,
@@ -150,10 +201,29 @@ export function reduceBatchQualityEvent(
     case 'start':
       return reduceStart(event)
     case 'progress':
-      return reduceProgress(state, event)
+      return reduceProgress(event)
     case 'complete':
       return reduceComplete(state, event)
     default:
       return state as BatchQualityState
+  }
+}
+
+export function mergeQualityJobSnapshot(
+  state: BatchQualityState | null,
+  job: BatchQualityJob | null,
+): BatchQualityState | null {
+  if (!job) {
+    return null
+  }
+
+  return {
+    jobId: job.id,
+    status: job.status,
+    total: job.total,
+    current: job.completed,
+    success: job.success,
+    failed: job.failed,
+    lastResult: toLastResult(job.last_result) || state?.lastResult || null,
   }
 }

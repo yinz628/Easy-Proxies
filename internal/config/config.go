@@ -109,10 +109,10 @@ type SubscriptionRefreshConfig struct {
 type NodeSource string
 
 const (
-	NodeSourceInline       NodeSource = "inline"       // Defined directly in config.yaml nodes array
-	NodeSourceFile         NodeSource = "nodes_file"   // Loaded from external nodes file
-	NodeSourceSubscription NodeSource = "subscription" // Fetched from subscription URL
-	NodeSourceManual       NodeSource = "manual"       // Added manually via WebUI
+	NodeSourceInline          NodeSource = "inline"       // Defined directly in config.yaml nodes array
+	NodeSourceFile            NodeSource = "nodes_file"   // Loaded from external nodes file
+	NodeSourceSubscription    NodeSource = "subscription" // Fetched from subscription URL
+	NodeSourceManual          NodeSource = "manual"       // Added manually via WebUI
 	NodeSourceTXTSubscription NodeSource = "txt_subscription"
 )
 
@@ -154,23 +154,26 @@ func NormalizeInboundProtocol(value string) (string, error) {
 
 // NodeConfig describes a single upstream proxy endpoint expressed as URI.
 type NodeConfig struct {
-	Name     string     `yaml:"name" json:"name"`
-	URI      string     `yaml:"uri" json:"uri"`
-	Port     uint16     `yaml:"port,omitempty" json:"port,omitempty"`
-	Username string     `yaml:"username,omitempty" json:"username,omitempty"`
-	Password string     `yaml:"password,omitempty" json:"password,omitempty"`
-	Source   NodeSource `yaml:"-" json:"source,omitempty"`   // Runtime only, not persisted in YAML
-	Disabled bool       `yaml:"-" json:"disabled,omitempty"` // Runtime only, not persisted in YAML; true = node is disabled
-	FeedKey  string     `yaml:"-" json:"feed_key,omitempty"`
-	QualityStatus   string     `yaml:"-" json:"quality_status,omitempty"`
-	QualityScore    *int       `yaml:"-" json:"quality_score,omitempty"`
-	QualityGrade    string     `yaml:"-" json:"quality_grade,omitempty"`
-	QualitySummary  string     `yaml:"-" json:"quality_summary,omitempty"`
-	QualityChecked  *int64     `yaml:"-" json:"quality_checked,omitempty"`
-	ExitIP          string     `yaml:"-" json:"exit_ip,omitempty"`
-	ExitCountry     string     `yaml:"-" json:"exit_country,omitempty"`
-	ExitCountryCode string     `yaml:"-" json:"exit_country_code,omitempty"`
-	ExitRegion      string     `yaml:"-" json:"exit_region,omitempty"`
+	Name                   string     `yaml:"name" json:"name"`
+	URI                    string     `yaml:"uri" json:"uri"`
+	Port                   uint16     `yaml:"port,omitempty" json:"port,omitempty"`
+	Username               string     `yaml:"username,omitempty" json:"username,omitempty"`
+	Password               string     `yaml:"password,omitempty" json:"password,omitempty"`
+	Source                 NodeSource `yaml:"-" json:"source,omitempty"`   // Runtime only, not persisted in YAML
+	Disabled               bool       `yaml:"-" json:"disabled,omitempty"` // Runtime only, not persisted in YAML; true = node is disabled
+	FeedKey                string     `yaml:"-" json:"feed_key,omitempty"`
+	QualityVersion         string     `yaml:"-" json:"quality_version,omitempty"`
+	QualityStatus          string     `yaml:"-" json:"quality_status,omitempty"`
+	QualityOpenAIStatus    string     `yaml:"-" json:"quality_openai_status,omitempty"`
+	QualityAnthropicStatus string     `yaml:"-" json:"quality_anthropic_status,omitempty"`
+	QualityScore           *int       `yaml:"-" json:"quality_score,omitempty"`
+	QualityGrade           string     `yaml:"-" json:"quality_grade,omitempty"`
+	QualitySummary         string     `yaml:"-" json:"quality_summary,omitempty"`
+	QualityChecked         *int64     `yaml:"-" json:"quality_checked,omitempty"`
+	ExitIP                 string     `yaml:"-" json:"exit_ip,omitempty"`
+	ExitCountry            string     `yaml:"-" json:"exit_country,omitempty"`
+	ExitCountryCode        string     `yaml:"-" json:"exit_country_code,omitempty"`
+	ExitRegion             string     `yaml:"-" json:"exit_region,omitempty"`
 }
 
 // NodeKey returns a unique identifier for the node based on its URI.

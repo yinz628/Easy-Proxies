@@ -662,8 +662,11 @@ func (m *Manager) ListConfigNodes(ctx context.Context) ([]config.NodeConfig, err
 			port = runtimePort
 		}
 		var qualityChecked *int64
+		var qualityVersion string
 		var qualityScore *int
 		var qualityStatus string
+		var qualityOpenAIStatus string
+		var qualityAnthropicStatus string
 		var qualityGrade string
 		var qualitySummary string
 		var exitIP string
@@ -671,7 +674,10 @@ func (m *Manager) ListConfigNodes(ctx context.Context) ([]config.NodeConfig, err
 		var exitCountryCode string
 		var exitRegion string
 		if stats := statsByNodeID[n.ID]; stats != nil {
+			qualityVersion = stats.QualityVersion
 			qualityStatus = stats.QualityStatus
+			qualityOpenAIStatus = stats.QualityOpenAIStatus
+			qualityAnthropicStatus = stats.QualityAnthropicStatus
 			qualityScore = stats.QualityScore
 			qualityGrade = stats.QualityGrade
 			qualitySummary = stats.QualitySummary
@@ -686,23 +692,26 @@ func (m *Manager) ListConfigNodes(ctx context.Context) ([]config.NodeConfig, err
 		}
 
 		result = append(result, config.NodeConfig{
-			Name:            n.Name,
-			URI:             n.URI,
-			Port:            port,
-			Username:        n.Username,
-			Password:        n.Password,
-			Source:          config.NodeSource(n.Source),
-			FeedKey:         n.FeedKey,
-			Disabled:        !n.Enabled,
-			QualityStatus:   qualityStatus,
-			QualityScore:    qualityScore,
-			QualityGrade:    qualityGrade,
-			QualitySummary:  qualitySummary,
-			QualityChecked:  qualityChecked,
-			ExitIP:          exitIP,
-			ExitCountry:     exitCountry,
-			ExitCountryCode: exitCountryCode,
-			ExitRegion:      exitRegion,
+			Name:                   n.Name,
+			URI:                    n.URI,
+			Port:                   port,
+			Username:               n.Username,
+			Password:               n.Password,
+			Source:                 config.NodeSource(n.Source),
+			FeedKey:                n.FeedKey,
+			Disabled:               !n.Enabled,
+			QualityVersion:         qualityVersion,
+			QualityStatus:          qualityStatus,
+			QualityOpenAIStatus:    qualityOpenAIStatus,
+			QualityAnthropicStatus: qualityAnthropicStatus,
+			QualityScore:           qualityScore,
+			QualityGrade:           qualityGrade,
+			QualitySummary:         qualitySummary,
+			QualityChecked:         qualityChecked,
+			ExitIP:                 exitIP,
+			ExitCountry:            exitCountry,
+			ExitCountryCode:        exitCountryCode,
+			ExitRegion:             exitRegion,
 		})
 	}
 

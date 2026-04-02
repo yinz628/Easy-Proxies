@@ -159,43 +159,49 @@ type NodeFilter struct {
 
 // NodeStats holds runtime statistics for a node.
 type NodeStats struct {
-	NodeID             int64     `json:"node_id"`
-	FailureCount       int       `json:"failure_count"`
-	SuccessCount       int64     `json:"success_count"`
-	Blacklisted        bool      `json:"blacklisted"`
-	BlacklistedUntil   time.Time `json:"blacklisted_until"`
-	LastError          string    `json:"last_error"`
-	LastFailureAt      time.Time `json:"last_failure_at"`
-	LastSuccessAt      time.Time `json:"last_success_at"`
-	LastLatencyMs      int64     `json:"last_latency_ms"` // -1 = untested
-	Available          bool      `json:"available"`
-	InitialCheckDone   bool      `json:"initial_check_done"`
-	TotalUploadBytes   int64     `json:"total_upload_bytes"`
-	TotalDownloadBytes int64     `json:"total_download_bytes"`
-	QualityStatus      string    `json:"quality_status"`
-	QualityScore       *int      `json:"quality_score,omitempty"`
-	QualityGrade       string    `json:"quality_grade"`
-	QualitySummary     string    `json:"quality_summary"`
-	QualityCheckedAt   time.Time `json:"quality_checked_at"`
-	ExitIP             string    `json:"exit_ip"`
-	ExitCountry        string    `json:"exit_country"`
-	ExitCountryCode    string    `json:"exit_country_code"`
-	ExitRegion         string    `json:"exit_region"`
-	UpdatedAt          time.Time `json:"updated_at"`
+	NodeID                 int64     `json:"node_id"`
+	FailureCount           int       `json:"failure_count"`
+	SuccessCount           int64     `json:"success_count"`
+	Blacklisted            bool      `json:"blacklisted"`
+	BlacklistedUntil       time.Time `json:"blacklisted_until"`
+	LastError              string    `json:"last_error"`
+	LastFailureAt          time.Time `json:"last_failure_at"`
+	LastSuccessAt          time.Time `json:"last_success_at"`
+	LastLatencyMs          int64     `json:"last_latency_ms"` // -1 = untested
+	Available              bool      `json:"available"`
+	InitialCheckDone       bool      `json:"initial_check_done"`
+	TotalUploadBytes       int64     `json:"total_upload_bytes"`
+	TotalDownloadBytes     int64     `json:"total_download_bytes"`
+	QualityStatus          string    `json:"quality_status"`
+	QualityVersion         string    `json:"quality_version"`
+	QualityOpenAIStatus    string    `json:"quality_openai_status"`
+	QualityAnthropicStatus string    `json:"quality_anthropic_status"`
+	QualityScore           *int      `json:"quality_score,omitempty"`
+	QualityGrade           string    `json:"quality_grade"`
+	QualitySummary         string    `json:"quality_summary"`
+	QualityCheckedAt       time.Time `json:"quality_checked_at"`
+	ExitIP                 string    `json:"exit_ip"`
+	ExitCountry            string    `json:"exit_country"`
+	ExitCountryCode        string    `json:"exit_country_code"`
+	ExitRegion             string    `json:"exit_region"`
+	UpdatedAt              time.Time `json:"updated_at"`
 }
 
 type NodeQualityCheck struct {
-	NodeID           int64                  `json:"node_id"`
-	QualityStatus    string                 `json:"quality_status"`
-	QualityScore     *int                   `json:"quality_score,omitempty"`
-	QualityGrade     string                 `json:"quality_grade"`
-	QualitySummary   string                 `json:"quality_summary"`
-	QualityCheckedAt time.Time              `json:"quality_checked_at"`
-	ExitIP           string                 `json:"exit_ip,omitempty"`
-	ExitCountry      string                 `json:"exit_country,omitempty"`
-	ExitCountryCode  string                 `json:"exit_country_code,omitempty"`
-	ExitRegion       string                 `json:"exit_region,omitempty"`
-	Items            []NodeQualityCheckItem `json:"items"`
+	NodeID                 int64                  `json:"node_id"`
+	QualityStatus          string                 `json:"quality_status"`
+	QualityVersion         string                 `json:"quality_version"`
+	QualityOpenAIStatus    string                 `json:"quality_openai_status"`
+	QualityAnthropicStatus string                 `json:"quality_anthropic_status"`
+	QualityScore           *int                   `json:"quality_score,omitempty"`
+	QualityGrade           string                 `json:"quality_grade"`
+	QualitySummary         string                 `json:"quality_summary"`
+	QualityCheckedAt       time.Time              `json:"quality_checked_at"`
+	ExitIP                 string                 `json:"exit_ip,omitempty"`
+	ExitCountry            string                 `json:"exit_country,omitempty"`
+	ExitCountryCode        string                 `json:"exit_country_code,omitempty"`
+	ExitRegion             string                 `json:"exit_region,omitempty"`
+	Items                  []NodeQualityCheckItem `json:"items"`
 }
 
 type NodeQualityCheckItem struct {
@@ -254,9 +260,9 @@ type SubscriptionStatus struct {
 
 // Node source constants (matching config.NodeSource values).
 const (
-	NodeSourceInline       = "inline"
-	NodeSourceFile         = "nodes_file"
-	NodeSourceSubscription = "subscription"
-	NodeSourceManual       = "manual"
+	NodeSourceInline          = "inline"
+	NodeSourceFile            = "nodes_file"
+	NodeSourceSubscription    = "subscription"
+	NodeSourceManual          = "manual"
 	NodeSourceTXTSubscription = "txt_subscription"
 )

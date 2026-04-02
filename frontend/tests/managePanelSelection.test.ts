@@ -18,6 +18,7 @@ const baseQuery: ManageQuery = {
   status: 'normal',
   region: 'hk',
   source: 'manual',
+  quality_status: 'healthy',
   sort_key: 'latency',
   sort_dir: 'desc',
 }
@@ -30,6 +31,7 @@ test('buildSelectionRequest strips page and sort from filter mode', () => {
       status: 'normal',
       region: 'hk',
       source: 'manual',
+      quality_status: 'healthy',
     },
     excludeNames: new Set(['node-b']),
   }
@@ -44,6 +46,7 @@ test('buildSelectionRequest strips page and sort from filter mode', () => {
         status: 'normal',
         region: 'hk',
         source: 'manual',
+        quality_status: 'healthy',
       },
       exclude_names: ['node-b'],
     },
@@ -73,6 +76,7 @@ test('isNodeSelected respects filter mode exclusions', () => {
       status: 'normal',
       region: 'hk',
       source: 'manual',
+      quality_status: 'healthy',
     },
     excludeNames: new Set(['node-b']),
   }
@@ -105,6 +109,7 @@ test('getPageSelectionState reports all selected for current filter page', () =>
       status: 'normal',
       region: 'hk',
       source: 'manual',
+      quality_status: 'healthy',
     },
     excludeNames: new Set(['node-z']),
   }
@@ -126,10 +131,12 @@ test('getSelectionCount returns zero when filter selection no longer matches act
       status: 'normal',
       region: 'hk',
       source: 'manual',
+      quality_status: 'healthy',
     },
     excludeNames: new Set(['node-a']),
   }
 
+  assert.equal(getSelectionCount(state, 18, { ...baseQuery, quality_status: 'warn' }), 0)
   assert.equal(getSelectionCount(state, 18, baseQuery), 17)
   assert.equal(getSelectionCount(state, 18, { ...baseQuery, region: 'us' }), 0)
 })

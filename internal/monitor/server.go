@@ -101,9 +101,10 @@ type Server struct {
 	sessionTTL time.Duration
 
 	// Concurrency control
-	probeSem   *semaphore.Weighted
-	qualitySem *semaphore.Weighted
-	probeJobs  *BatchProbeJobManager
+	probeSem    *semaphore.Weighted
+	qualitySem  *semaphore.Weighted
+	probeJobs   *BatchProbeJobManager
+	qualityJobs *BatchQualityJobManager
 
 	// Lifecycle
 	done chan struct{} // closed on Shutdown to stop background goroutines
@@ -128,15 +129,16 @@ func NewServer(cfg Config, mgr *Manager, logger *log.Logger) *Server {
 	}
 
 	s := &Server{
-		cfg:        cfg,
-		mgr:        mgr,
-		logger:     logger,
-		sessions:   make(map[string]*Session),
-		sessionTTL: 24 * time.Hour,
-		probeSem:   semaphore.NewWeighted(maxConcurrentProbes),
-		qualitySem: semaphore.NewWeighted(5),
-		probeJobs:  NewBatchProbeJobManager(10),
-		done:       make(chan struct{}),
+		cfg:         cfg,
+		mgr:         mgr,
+		logger:      logger,
+		sessions:    make(map[string]*Session),
+		sessionTTL:  24 * time.Hour,
+		probeSem:    semaphore.NewWeighted(maxConcurrentProbes),
+		qualitySem:  semaphore.NewWeighted(5),
+		probeJobs:   NewBatchProbeJobManager(10),
+		qualityJobs: NewBatchQualityJobManager(4),
+		done:        make(chan struct{}),
 	}
 
 	// Start session cleanup goroutine
@@ -157,6 +159,9 @@ func NewServer(cfg Config, mgr *Manager, logger *log.Logger) *Server {
 	mux.HandleFunc("/api/nodes/probe-batch/status", s.withAuth(s.handleProbeBatchStatus))
 	mux.HandleFunc("/api/nodes/probe-batch/cancel", s.withAuth(s.handleProbeBatchCancel))
 	mux.HandleFunc("/api/nodes/quality-check-batch", s.withAuth(s.handleQualityCheckBatch))
+	mux.HandleFunc("/api/nodes/quality-check-batch/status", s.withAuth(s.handleQualityCheckBatchStatus))
+	mux.HandleFunc("/api/nodes/quality-check-batch/stream", s.withAuth(s.handleQualityCheckBatchStream))
+	mux.HandleFunc("/api/nodes/quality-check-batch/cancel", s.withAuth(s.handleQualityCheckBatchCancel))
 	mux.HandleFunc("/api/nodes/traffic/stream", s.withAuth(s.handleTrafficStream))
 	mux.HandleFunc("/api/nodes/", s.withAuth(s.handleNodeAction))
 	mux.HandleFunc("/api/debug", s.withAuth(s.handleDebug))
@@ -260,7 +265,7 @@ type allSettingsResponse struct {
 	GeoIPAutoUpdateInterval string `json:"geoip_auto_update_interval"`
 
 	// Subscriptions
-	Subscriptions    []string                     `json:"subscriptions"`
+	Subscriptions    []string                       `json:"subscriptions"`
 	TXTSubscriptions []config.TXTSubscriptionConfig `json:"txt_subscriptions"`
 }
 
@@ -313,7 +318,7 @@ type allSettingsRequest struct {
 	GeoIPAutoUpdateInterval string `json:"geoip_auto_update_interval"`
 
 	// Subscriptions
-	Subscriptions    []string                     `json:"subscriptions"`
+	Subscriptions    []string                       `json:"subscriptions"`
 	TXTSubscriptions []config.TXTSubscriptionConfig `json:"txt_subscriptions"`
 }
 
@@ -1049,54 +1054,125 @@ func (s *Server) handleQualityCheckBatch(w http.ResponseWriter, r *http.Request)
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
-	if s.store != nil {
-		s.handleQualityCheckBatchV2(w, r)
-		return
-	}
 	if s.store == nil {
 		w.WriteHeader(http.StatusServiceUnavailable)
 		writeJSON(w, map[string]any{"error": "数据存储未初始化"})
 		return
 	}
 
-	var req struct {
-		Tags []string `json:"tags"`
-	}
+	var req manageSelectionRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(http.StatusBadRequest)
 		writeJSON(w, map[string]any{"error": "请求格式错误"})
 		return
 	}
-	if len(req.Tags) == 0 {
-		w.WriteHeader(http.StatusBadRequest)
-		writeJSON(w, map[string]any{"error": "tags 不能为空"})
+	if usesNodeManagerSelection(req) && !s.ensureNodeManager(w) {
 		return
 	}
 
-	selectedTags := make(map[string]struct{}, len(req.Tags))
-	for _, tag := range req.Tags {
-		tag = strings.TrimSpace(tag)
-		if tag == "" {
-			continue
-		}
-		selectedTags[tag] = struct{}{}
+	selectedRows, err := s.resolveSelectionRequest(r.Context(), req)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		writeJSON(w, map[string]any{"error": "没有可检测的节点"})
+		return
 	}
+
+	selectedTags := tagsFromRows(selectedRows)
 	if len(selectedTags) == 0 {
 		w.WriteHeader(http.StatusBadRequest)
 		writeJSON(w, map[string]any{"error": "没有可检测的节点"})
 		return
 	}
 
-	snapshots := s.mgr.SnapshotDetailed()
-	filtered := make([]Snapshot, 0, len(selectedTags))
-	for _, snap := range snapshots {
-		if _, ok := selectedTags[snap.Tag]; ok {
-			filtered = append(filtered, snap)
+	snapshotByTag := make(map[string]Snapshot)
+	for _, snap := range s.mgr.Snapshot() {
+		if snap.Tag != "" {
+			snapshotByTag[snap.Tag] = snap
 		}
 	}
-	if len(filtered) == 0 {
+
+	checker := NewQualityChecker(s.mgr, s.store)
+	targets := make([]BatchQualityTarget, 0, len(selectedTags))
+	for _, tag := range selectedTags {
+		snap, ok := snapshotByTag[tag]
+		if !ok {
+			continue
+		}
+		targets = append(targets, BatchQualityTarget{Tag: snap.Tag, Name: snap.Name})
+	}
+	if len(targets) == 0 {
 		w.WriteHeader(http.StatusBadRequest)
 		writeJSON(w, map[string]any{"error": "没有可检测的节点"})
+		return
+	}
+
+	job, err := s.qualityJobs.Start(targets, func(ctx context.Context, target BatchQualityTarget) (*store.NodeQualityCheck, error) {
+		if err := s.qualitySem.Acquire(ctx, 1); err != nil {
+			return nil, fmt.Errorf("quality check cancelled: %w", err)
+		}
+		defer s.qualitySem.Release(1)
+		return checker.CheckNode(ctx, target.Tag)
+	})
+	if err != nil {
+		if errors.Is(err, ErrBatchQualityJobRunning) {
+			w.WriteHeader(http.StatusConflict)
+		} else {
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+		writeJSON(w, map[string]any{"error": err.Error()})
+		return
+	}
+
+	writeJSON(w, map[string]any{"job": job})
+}
+
+func (s *Server) handleQualityCheckBatchStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	job := s.qualityJobs.Status()
+	if job == nil {
+		writeJSON(w, map[string]any{"job": nil})
+		return
+	}
+
+	writeJSON(w, map[string]any{"job": job})
+}
+
+func (s *Server) handleQualityCheckBatchCancel(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		JobID string `json:"job_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		writeJSON(w, map[string]any{"error": "请求格式错误"})
+		return
+	}
+	if strings.TrimSpace(req.JobID) == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		writeJSON(w, map[string]any{"error": "job_id 不能为空"})
+		return
+	}
+
+	if err := s.qualityJobs.Cancel(req.JobID); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		writeJSON(w, map[string]any{"error": err.Error()})
+		return
+	}
+
+	writeJSON(w, map[string]any{"message": "批量质量检测已取消", "job_id": req.JobID})
+}
+
+func (s *Server) handleQualityCheckBatchStream(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
 
@@ -1110,123 +1186,142 @@ func (s *Server) handleQualityCheckBatch(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	total := len(filtered)
-	fmt.Fprintf(w, "data: %s\n\n", fmt.Sprintf(`{"type":"start","total":%d}`, total))
-	flusher.Flush()
-
-	type qualityResult struct {
-		tag              string
-		name             string
-		qualityStatus    string
-		qualityScore     int
-		qualityGrade     string
-		qualitySummary   string
-		qualityCheckedAt string
-		exitIP           string
-		exitCountry      string
-		exitCountryCode  string
-		exitRegion       string
-		items            []store.NodeQualityCheckItem
-		err              string
-	}
-
-	checker := NewQualityChecker(s.mgr, s.store)
-	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
-	defer cancel()
-
-	results := make(chan qualityResult, total)
-	var wg sync.WaitGroup
-
-	for _, snap := range filtered {
-		wg.Add(1)
-		go func(snap Snapshot) {
-			defer wg.Done()
-
-			if err := s.qualitySem.Acquire(ctx, 1); err != nil {
-				results <- qualityResult{tag: snap.Tag, name: snap.Name, err: "quality check cancelled: " + err.Error()}
-				return
-			}
-			defer s.qualitySem.Release(1)
-
-			check, err := checker.CheckNode(ctx, snap.Tag)
-			if err != nil {
-				results <- qualityResult{tag: snap.Tag, name: snap.Name, err: err.Error()}
-				return
-			}
-
-			score := 0
-			if check.QualityScore != nil {
-				score = *check.QualityScore
-			}
-			checkedAt := ""
-			if !check.QualityCheckedAt.IsZero() {
-				checkedAt = check.QualityCheckedAt.Format(time.RFC3339)
-			}
-			results <- qualityResult{
-				tag:              snap.Tag,
-				name:             snap.Name,
-				qualityStatus:    check.QualityStatus,
-				qualityScore:     score,
-				qualityGrade:     check.QualityGrade,
-				qualitySummary:   check.QualitySummary,
-				qualityCheckedAt: checkedAt,
-				exitIP:           check.ExitIP,
-				exitCountry:      check.ExitCountry,
-				exitCountryCode:  check.ExitCountryCode,
-				exitRegion:       check.ExitRegion,
-				items:            check.Items,
-			}
-		}(snap)
-	}
-
-	go func() {
-		wg.Wait()
-		close(results)
-	}()
-
-	successCount := 0
-	failedCount := 0
-	count := 0
-
-	for result := range results {
-		count++
-		status := "success"
-		if result.err != "" {
-			status = "error"
-			failedCount++
-		} else {
-			successCount++
-		}
-
-		payload := map[string]any{
-			"type":               "progress",
-			"tag":                result.tag,
-			"name":               result.name,
-			"status":             status,
-			"error":              result.err,
-			"quality_status":     result.qualityStatus,
-			"quality_score":      result.qualityScore,
-			"quality_grade":      result.qualityGrade,
-			"quality_summary":    result.qualitySummary,
-			"quality_checked_at": result.qualityCheckedAt,
-			"exit_ip":            result.exitIP,
-			"exit_country":       result.exitCountry,
-			"exit_country_code":  result.exitCountryCode,
-			"exit_region":        result.exitRegion,
-			"items":              result.items,
-			"current":            count,
-			"total":              total,
-		}
-		eventData, err := json.Marshal(payload)
+	send := func(payload map[string]any) bool {
+		data, err := json.Marshal(payload)
 		if err != nil {
-			continue
+			return false
 		}
-		fmt.Fprintf(w, "data: %s\n\n", eventData)
+		if _, err := fmt.Fprintf(w, "data: %s\n\n", data); err != nil {
+			return false
+		}
 		flusher.Flush()
+		return true
 	}
 
-	fmt.Fprintf(w, "data: %s\n\n", fmt.Sprintf(`{"type":"complete","total":%d,"success":%d,"failed":%d}`, total, successCount, failedCount))
-	flusher.Flush()
+	jobID := strings.TrimSpace(r.URL.Query().Get("job_id"))
+	if jobID == "" {
+		current := s.qualityJobs.Status()
+		if current != nil {
+			jobID = current.ID
+		}
+	}
+	if jobID == "" {
+		send(map[string]any{
+			"type":      "complete",
+			"total":     0,
+			"completed": 0,
+			"success":   0,
+			"failed":    0,
+		})
+		return
+	}
+
+	job, updates, unsubscribe, err := s.qualityJobs.Subscribe(jobID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	defer unsubscribe()
+
+	if !send(map[string]any{
+		"type":      "start",
+		"job_id":    job.ID,
+		"status":    job.Status,
+		"total":     job.Total,
+		"completed": job.Completed,
+		"success":   job.Success,
+		"failed":    job.Failed,
+	}) {
+		return
+	}
+
+	if job.Completed > 0 && job.LastResult != nil {
+		payload := map[string]any{
+			"type":                     "progress",
+			"job_id":                   job.ID,
+			"status":                   "success",
+			"error":                    job.LastResult.Error,
+			"tag":                      job.LastResult.Tag,
+			"name":                     job.LastResult.Name,
+			"quality_version":          job.LastResult.QualityVersion,
+			"quality_status":           job.LastResult.QualityStatus,
+			"quality_openai_status":    job.LastResult.QualityOpenAIStatus,
+			"quality_anthropic_status": job.LastResult.QualityAnthropicStatus,
+			"quality_score":            job.LastResult.QualityScore,
+			"quality_grade":            job.LastResult.QualityGrade,
+			"quality_summary":          job.LastResult.QualitySummary,
+			"quality_checked_at":       job.LastResult.QualityCheckedAt,
+			"items":                    job.LastResult.Items,
+			"current":                  job.Completed,
+			"total":                    job.Total,
+			"success":                  job.Success,
+			"failed":                   job.Failed,
+		}
+		if job.LastResult.Error != "" {
+			payload["status"] = "error"
+		}
+		if !send(payload) {
+			return
+		}
+	}
+
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case event, ok := <-updates:
+			if !ok {
+				return
+			}
+			payload := map[string]any{
+				"type":                     "progress",
+				"job_id":                   event.JobID,
+				"status":                   "success",
+				"error":                    event.Result.Error,
+				"tag":                      event.Result.Tag,
+				"name":                     event.Result.Name,
+				"quality_version":          event.Result.QualityVersion,
+				"quality_status":           event.Result.QualityStatus,
+				"quality_openai_status":    event.Result.QualityOpenAIStatus,
+				"quality_anthropic_status": event.Result.QualityAnthropicStatus,
+				"quality_score":            event.Result.QualityScore,
+				"quality_grade":            event.Result.QualityGrade,
+				"quality_summary":          event.Result.QualitySummary,
+				"quality_checked_at":       event.Result.QualityCheckedAt,
+				"items":                    event.Result.Items,
+				"current":                  event.Completed,
+				"total":                    event.Total,
+				"success":                  event.Success,
+				"failed":                   event.Failed,
+			}
+			if event.Result != nil && event.Result.Error != "" {
+				payload["status"] = "error"
+			}
+			if !send(payload) {
+				return
+			}
+		case <-ticker.C:
+			current := s.qualityJobs.Status()
+			if current == nil || current.ID != job.ID {
+				return
+			}
+			if current.Status == BatchQualityCompleted || current.Status == BatchQualityCancelled || current.Status == BatchQualityFailed {
+				send(map[string]any{
+					"type":      "complete",
+					"job_id":    current.ID,
+					"status":    current.Status,
+					"total":     current.Total,
+					"completed": current.Completed,
+					"success":   current.Success,
+					"failed":    current.Failed,
+				})
+				return
+			}
+		}
+	}
 }
 
 func (s *Server) handleTrafficStream(w http.ResponseWriter, r *http.Request) {
@@ -1371,176 +1466,7 @@ func (s *Server) handleProbeBatchStartV2(w http.ResponseWriter, r *http.Request)
 }
 
 func (s *Server) handleQualityCheckBatchV2(w http.ResponseWriter, r *http.Request) {
-	var req manageSelectionRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		w.WriteHeader(http.StatusBadRequest)
-		writeJSON(w, map[string]any{"error": "璇锋眰鏍煎紡閿欒"})
-		return
-	}
-	if usesNodeManagerSelection(req) && !s.ensureNodeManager(w) {
-		return
-	}
-
-	selectedRows, err := s.resolveSelectionRequest(r.Context(), req)
-	if err != nil {
-		w.WriteHeader(http.StatusBadRequest)
-		writeJSON(w, map[string]any{"error": "娌℃湁鍙娴嬬殑鑺傜偣"})
-		return
-	}
-
-	selectedTags := tagsFromRows(selectedRows)
-	if len(selectedTags) == 0 {
-		w.WriteHeader(http.StatusBadRequest)
-		writeJSON(w, map[string]any{"error": "娌℃湁鍙娴嬬殑鑺傜偣"})
-		return
-	}
-
-	snapshotByTag := make(map[string]Snapshot)
-	for _, snap := range s.mgr.Snapshot() {
-		if snap.Tag != "" {
-			snapshotByTag[snap.Tag] = snap
-		}
-	}
-
-	filtered := make([]Snapshot, 0, len(selectedTags))
-	for _, tag := range selectedTags {
-		if snap, ok := snapshotByTag[tag]; ok {
-			filtered = append(filtered, snap)
-		}
-	}
-	if len(filtered) == 0 {
-		w.WriteHeader(http.StatusBadRequest)
-		writeJSON(w, map[string]any{"error": "娌℃湁鍙娴嬬殑鑺傜偣"})
-		return
-	}
-
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		http.Error(w, "SSE not supported", http.StatusInternalServerError)
-		return
-	}
-
-	total := len(filtered)
-	fmt.Fprintf(w, "data: %s\n\n", fmt.Sprintf(`{"type":"start","total":%d}`, total))
-	flusher.Flush()
-
-	type qualityResult struct {
-		tag              string
-		name             string
-		qualityStatus    string
-		qualityScore     int
-		qualityGrade     string
-		qualitySummary   string
-		qualityCheckedAt string
-		exitIP           string
-		exitCountry      string
-		exitCountryCode  string
-		exitRegion       string
-		items            []store.NodeQualityCheckItem
-		err              string
-	}
-
-	checker := NewQualityChecker(s.mgr, s.store)
-	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
-	defer cancel()
-
-	results := make(chan qualityResult, total)
-	var wg sync.WaitGroup
-
-	for _, snap := range filtered {
-		wg.Add(1)
-		go func(snap Snapshot) {
-			defer wg.Done()
-
-			if err := s.qualitySem.Acquire(ctx, 1); err != nil {
-				results <- qualityResult{tag: snap.Tag, name: snap.Name, err: "quality check cancelled: " + err.Error()}
-				return
-			}
-			defer s.qualitySem.Release(1)
-
-			check, err := checker.CheckNode(ctx, snap.Tag)
-			if err != nil {
-				results <- qualityResult{tag: snap.Tag, name: snap.Name, err: err.Error()}
-				return
-			}
-
-			score := 0
-			if check.QualityScore != nil {
-				score = *check.QualityScore
-			}
-			checkedAt := ""
-			if !check.QualityCheckedAt.IsZero() {
-				checkedAt = check.QualityCheckedAt.Format(time.RFC3339)
-			}
-			results <- qualityResult{
-				tag:              snap.Tag,
-				name:             snap.Name,
-				qualityStatus:    check.QualityStatus,
-				qualityScore:     score,
-				qualityGrade:     check.QualityGrade,
-				qualitySummary:   check.QualitySummary,
-				qualityCheckedAt: checkedAt,
-				exitIP:           check.ExitIP,
-				exitCountry:      check.ExitCountry,
-				exitCountryCode:  check.ExitCountryCode,
-				exitRegion:       check.ExitRegion,
-				items:            check.Items,
-			}
-		}(snap)
-	}
-
-	go func() {
-		wg.Wait()
-		close(results)
-	}()
-
-	successCount := 0
-	failedCount := 0
-	count := 0
-
-	for result := range results {
-		count++
-		status := "success"
-		if result.err != "" {
-			status = "error"
-			failedCount++
-		} else {
-			successCount++
-		}
-
-		payload := map[string]any{
-			"type":               "progress",
-			"tag":                result.tag,
-			"name":               result.name,
-			"status":             status,
-			"error":              result.err,
-			"quality_status":     result.qualityStatus,
-			"quality_score":      result.qualityScore,
-			"quality_grade":      result.qualityGrade,
-			"quality_summary":    result.qualitySummary,
-			"quality_checked_at": result.qualityCheckedAt,
-			"exit_ip":            result.exitIP,
-			"exit_country":       result.exitCountry,
-			"exit_country_code":  result.exitCountryCode,
-			"exit_region":        result.exitRegion,
-			"items":              result.items,
-			"current":            count,
-			"total":              total,
-		}
-		eventData, err := json.Marshal(payload)
-		if err != nil {
-			continue
-		}
-		fmt.Fprintf(w, "data: %s\n\n", eventData)
-		flusher.Flush()
-	}
-
-	fmt.Fprintf(w, "data: %s\n\n", fmt.Sprintf(`{"type":"complete","total":%d,"success":%d,"failed":%d}`, total, successCount, failedCount))
-	flusher.Flush()
+	s.handleQualityCheckBatch(w, r)
 }
 
 func (s *Server) handleConfigNodesBatchToggleV2(w http.ResponseWriter, r *http.Request) {
@@ -1588,9 +1514,9 @@ func (s *Server) handleConfigNodesBatchToggleV2(w http.ResponseWriter, r *http.R
 	}
 
 	result := map[string]any{
-/*
-		"message": fmt.Sprintf("鎴愬姛%s %d 涓妭鐐?s", action, successCount, reloadMsg),
-*/
+		/*
+			"message": fmt.Sprintf("鎴愬姛%s %d 涓妭鐐?s", action, successCount, reloadMsg),
+		*/
 		"message": fmt.Sprintf("%s %d 个节点%s", action, successCount, reloadMsg),
 		"success": successCount,
 		"total":   len(selectedNames),
@@ -1640,9 +1566,9 @@ func (s *Server) handleConfigNodesBatchDeleteV2(w http.ResponseWriter, r *http.R
 	}
 
 	result := map[string]any{
-/*
-		"message": fmt.Sprintf("鎴愬姛鍒犻櫎 %d 涓妭鐐?s", successCount, reloadMsg),
-*/
+		/*
+			"message": fmt.Sprintf("鎴愬姛鍒犻櫎 %d 涓妭鐐?s", successCount, reloadMsg),
+		*/
 		"message": fmt.Sprintf("删除 %d 个节点%s", successCount, reloadMsg),
 		"success": successCount,
 		"total":   len(selectedNames),

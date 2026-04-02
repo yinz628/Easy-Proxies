@@ -155,6 +155,15 @@ CREATE TABLE IF NOT EXISTS node_quality_checks (
 CREATE INDEX IF NOT EXISTS idx_node_quality_checks_node_id ON node_quality_checks(node_id);
 `,
 		},
+		{
+			Version:     6,
+			Description: "add quality version and provider statuses",
+			Up: `
+ALTER TABLE node_stats ADD COLUMN quality_version TEXT NOT NULL DEFAULT '';
+ALTER TABLE node_stats ADD COLUMN quality_openai_status TEXT NOT NULL DEFAULT '';
+ALTER TABLE node_stats ADD COLUMN quality_anthropic_status TEXT NOT NULL DEFAULT '';
+`,
+		},
 	}
 }
 
