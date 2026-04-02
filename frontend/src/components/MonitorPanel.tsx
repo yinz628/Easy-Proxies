@@ -202,27 +202,24 @@ export default function MonitorPanel() {
   // Latency distribution bars
   const latencyBars = useMemo(() => {
     const buckets = [
-      { label: '0-50', min: 0, max: 50, count: 0, color: 'oklch(0.72 0.19 142)' },
-      { label: '50-100', min: 50, max: 100, count: 0, color: 'oklch(0.75 0.18 120)' },
-      { label: '100-200', min: 100, max: 200, count: 0, color: 'oklch(0.80 0.18 84)' },
-      { label: '200-300', min: 200, max: 300, count: 0, color: 'oklch(0.75 0.18 55)' },
-      { label: '300+', min: 300, max: Infinity, count: 0, color: 'oklch(0.63 0.24 29)' },
+      { label: '0-200', min: 0, max: 200, count: 0, color: 'oklch(0.72 0.19 142)' },
+      { label: '200-500', min: 200, max: 500, count: 0, color: 'oklch(0.75 0.18 120)' },
+      { label: '500-1000', min: 500, max: 1000, count: 0, color: 'oklch(0.80 0.18 84)' },
+      { label: '1000+', min: 1000, max: Infinity, count: 0, color: 'oklch(0.63 0.24 29)' },
       { label: '超时', min: -1, max: 0, count: 0, color: 'oklch(0.50 0.10 250)' },
     ]
     for (const node of allNodes) {
       const ms = node.last_latency_ms
       if (ms < 0 || !node.initial_check_done) {
-        buckets[5].count++
-      } else if (ms <= 50) {
-        buckets[0].count++
-      } else if (ms <= 100) {
-        buckets[1].count++
-      } else if (ms <= 200) {
-        buckets[2].count++
-      } else if (ms <= 300) {
-        buckets[3].count++
-      } else {
         buckets[4].count++
+      } else if (ms <= 200) {
+        buckets[0].count++
+      } else if (ms <= 500) {
+        buckets[1].count++
+      } else if (ms <= 1000) {
+        buckets[2].count++
+      } else {
+        buckets[3].count++
       }
     }
     return buckets.map(b => ({ label: b.label, value: b.count, color: b.color }))
