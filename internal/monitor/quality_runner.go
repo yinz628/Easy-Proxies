@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"easy_proxies/internal/config"
 	"easy_proxies/internal/quality"
 	"easy_proxies/internal/store"
 )
@@ -49,11 +50,12 @@ var qualityTargets = []qualityTarget{
 
 type QualityChecker struct {
 	monitorMgr *Manager
+	nodeMgr    NodeManager
 	store      store.Store
 }
 
-func NewQualityChecker(mgr *Manager, st store.Store) *QualityChecker {
-	return &QualityChecker{monitorMgr: mgr, store: st}
+func NewQualityChecker(mgr *Manager, st store.Store, nodeMgr NodeManager) *QualityChecker {
+	return &QualityChecker{monitorMgr: mgr, nodeMgr: nodeMgr, store: st}
 }
 
 func (c *QualityChecker) CheckNode(ctx context.Context, tag string) (*store.NodeQualityCheck, error) {
@@ -81,24 +83,59 @@ func (c *QualityChecker) CheckNode(ctx context.Context, tag string) (*store.Node
 		return nil, fmt.Errorf("store node for %s not found", snapshot.URI)
 	}
 
+	return c.runChecks(ctx, node.ID, func(reqCtx context.Context, method, rawURL string, headers map[string]string, maxBodyBytes int64) (*HTTPCheckResult, error) {
+		return c.monitorMgr.HTTPRequest(reqCtx, tag, method, rawURL, headers, maxBodyBytes)
+	})
+}
+
+func (c *QualityChecker) CheckTarget(ctx context.Context, target BatchQualityTarget) (*store.NodeQualityCheck, error) {
+	if strings.TrimSpace(target.Tag) != "" {
+		return c.CheckNode(ctx, target.Tag)
+	}
+	return c.CheckConfigNode(ctx, target.ConfigNode, target.StoreNodeID)
+}
+
+func (c *QualityChecker) CheckConfigNode(ctx context.Context, node config.NodeConfig, storeNodeID int64) (*store.NodeQualityCheck, error) {
+	if c.nodeMgr == nil || c.store == nil {
+		return nil, fmt.Errorf("quality checker dependencies are not initialized")
+	}
+	if storeNodeID <= 0 {
+		return nil, fmt.Errorf("store node id is required for config-backed quality checks")
+	}
+
+	runtimeNode, err := c.nodeMgr.CreateConfigNodeRuntime(ctx, node)
+	if err != nil {
+		return nil, err
+	}
+	defer runtimeNode.Close()
+
+	return c.runChecks(ctx, storeNodeID, runtimeNode.HTTPRequest)
+}
+
+func (c *QualityChecker) runChecks(ctx context.Context, nodeID int64, request func(ctx context.Context, method, rawURL string, headers map[string]string, maxBodyBytes int64) (*HTTPCheckResult, error)) (*store.NodeQualityCheck, error) {
 	result := &quality.CheckResult{
 		CheckedAt: time.Now(),
 		Items:     make([]quality.CheckItem, 0, len(qualityTargets)),
 	}
 
 	for _, target := range qualityTargets {
-		result.Items = append(result.Items, c.runTarget(ctx, tag, target))
+		result.Items = append(result.Items, c.runTarget(ctx, request, target))
 	}
 
 	quality.FinalizeResult(result)
-	check := toStoreQualityCheck(node.ID, result)
+	check := toStoreQualityCheck(nodeID, result)
+	manualProbe, err := c.store.GetNodeManualProbeResult(ctx, nodeID)
+	if err != nil {
+		return nil, err
+	}
+	applyActivationStateToQualityCheck(check, manualProbe)
 	if err := c.store.SaveNodeQualityCheck(ctx, check); err != nil {
 		return nil, err
 	}
 	return check, nil
 }
 
-func (c *QualityChecker) runTarget(ctx context.Context, tag string, target qualityTarget) quality.CheckItem {
+func (c *QualityChecker) runTarget(ctx context.Context, request func(ctx context.Context, method, rawURL string, headers map[string]string, maxBodyBytes int64) (*HTTPCheckResult, error), target qualityTarget) quality.CheckItem {
 	reqCtx, cancel := context.WithTimeout(ctx, qualityRequestTimeout)
 	defer cancel()
 
@@ -107,7 +144,7 @@ func (c *QualityChecker) runTarget(ctx context.Context, tag string, target quali
 		"User-Agent": qualityUserAgent,
 	}
 
-	resp, err := c.monitorMgr.HTTPRequest(reqCtx, tag, target.Method, target.URL, headers, qualityMaxBodyBytes)
+	resp, err := request(reqCtx, target.Method, target.URL, headers, qualityMaxBodyBytes)
 	if err != nil {
 		return quality.CheckItem{Target: target.Name, Status: quality.StatusFail, Message: err.Error()}
 	}

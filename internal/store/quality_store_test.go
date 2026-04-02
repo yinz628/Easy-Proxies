@@ -55,6 +55,74 @@ func TestMigrateAddsQualitySummaryColumns(t *testing.T) {
 	}
 }
 
+func TestMigrateAddsLifecycleStateAndManualProbeTable(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "store.db")
+	st, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer st.Close()
+
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("sql.Open() error = %v", err)
+	}
+	defer db.Close()
+
+	rows, err := db.Query("PRAGMA table_info(nodes)")
+	if err != nil {
+		t.Fatalf("PRAGMA table_info(nodes) error = %v", err)
+	}
+	defer rows.Close()
+
+	nodeColumns := map[string]bool{}
+	for rows.Next() {
+		var cid int
+		var name, dataType string
+		var notNull, pk int
+		var defaultValue sql.NullString
+		if err := rows.Scan(&cid, &name, &dataType, &notNull, &defaultValue, &pk); err != nil {
+			t.Fatalf("rows.Scan(nodes) error = %v", err)
+		}
+		nodeColumns[name] = true
+	}
+	if !nodeColumns["lifecycle_state"] {
+		t.Fatal("nodes missing column \"lifecycle_state\"")
+	}
+
+	manualProbeRows, err := db.Query("PRAGMA table_info(node_manual_probe_results)")
+	if err != nil {
+		t.Fatalf("PRAGMA table_info(node_manual_probe_results) error = %v", err)
+	}
+	defer manualProbeRows.Close()
+
+	manualProbeColumns := map[string]bool{}
+	for manualProbeRows.Next() {
+		var cid int
+		var name, dataType string
+		var notNull, pk int
+		var defaultValue sql.NullString
+		if err := manualProbeRows.Scan(&cid, &name, &dataType, &notNull, &defaultValue, &pk); err != nil {
+			t.Fatalf("rows.Scan(node_manual_probe_results) error = %v", err)
+		}
+		manualProbeColumns[name] = true
+	}
+
+	for _, name := range []string{
+		"node_id",
+		"status",
+		"latency_ms",
+		"timed_out",
+		"message",
+		"checked_at",
+		"updated_at",
+	} {
+		if !manualProbeColumns[name] {
+			t.Fatalf("node_manual_probe_results missing column %q", name)
+		}
+	}
+}
+
 func TestSaveNodeQualityCheckReplacesPreviousItems(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "store.db")
 	st, err := Open(dbPath)

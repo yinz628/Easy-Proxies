@@ -42,6 +42,7 @@ func TestBatchQualityJobManagerTracksProgressAndCompletion(t *testing.T) {
 				QualityStatus:          quality.StatusDualAvailable,
 				QualityOpenAIStatus:    quality.StatusPass,
 				QualityAnthropicStatus: quality.StatusPass,
+				ActivationReady:        true,
 				QualityScore:           &score,
 				QualityGrade:           "A",
 				QualitySummary:         "all good",
@@ -98,6 +99,9 @@ func TestBatchQualityJobManagerTracksProgressAndCompletion(t *testing.T) {
 	}
 	if current.LastResult.QualityAnthropicStatus != quality.StatusPass {
 		t.Fatalf("LastResult.QualityAnthropicStatus = %q", current.LastResult.QualityAnthropicStatus)
+	}
+	if !current.LastResult.ActivationReady {
+		t.Fatalf("LastResult.ActivationReady = false, want true")
 	}
 	if current.LastResult.QualityScore == nil || *current.LastResult.QualityScore != 100 {
 		t.Fatalf("LastResult.QualityScore = %#v, want 100", current.LastResult.QualityScore)

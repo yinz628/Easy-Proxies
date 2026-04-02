@@ -6,11 +6,14 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"easy_proxies/internal/config"
+	"easy_proxies/internal/quality"
+	"easy_proxies/internal/store"
 )
 
 type toggleCall struct {
@@ -19,10 +22,17 @@ type toggleCall struct {
 }
 
 type fakeNodeManager struct {
-	nodes    []config.NodeConfig
-	toggles  []toggleCall
-	deleted  []string
-	reloaded bool
+	nodes                     []config.NodeConfig
+	toggles                   []toggleCall
+	deleted                   []string
+	reloaded                  bool
+	createConfigNodeRuntimeFn func(ctx context.Context, node config.NodeConfig) (ConfigNodeRuntime, error)
+}
+
+type fakeConfigNodeRuntime struct {
+	probeFn       func(ctx context.Context) (time.Duration, error)
+	httpRequestFn func(ctx context.Context, method, rawURL string, headers map[string]string, maxBodyBytes int64) (*HTTPCheckResult, error)
+	closeFn       func() error
 }
 
 func (f *fakeNodeManager) ListConfigNodes(ctx context.Context) ([]config.NodeConfig, error) {
@@ -59,6 +69,34 @@ func (f *fakeNodeManager) SetNodeEnabled(ctx context.Context, name string, enabl
 func (f *fakeNodeManager) TriggerReload(ctx context.Context) error {
 	f.reloaded = true
 	return nil
+}
+
+func (f *fakeConfigNodeRuntime) Probe(ctx context.Context) (time.Duration, error) {
+	if f.probeFn == nil {
+		return 0, ErrNodeNotFound
+	}
+	return f.probeFn(ctx)
+}
+
+func (f *fakeConfigNodeRuntime) HTTPRequest(ctx context.Context, method, rawURL string, headers map[string]string, maxBodyBytes int64) (*HTTPCheckResult, error) {
+	if f.httpRequestFn == nil {
+		return nil, ErrNodeNotFound
+	}
+	return f.httpRequestFn(ctx, method, rawURL, headers, maxBodyBytes)
+}
+
+func (f *fakeConfigNodeRuntime) Close() error {
+	if f.closeFn == nil {
+		return nil
+	}
+	return f.closeFn()
+}
+
+func (f *fakeNodeManager) CreateConfigNodeRuntime(ctx context.Context, node config.NodeConfig) (ConfigNodeRuntime, error) {
+	if f.createConfigNodeRuntimeFn == nil {
+		return nil, ErrNodeNotFound
+	}
+	return f.createConfigNodeRuntimeFn(ctx, node)
 }
 
 func newManageListTestServer(t *testing.T) (*Server, *fakeNodeManager) {
@@ -492,4 +530,176 @@ func TestHandleProbeBatchStartRejectsWhenJobAlreadyRunning(t *testing.T) {
 	}
 
 	close(block)
+}
+
+func TestHandleProbeBatchStartAcceptsStagedNodeByName(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "staged-probe.db")
+	dataStore, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("store.Open() error = %v", err)
+	}
+	defer dataStore.Close()
+
+	server, nodeMgr := newManageListTestServer(t)
+	server.SetStore(dataStore)
+
+	stagedNode := &store.Node{
+		URI:            "socks5://142.54.228.193:4145",
+		Name:           "staged-probe-node",
+		Source:         store.NodeSourceTXTSubscription,
+		Enabled:        true,
+		LifecycleState: store.NodeLifecycleStaged,
+	}
+	if err := dataStore.CreateNode(ctx, stagedNode); err != nil {
+		t.Fatalf("CreateNode() error = %v", err)
+	}
+
+	nodeMgr.nodes = append(nodeMgr.nodes, config.NodeConfig{
+		Name:           stagedNode.Name,
+		URI:            stagedNode.URI,
+		Source:         config.NodeSourceTXTSubscription,
+		LifecycleState: store.NodeLifecycleStaged,
+	})
+	nodeMgr.createConfigNodeRuntimeFn = func(ctx context.Context, node config.NodeConfig) (ConfigNodeRuntime, error) {
+		if node.Name != stagedNode.Name {
+			t.Fatalf("CreateConfigNodeRuntime() received %q, want %q", node.Name, stagedNode.Name)
+		}
+		return &fakeConfigNodeRuntime{
+			probeFn: func(ctx context.Context) (time.Duration, error) {
+				return 55 * time.Millisecond, nil
+			},
+		}, nil
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/nodes/probe-batch/start", strings.NewReader(`{"names":["staged-probe-node"]}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	server.handleProbeBatchStart(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		current := server.probeJobs.Status()
+		if current != nil && current.Status == BatchProbeCompleted {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("batch probe job did not complete before deadline: %+v", current)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	result, err := dataStore.GetNodeManualProbeResult(ctx, stagedNode.ID)
+	if err != nil {
+		t.Fatalf("GetNodeManualProbeResult() error = %v", err)
+	}
+	if result == nil {
+		t.Fatal("GetNodeManualProbeResult() = nil, want non-nil")
+	}
+	if result.Status != store.ManualProbeStatusPass {
+		t.Fatalf("result.Status = %q, want %q", result.Status, store.ManualProbeStatusPass)
+	}
+	if result.LatencyMs != 55 {
+		t.Fatalf("result.LatencyMs = %d, want 55", result.LatencyMs)
+	}
+}
+
+func TestHandleQualityCheckBatchAcceptsStagedNodeByName(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "staged-quality.db")
+	dataStore, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("store.Open() error = %v", err)
+	}
+	defer dataStore.Close()
+
+	server, nodeMgr := newManageListTestServer(t)
+	server.SetStore(dataStore)
+
+	stagedNode := &store.Node{
+		URI:            "socks5://68.71.249.153:48606",
+		Name:           "staged-quality-node",
+		Source:         store.NodeSourceTXTSubscription,
+		Enabled:        true,
+		LifecycleState: store.NodeLifecycleStaged,
+	}
+	if err := dataStore.CreateNode(ctx, stagedNode); err != nil {
+		t.Fatalf("CreateNode() error = %v", err)
+	}
+	if err := dataStore.SaveNodeManualProbeResult(ctx, &store.NodeManualProbeResult{
+		NodeID:    stagedNode.ID,
+		Status:    store.ManualProbeStatusPass,
+		LatencyMs: 88,
+		CheckedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("SaveNodeManualProbeResult() error = %v", err)
+	}
+
+	nodeMgr.nodes = append(nodeMgr.nodes, config.NodeConfig{
+		Name:           stagedNode.Name,
+		URI:            stagedNode.URI,
+		Source:         config.NodeSourceTXTSubscription,
+		LifecycleState: store.NodeLifecycleStaged,
+	})
+	nodeMgr.createConfigNodeRuntimeFn = func(ctx context.Context, node config.NodeConfig) (ConfigNodeRuntime, error) {
+		if node.Name != stagedNode.Name {
+			t.Fatalf("CreateConfigNodeRuntime() received %q, want %q", node.Name, stagedNode.Name)
+		}
+		return &fakeConfigNodeRuntime{
+			httpRequestFn: func(ctx context.Context, method, rawURL string, headers map[string]string, maxBodyBytes int64) (*HTTPCheckResult, error) {
+				switch rawURL {
+				case "https://api.openai.com/v1/models":
+					return mockOpenAIUnauthorizedResult(180), nil
+				case "https://api.anthropic.com/v1/messages":
+					return mockAnthropicMethodNotAllowedResult(190), nil
+				default:
+					t.Fatalf("unexpected quality target %s", rawURL)
+					return nil, nil
+				}
+			},
+		}, nil
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/nodes/quality-check-batch", strings.NewReader(`{"names":["staged-quality-node"]}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	server.handleQualityCheckBatch(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	completedJob := waitForQualityStatus(t, server, 2*time.Second, func(job *BatchQualityJob) bool {
+		return job != nil && job.Status == BatchQualityCompleted
+	})
+	if completedJob.LastResult == nil {
+		t.Fatalf("LastResult = nil")
+	}
+	if completedJob.LastResult.Name != stagedNode.Name {
+		t.Fatalf("LastResult.Name = %q, want %q", completedJob.LastResult.Name, stagedNode.Name)
+	}
+	if completedJob.LastResult.QualityStatus != quality.StatusDualAvailable {
+		t.Fatalf("QualityStatus = %q, want %q", completedJob.LastResult.QualityStatus, quality.StatusDualAvailable)
+	}
+	if !completedJob.LastResult.ActivationReady {
+		t.Fatalf("ActivationReady = false, want true")
+	}
+
+	check, err := dataStore.GetNodeQualityCheck(ctx, stagedNode.ID)
+	if err != nil {
+		t.Fatalf("GetNodeQualityCheck() error = %v", err)
+	}
+	if check == nil {
+		t.Fatal("GetNodeQualityCheck() = nil, want non-nil")
+	}
+	if check.QualityStatus != quality.StatusDualAvailable {
+		t.Fatalf("check.QualityStatus = %q, want %q", check.QualityStatus, quality.StatusDualAvailable)
+	}
+	if got, want := len(check.Items), 2; got != want {
+		t.Fatalf("len(check.Items) = %d, want %d", got, want)
+	}
 }

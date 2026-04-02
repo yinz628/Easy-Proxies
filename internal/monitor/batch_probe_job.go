@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"sync"
 	"time"
+
+	"easy_proxies/internal/config"
 )
 
 type BatchProbeJobStatus string
@@ -30,8 +32,10 @@ type BatchProbeJobResult struct {
 }
 
 type BatchProbeTarget struct {
-	Tag  string
-	Name string
+	Tag         string
+	Name        string
+	StoreNodeID int64
+	ConfigNode  config.NodeConfig
 }
 
 type BatchProbeJob struct {

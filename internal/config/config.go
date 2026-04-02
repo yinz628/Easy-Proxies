@@ -161,6 +161,7 @@ type NodeConfig struct {
 	Password               string     `yaml:"password,omitempty" json:"password,omitempty"`
 	Source                 NodeSource `yaml:"-" json:"source,omitempty"`   // Runtime only, not persisted in YAML
 	Disabled               bool       `yaml:"-" json:"disabled,omitempty"` // Runtime only, not persisted in YAML; true = node is disabled
+	LifecycleState         string     `yaml:"-" json:"lifecycle_state,omitempty"`
 	FeedKey                string     `yaml:"-" json:"feed_key,omitempty"`
 	QualityVersion         string     `yaml:"-" json:"quality_version,omitempty"`
 	QualityStatus          string     `yaml:"-" json:"quality_status,omitempty"`

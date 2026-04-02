@@ -361,7 +361,7 @@ func TestQualityCheckerRejectsAllowedStatusWithoutOfficialSignature(t *testing.T
 		}
 	})
 
-	checker := NewQualityChecker(mgr, st)
+	checker := NewQualityChecker(mgr, st, nil)
 	result, err := checker.CheckNode(ctx, "node-e")
 	if err != nil {
 		t.Fatalf("CheckNode() error = %v", err)
@@ -567,6 +567,63 @@ func TestQualityCheckPersistsTimestamp(t *testing.T) {
 	}
 	if got == nil || got.QualityCheckedAt.IsZero() {
 		t.Fatalf("QualityCheckedAt not persisted: %+v", got)
+	}
+}
+
+func TestHandleQualityCheckIncludesActivationReadiness(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "quality-activation.db"))
+	if err != nil {
+		t.Fatalf("store.Open() error = %v", err)
+	}
+	defer st.Close()
+
+	ctx := context.Background()
+	node := &store.Node{
+		URI:            "http://10.10.10.10:80",
+		Name:           "node-activation",
+		Source:         store.NodeSourceManual,
+		Enabled:        true,
+		LifecycleState: store.NodeLifecycleStaged,
+	}
+	if err := st.CreateNode(ctx, node); err != nil {
+		t.Fatalf("CreateNode() error = %v", err)
+	}
+	if err := st.SaveNodeManualProbeResult(ctx, &store.NodeManualProbeResult{
+		NodeID:    node.ID,
+		Status:    store.ManualProbeStatusPass,
+		LatencyMs: 120,
+		CheckedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("SaveNodeManualProbeResult() error = %v", err)
+	}
+
+	mgr, err := NewManager(Config{})
+	if err != nil {
+		t.Fatalf("NewManager() error = %v", err)
+	}
+	entry := mgr.Register(NodeInfo{Tag: "node-activation", Name: "node-activation", URI: node.URI})
+	entry.SetHTTPRequest(func(ctx context.Context, method, rawURL string, headers map[string]string, maxBodyBytes int64) (*HTTPCheckResult, error) {
+		switch rawURL {
+		case "https://api.openai.com/v1/models":
+			return mockOpenAIUnauthorizedResult(180), nil
+		case "https://api.anthropic.com/v1/messages":
+			return mockAnthropicMethodNotAllowedResult(190), nil
+		default:
+			return nil, fmt.Errorf("unexpected quality target %s", rawURL)
+		}
+	})
+
+	checker := NewQualityChecker(mgr, st, nil)
+	result, err := checker.CheckNode(ctx, "node-activation")
+	if err != nil {
+		t.Fatalf("CheckNode() error = %v", err)
+	}
+
+	if !result.ActivationReady {
+		t.Fatalf("ActivationReady = false, want true")
+	}
+	if result.ActivationBlockReason != "" {
+		t.Fatalf("ActivationBlockReason = %q, want empty", result.ActivationBlockReason)
 	}
 }
 

@@ -67,7 +67,7 @@ type querier interface {
 // ===================== Node operations =====================
 
 func (s *sqliteStore) ListNodes(ctx context.Context, filter NodeFilter) ([]Node, error) {
-	query := "SELECT id, uri, name, source, feed_key, port, username, password, region, country, enabled, created_at, updated_at FROM nodes"
+	query := "SELECT id, uri, name, source, feed_key, port, username, password, region, country, enabled, lifecycle_state, created_at, updated_at FROM nodes"
 	var conditions []string
 	var args []any
 
@@ -86,6 +86,10 @@ func (s *sqliteStore) ListNodes(ctx context.Context, filter NodeFilter) ([]Node,
 		} else {
 			args = append(args, 0)
 		}
+	}
+	if lifecycleState := strings.TrimSpace(filter.LifecycleState); lifecycleState != "" {
+		conditions = append(conditions, "lifecycle_state = ?")
+		args = append(args, lifecycleState)
 	}
 
 	if len(conditions) > 0 {
@@ -110,19 +114,19 @@ func (s *sqliteStore) ListNodes(ctx context.Context, filter NodeFilter) ([]Node,
 
 func (s *sqliteStore) GetNode(ctx context.Context, id int64) (*Node, error) {
 	row := s.conn().QueryRowContext(ctx,
-		"SELECT id, uri, name, source, feed_key, port, username, password, region, country, enabled, created_at, updated_at FROM nodes WHERE id = ?", id)
+		"SELECT id, uri, name, source, feed_key, port, username, password, region, country, enabled, lifecycle_state, created_at, updated_at FROM nodes WHERE id = ?", id)
 	return scanNode(row)
 }
 
 func (s *sqliteStore) GetNodeByURI(ctx context.Context, uri string) (*Node, error) {
 	row := s.conn().QueryRowContext(ctx,
-		"SELECT id, uri, name, source, feed_key, port, username, password, region, country, enabled, created_at, updated_at FROM nodes WHERE uri = ?", uri)
+		"SELECT id, uri, name, source, feed_key, port, username, password, region, country, enabled, lifecycle_state, created_at, updated_at FROM nodes WHERE uri = ?", uri)
 	return scanNode(row)
 }
 
 func (s *sqliteStore) GetNodeByName(ctx context.Context, name string) (*Node, error) {
 	row := s.conn().QueryRowContext(ctx,
-		"SELECT id, uri, name, source, feed_key, port, username, password, region, country, enabled, created_at, updated_at FROM nodes WHERE name = ?", name)
+		"SELECT id, uri, name, source, feed_key, port, username, password, region, country, enabled, lifecycle_state, created_at, updated_at FROM nodes WHERE name = ?", name)
 	return scanNode(row)
 }
 
@@ -134,17 +138,17 @@ func (s *sqliteStore) CreateNode(ctx context.Context, node *Node) error {
 	if node.UpdatedAt.IsZero() {
 		node.UpdatedAt = time.Now().UTC()
 	}
-	enabled := 0
-	if node.Enabled {
-		enabled = 1
-	}
+	lifecycleState := normalizeNodeLifecycle(node.LifecycleState, node.Enabled)
+	node.LifecycleState = lifecycleState
+	node.Enabled = lifecycleStateEnabled(lifecycleState)
+	enabled := boolToInt(node.Enabled)
 
 	result, err := s.conn().ExecContext(ctx,
-		`INSERT INTO nodes (uri, name, source, feed_key, port, username, password, region, country, enabled, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO nodes (uri, name, source, feed_key, port, username, password, region, country, enabled, lifecycle_state, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		node.URI, node.Name, node.Source, node.FeedKey, node.Port,
 		node.Username, node.Password, node.Region, node.Country,
-		enabled, now, now,
+		enabled, lifecycleState, now, now,
 	)
 	if err != nil {
 		return fmt.Errorf("create node: %w", err)
@@ -168,18 +172,18 @@ func (s *sqliteStore) CreateNode(ctx context.Context, node *Node) error {
 
 func (s *sqliteStore) UpdateNode(ctx context.Context, node *Node) error {
 	now := time.Now().UTC().Format(time.RFC3339)
-	enabled := 0
-	if node.Enabled {
-		enabled = 1
-	}
+	lifecycleState := normalizeNodeLifecycle(node.LifecycleState, node.Enabled)
+	node.LifecycleState = lifecycleState
+	node.Enabled = lifecycleStateEnabled(lifecycleState)
+	enabled := boolToInt(node.Enabled)
 
 	result, err := s.conn().ExecContext(ctx,
 		`UPDATE nodes SET uri=?, name=?, source=?, feed_key=?, port=?, username=?, password=?,
-		 region=?, country=?, enabled=?, updated_at=?
+		 region=?, country=?, enabled=?, lifecycle_state=?, updated_at=?
 		 WHERE id=?`,
 		node.URI, node.Name, node.Source, node.FeedKey, node.Port,
 		node.Username, node.Password, node.Region, node.Country,
-		enabled, now, node.ID,
+		enabled, lifecycleState, now, node.ID,
 	)
 	if err != nil {
 		return fmt.Errorf("update node %d: %w", node.ID, err)
@@ -237,15 +241,15 @@ func (s *sqliteStore) ReplaceTXTFeedNodes(ctx context.Context, feedKey string, n
 			n := &nodes[i]
 			n.Source = NodeSourceTXTSubscription
 			n.FeedKey = feedKey
-			enabled := 0
-			if n.Enabled {
-				enabled = 1
-			}
+			lifecycleState := normalizeNodeLifecycle(n.LifecycleState, n.Enabled)
+			n.LifecycleState = lifecycleState
+			n.Enabled = lifecycleStateEnabled(lifecycleState)
+			enabled := boolToInt(n.Enabled)
 
 			if _, err := txStore.conn().ExecContext(ctx,
-				`INSERT OR IGNORE INTO nodes (uri, name, source, feed_key, port, username, password, region, country, enabled, created_at, updated_at)
-				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-				n.URI, n.Name, n.Source, feedKey, n.Port, n.Username, n.Password, n.Region, n.Country, enabled, now, now,
+				`INSERT OR IGNORE INTO nodes (uri, name, source, feed_key, port, username, password, region, country, enabled, lifecycle_state, created_at, updated_at)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				n.URI, n.Name, n.Source, feedKey, n.Port, n.Username, n.Password, n.Region, n.Country, enabled, lifecycleState, now, now,
 			); err != nil {
 				return fmt.Errorf("insert txt node %q: %w", n.URI, err)
 			}
@@ -259,6 +263,7 @@ func (s *sqliteStore) ReplaceTXTFeedNodes(ctx context.Context, feedKey string, n
 				       region = CASE WHEN source = ? THEN ? ELSE region END,
 				       country = CASE WHEN source = ? THEN ? ELSE country END,
 				       enabled = CASE WHEN source = ? THEN ? ELSE enabled END,
+				       lifecycle_state = CASE WHEN source = ? THEN ? ELSE lifecycle_state END,
 				       updated_at = ?
 				 WHERE uri = ?`,
 				NodeSourceTXTSubscription, n.Name,
@@ -268,6 +273,7 @@ func (s *sqliteStore) ReplaceTXTFeedNodes(ctx context.Context, feedKey string, n
 				NodeSourceTXTSubscription, n.Region,
 				NodeSourceTXTSubscription, n.Country,
 				NodeSourceTXTSubscription, enabled,
+				NodeSourceTXTSubscription, lifecycleState,
 				now, n.URI,
 			); err != nil {
 				return fmt.Errorf("update txt node %q: %w", n.URI, err)
@@ -329,12 +335,13 @@ func (s *sqliteStore) BulkUpsertNodes(ctx context.Context, nodes []Node) error {
 	execFn := func(txStore *sqliteStore) error {
 		now := time.Now().UTC().Format(time.RFC3339)
 		stmt, err := txStore.conn().PrepareContext(ctx,
-			`INSERT INTO nodes (uri, name, source, feed_key, port, username, password, region, country, enabled, created_at, updated_at)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			`INSERT INTO nodes (uri, name, source, feed_key, port, username, password, region, country, enabled, lifecycle_state, created_at, updated_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			 ON CONFLICT(uri) DO UPDATE SET
 			   name=excluded.name, source=excluded.source, feed_key=excluded.feed_key, port=excluded.port,
 			   username=excluded.username, password=excluded.password,
 			   region=excluded.region, country=excluded.country,
+			   enabled=excluded.enabled, lifecycle_state=excluded.lifecycle_state,
 			   updated_at=excluded.updated_at`)
 		if err != nil {
 			return fmt.Errorf("prepare bulk upsert: %w", err)
@@ -343,14 +350,14 @@ func (s *sqliteStore) BulkUpsertNodes(ctx context.Context, nodes []Node) error {
 
 		for i := range nodes {
 			n := &nodes[i]
-			enabled := 0
-			if n.Enabled {
-				enabled = 1
-			}
+			lifecycleState := normalizeNodeLifecycle(n.LifecycleState, n.Enabled)
+			n.LifecycleState = lifecycleState
+			n.Enabled = lifecycleStateEnabled(lifecycleState)
+			enabled := boolToInt(n.Enabled)
 			result, err := stmt.ExecContext(ctx,
 				n.URI, n.Name, n.Source, n.FeedKey, n.Port,
 				n.Username, n.Password, n.Region, n.Country,
-				enabled, now, now,
+				enabled, lifecycleState, now, now,
 			)
 			if err != nil {
 				return fmt.Errorf("upsert node %q: %w", n.URI, err)
@@ -402,6 +409,10 @@ func (s *sqliteStore) CountNodes(ctx context.Context, filter NodeFilter) (int64,
 		} else {
 			args = append(args, 0)
 		}
+	}
+	if lifecycleState := strings.TrimSpace(filter.LifecycleState); lifecycleState != "" {
+		conditions = append(conditions, "lifecycle_state = ?")
+		args = append(args, lifecycleState)
 	}
 
 	if len(conditions) > 0 {
@@ -1021,7 +1032,7 @@ func scanNode(row *sql.Row) (*Node, error) {
 	err := row.Scan(
 		&n.ID, &n.URI, &n.Name, &n.Source, &n.FeedKey, &n.Port,
 		&n.Username, &n.Password, &n.Region, &n.Country,
-		&enabled, &createdAtStr, &updatedAtStr,
+		&enabled, &n.LifecycleState, &createdAtStr, &updatedAtStr,
 	)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -1030,7 +1041,8 @@ func scanNode(row *sql.Row) (*Node, error) {
 		return nil, err
 	}
 
-	n.Enabled = enabled != 0
+	n.LifecycleState = normalizeNodeLifecycle(n.LifecycleState, enabled != 0)
+	n.Enabled = lifecycleStateEnabled(n.LifecycleState)
 	n.CreatedAt = parseTime(createdAtStr)
 	n.UpdatedAt = parseTime(updatedAtStr)
 	return &n, nil
@@ -1046,18 +1058,150 @@ func scanNodes(rows *sql.Rows) ([]Node, error) {
 		err := rows.Scan(
 			&n.ID, &n.URI, &n.Name, &n.Source, &n.FeedKey, &n.Port,
 			&n.Username, &n.Password, &n.Region, &n.Country,
-			&enabled, &createdAtStr, &updatedAtStr,
+			&enabled, &n.LifecycleState, &createdAtStr, &updatedAtStr,
 		)
 		if err != nil {
 			return nil, err
 		}
 
-		n.Enabled = enabled != 0
+		n.LifecycleState = normalizeNodeLifecycle(n.LifecycleState, enabled != 0)
+		n.Enabled = lifecycleStateEnabled(n.LifecycleState)
 		n.CreatedAt = parseTime(createdAtStr)
 		n.UpdatedAt = parseTime(updatedAtStr)
 		nodes = append(nodes, n)
 	}
 	return nodes, rows.Err()
+}
+
+func (s *sqliteStore) BatchUpdateNodeLifecycle(ctx context.Context, nodeIDs []int64, lifecycleState string) error {
+	if len(nodeIDs) == 0 {
+		return nil
+	}
+
+	lifecycleState = normalizeNodeLifecycle(lifecycleState, true)
+	enabled := boolToInt(lifecycleStateEnabled(lifecycleState))
+	placeholders := make([]string, 0, len(nodeIDs))
+	args := make([]any, 0, len(nodeIDs)+3)
+	args = append(args, lifecycleState, enabled, time.Now().UTC().Format(time.RFC3339))
+	for _, nodeID := range nodeIDs {
+		placeholders = append(placeholders, "?")
+		args = append(args, nodeID)
+	}
+
+	_, err := s.conn().ExecContext(ctx,
+		fmt.Sprintf(
+			`UPDATE nodes
+			    SET lifecycle_state = ?, enabled = ?, updated_at = ?
+			  WHERE id IN (%s)`,
+			strings.Join(placeholders, ", "),
+		),
+		args...,
+	)
+	if err != nil {
+		return fmt.Errorf("batch update node lifecycle: %w", err)
+	}
+	return nil
+}
+
+func (s *sqliteStore) GetNodeManualProbeResult(ctx context.Context, nodeID int64) (*NodeManualProbeResult, error) {
+	row := s.conn().QueryRowContext(ctx,
+		`SELECT node_id, status, latency_ms, timed_out, message, checked_at, updated_at
+		   FROM node_manual_probe_results
+		  WHERE node_id = ?`,
+		nodeID,
+	)
+
+	var result NodeManualProbeResult
+	var timedOut int
+	var checkedAtStr, updatedAtStr string
+	err := row.Scan(
+		&result.NodeID,
+		&result.Status,
+		&result.LatencyMs,
+		&timedOut,
+		&result.Message,
+		&checkedAtStr,
+		&updatedAtStr,
+	)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get node manual probe result %d: %w", nodeID, err)
+	}
+
+	result.TimedOut = timedOut != 0
+	result.CheckedAt = parseTime(checkedAtStr)
+	result.UpdatedAt = parseTime(updatedAtStr)
+	return &result, nil
+}
+
+func (s *sqliteStore) GetAllNodeManualProbeResults(ctx context.Context) (map[int64]*NodeManualProbeResult, error) {
+	rows, err := s.conn().QueryContext(ctx,
+		`SELECT node_id, status, latency_ms, timed_out, message, checked_at, updated_at
+		   FROM node_manual_probe_results`,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("get all node manual probe results: %w", err)
+	}
+	defer rows.Close()
+
+	results := make(map[int64]*NodeManualProbeResult)
+	for rows.Next() {
+		var result NodeManualProbeResult
+		var timedOut int
+		var checkedAtStr, updatedAtStr string
+		if err := rows.Scan(
+			&result.NodeID,
+			&result.Status,
+			&result.LatencyMs,
+			&timedOut,
+			&result.Message,
+			&checkedAtStr,
+			&updatedAtStr,
+		); err != nil {
+			return nil, fmt.Errorf("scan node manual probe result: %w", err)
+		}
+		result.TimedOut = timedOut != 0
+		result.CheckedAt = parseTime(checkedAtStr)
+		result.UpdatedAt = parseTime(updatedAtStr)
+		copied := result
+		results[result.NodeID] = &copied
+	}
+	return results, rows.Err()
+}
+
+func (s *sqliteStore) SaveNodeManualProbeResult(ctx context.Context, result *NodeManualProbeResult) error {
+	if result == nil {
+		return nil
+	}
+
+	if result.Status == "" {
+		result.Status = ManualProbeStatusUntested
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	_, err := s.conn().ExecContext(ctx,
+		`INSERT INTO node_manual_probe_results (node_id, status, latency_ms, timed_out, message, checked_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(node_id) DO UPDATE SET
+		   status=excluded.status,
+		   latency_ms=excluded.latency_ms,
+		   timed_out=excluded.timed_out,
+		   message=excluded.message,
+		   checked_at=excluded.checked_at,
+		   updated_at=excluded.updated_at`,
+		result.NodeID,
+		result.Status,
+		result.LatencyMs,
+		boolToInt(result.TimedOut),
+		result.Message,
+		formatTime(result.CheckedAt),
+		now,
+	)
+	if err != nil {
+		return fmt.Errorf("save node manual probe result %d: %w", result.NodeID, err)
+	}
+	return nil
 }
 
 func parseTime(s string) time.Time {
@@ -1087,4 +1231,29 @@ func boolToInt(b bool) int {
 		return 1
 	}
 	return 0
+}
+
+func normalizeNodeLifecycle(lifecycleState string, enabled bool) string {
+	switch strings.TrimSpace(lifecycleState) {
+	case NodeLifecycleActive:
+		return NodeLifecycleActive
+	case NodeLifecycleStaged:
+		return NodeLifecycleStaged
+	case NodeLifecycleDisabled:
+		return NodeLifecycleDisabled
+	default:
+		if enabled {
+			return NodeLifecycleActive
+		}
+		return NodeLifecycleDisabled
+	}
+}
+
+func lifecycleStateEnabled(lifecycleState string) bool {
+	switch strings.TrimSpace(lifecycleState) {
+	case NodeLifecycleActive, NodeLifecycleStaged:
+		return true
+	default:
+		return false
+	}
 }

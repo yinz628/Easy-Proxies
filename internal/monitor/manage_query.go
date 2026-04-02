@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"easy_proxies/internal/config"
+	"easy_proxies/internal/store"
 )
 
 type ManageSortKey string
@@ -32,15 +33,18 @@ const (
 var errInvalidManageSelection = errors.New("invalid manage selection")
 
 type ManageQuery struct {
-	Page          int
-	PageSize      int
-	Keyword       string
-	Status        string
-	Region        string
-	Source        string
-	QualityStatus string
-	SortKey       ManageSortKey
-	SortDir       string
+	Page              int
+	PageSize          int
+	Keyword           string
+	Status            string
+	Region            string
+	Source            string
+	LifecycleState    string
+	ManualProbeStatus string
+	ActivationReady   string
+	QualityStatus     string
+	SortKey           ManageSortKey
+	SortDir           string
 }
 
 type ManageRow struct {
@@ -51,9 +55,16 @@ type ManageRow struct {
 	Password               string `json:"password"`
 	Source                 string `json:"source,omitempty"`
 	Disabled               bool   `json:"disabled,omitempty"`
+	LifecycleState         string `json:"lifecycle_state,omitempty"`
 	RuntimeStatus          string `json:"runtime_status"`
 	Tag                    string `json:"tag,omitempty"`
 	LatencyMS              int64  `json:"latency_ms"`
+	ManualProbeStatus      string `json:"manual_probe_status"`
+	ManualProbeLatencyMS   int64  `json:"manual_probe_latency_ms"`
+	ManualProbeChecked     *int64 `json:"manual_probe_checked,omitempty"`
+	ManualProbeMessage     string `json:"manual_probe_message,omitempty"`
+	ActivationReady        bool   `json:"activation_ready"`
+	ActivationBlockReason  string `json:"activation_block_reason,omitempty"`
 	Region                 string `json:"region,omitempty"`
 	Country                string `json:"country,omitempty"`
 	ActiveConnections      int    `json:"active_connections"`
@@ -81,9 +92,12 @@ type ManageSelection struct {
 }
 
 type ManageFacets struct {
-	Regions         []string `json:"regions"`
-	Sources         []string `json:"sources"`
-	QualityStatuses []string `json:"quality_statuses"`
+	Regions             []string `json:"regions"`
+	Sources             []string `json:"sources"`
+	LifecycleStates     []string `json:"lifecycle_states"`
+	ManualProbeStatuses []string `json:"manual_probe_statuses"`
+	ActivationReadiness []string `json:"activation_readiness"`
+	QualityStatuses     []string `json:"quality_statuses"`
 }
 
 type ManageListResponse struct {
@@ -124,7 +138,10 @@ func BuildManageRows(configNodes []config.NodeConfig, snapshots []Snapshot) []Ma
 			Password:               node.Password,
 			Source:                 string(node.Source),
 			Disabled:               node.Disabled,
+			LifecycleState:         normalizeManageLifecycleState(node.LifecycleState, node.Disabled),
 			LatencyMS:              -1,
+			ManualProbeStatus:      store.ManualProbeStatusUntested,
+			ManualProbeLatencyMS:   -1,
 			RuntimeStatus:          "pending",
 			QualityVersion:         node.QualityVersion,
 			QualityStatus:          node.QualityStatus,
@@ -140,6 +157,7 @@ func BuildManageRows(configNodes []config.NodeConfig, snapshots []Snapshot) []Ma
 			ExitRegion:             node.ExitRegion,
 		}
 		applyManageQualityCompatibility(&row)
+		applyManageActivationState(&row)
 
 		if node.Disabled {
 			row.RuntimeStatus = "disabled"
@@ -168,6 +186,43 @@ func BuildManageRows(configNodes []config.NodeConfig, snapshots []Snapshot) []Ma
 	}
 
 	return rows
+}
+
+func ApplyManageManualProbeResults(rows []ManageRow, storeNodes []store.Node, results map[int64]*store.NodeManualProbeResult) {
+	if len(rows) == 0 || len(storeNodes) == 0 || len(results) == 0 {
+		return
+	}
+
+	resultsByURI := make(map[string]*store.NodeManualProbeResult, len(results))
+	resultsByName := make(map[string]*store.NodeManualProbeResult, len(results))
+	for _, node := range storeNodes {
+		result := results[node.ID]
+		if result == nil {
+			continue
+		}
+
+		if uriKey := normalizeLookupKey(node.URI); uriKey != "" {
+			if _, exists := resultsByURI[uriKey]; !exists {
+				resultsByURI[uriKey] = result
+			}
+		}
+		if nameKey := normalizeLookupKey(node.Name); nameKey != "" {
+			if _, exists := resultsByName[nameKey]; !exists {
+				resultsByName[nameKey] = result
+			}
+		}
+	}
+
+	for idx := range rows {
+		result, ok := resultsByURI[normalizeLookupKey(rows[idx].URI)]
+		if !ok {
+			result, ok = resultsByName[normalizeLookupKey(rows[idx].Name)]
+		}
+		if !ok {
+			continue
+		}
+		applyManageManualProbeResult(&rows[idx], result)
+	}
 }
 
 func QueryManageRows(rows []ManageRow, query ManageQuery) ManageListResponse {
@@ -256,15 +311,18 @@ func ResolveManageSelection(rows []ManageRow, selection ManageSelection) ([]Mana
 
 func parseManageQuery(values url.Values) (ManageQuery, error) {
 	query := ManageQuery{
-		Page:          defaultManagePage,
-		PageSize:      defaultManagePageSize,
-		Keyword:       strings.TrimSpace(values.Get("keyword")),
-		Status:        strings.TrimSpace(values.Get("status")),
-		Region:        strings.TrimSpace(values.Get("region")),
-		Source:        strings.TrimSpace(values.Get("source")),
-		QualityStatus: strings.TrimSpace(values.Get("quality_status")),
-		SortKey:       ManageSortKey(strings.TrimSpace(values.Get("sort_key"))),
-		SortDir:       strings.TrimSpace(values.Get("sort_dir")),
+		Page:              defaultManagePage,
+		PageSize:          defaultManagePageSize,
+		Keyword:           strings.TrimSpace(values.Get("keyword")),
+		Status:            strings.TrimSpace(values.Get("status")),
+		Region:            strings.TrimSpace(values.Get("region")),
+		Source:            strings.TrimSpace(values.Get("source")),
+		LifecycleState:    strings.TrimSpace(values.Get("lifecycle_state")),
+		ManualProbeStatus: strings.TrimSpace(values.Get("manual_probe_status")),
+		ActivationReady:   strings.TrimSpace(values.Get("activation_ready")),
+		QualityStatus:     strings.TrimSpace(values.Get("quality_status")),
+		SortKey:           ManageSortKey(strings.TrimSpace(values.Get("sort_key"))),
+		SortDir:           strings.TrimSpace(values.Get("sort_dir")),
 	}
 
 	if page := strings.TrimSpace(values.Get("page")); page != "" {
@@ -301,6 +359,12 @@ func normalizeManageQuery(query ManageQuery) ManageQuery {
 	normalized.Status = strings.TrimSpace(normalized.Status)
 	normalized.Region = strings.TrimSpace(normalized.Region)
 	normalized.Source = strings.TrimSpace(normalized.Source)
+	normalized.LifecycleState = strings.TrimSpace(normalized.LifecycleState)
+	normalized.ManualProbeStatus = strings.TrimSpace(normalized.ManualProbeStatus)
+	if normalized.ManualProbeStatus != "" {
+		normalized.ManualProbeStatus = normalizeManualProbeStatus(normalized.ManualProbeStatus)
+	}
+	normalized.ActivationReady = normalizeManageActivationReadyFilter(normalized.ActivationReady)
 	normalized.QualityStatus = strings.TrimSpace(normalized.QualityStatus)
 	if !isValidManageSortKey(normalized.SortKey) {
 		normalized.SortKey = ManageSortByName
@@ -342,6 +406,15 @@ func filterManageRows(rows []ManageRow, query ManageQuery) []ManageRow {
 		if query.Source != "" && row.Source != query.Source {
 			continue
 		}
+		if query.LifecycleState != "" && row.LifecycleState != query.LifecycleState {
+			continue
+		}
+		if query.ManualProbeStatus != "" && row.ManualProbeStatus != query.ManualProbeStatus {
+			continue
+		}
+		if query.ActivationReady != "" && activationReadyFacetValue(row.ActivationReady) != query.ActivationReady {
+			continue
+		}
 		if query.QualityStatus != "" && row.QualityStatus != query.QualityStatus {
 			continue
 		}
@@ -368,6 +441,9 @@ func buildManageSummary(rows []ManageRow) map[string]int {
 func buildManageFacets(rows []ManageRow) ManageFacets {
 	regionSet := make(map[string]struct{})
 	sourceSet := make(map[string]struct{})
+	lifecycleStateSet := make(map[string]struct{})
+	manualProbeStatusSet := make(map[string]struct{})
+	activationReadySet := make(map[string]struct{})
 	qualityStatusSet := make(map[string]struct{})
 
 	for _, row := range rows {
@@ -377,6 +453,13 @@ func buildManageFacets(rows []ManageRow) ManageFacets {
 		if row.Source != "" {
 			sourceSet[row.Source] = struct{}{}
 		}
+		if row.LifecycleState != "" {
+			lifecycleStateSet[row.LifecycleState] = struct{}{}
+		}
+		if row.ManualProbeStatus != "" {
+			manualProbeStatusSet[row.ManualProbeStatus] = struct{}{}
+		}
+		activationReadySet[activationReadyFacetValue(row.ActivationReady)] = struct{}{}
 		if row.QualityStatus != "" {
 			qualityStatusSet[row.QualityStatus] = struct{}{}
 		}
@@ -390,6 +473,18 @@ func buildManageFacets(rows []ManageRow) ManageFacets {
 	for source := range sourceSet {
 		sources = append(sources, source)
 	}
+	lifecycleStates := make([]string, 0, len(lifecycleStateSet))
+	for lifecycleState := range lifecycleStateSet {
+		lifecycleStates = append(lifecycleStates, lifecycleState)
+	}
+	manualProbeStatuses := make([]string, 0, len(manualProbeStatusSet))
+	for manualProbeStatus := range manualProbeStatusSet {
+		manualProbeStatuses = append(manualProbeStatuses, manualProbeStatus)
+	}
+	activationReadiness := make([]string, 0, len(activationReadySet))
+	for readiness := range activationReadySet {
+		activationReadiness = append(activationReadiness, readiness)
+	}
 	qualityStatuses := make([]string, 0, len(qualityStatusSet))
 	for status := range qualityStatusSet {
 		qualityStatuses = append(qualityStatuses, status)
@@ -397,12 +492,18 @@ func buildManageFacets(rows []ManageRow) ManageFacets {
 
 	slices.Sort(regions)
 	slices.Sort(sources)
+	slices.Sort(lifecycleStates)
+	slices.Sort(manualProbeStatuses)
+	slices.Sort(activationReadiness)
 	slices.Sort(qualityStatuses)
 
 	return ManageFacets{
-		Regions:         regions,
-		Sources:         sources,
-		QualityStatuses: qualityStatuses,
+		Regions:             regions,
+		Sources:             sources,
+		LifecycleStates:     lifecycleStates,
+		ManualProbeStatuses: manualProbeStatuses,
+		ActivationReadiness: activationReadiness,
+		QualityStatuses:     qualityStatuses,
 	}
 }
 
@@ -530,6 +631,21 @@ func applyManageQualityCompatibility(row *ManageRow) {
 	row.ExitRegion = ""
 }
 
+func applyManageManualProbeResult(row *ManageRow, result *store.NodeManualProbeResult) {
+	if row == nil || result == nil {
+		return
+	}
+
+	row.ManualProbeStatus = result.Status
+	row.ManualProbeLatencyMS = result.LatencyMs
+	row.ManualProbeMessage = result.Message
+	if !result.CheckedAt.IsZero() {
+		checked := result.CheckedAt.Unix()
+		row.ManualProbeChecked = &checked
+	}
+	applyManageActivationState(row)
+}
+
 func hasLegacyManageQualityResult(row *ManageRow) bool {
 	if row == nil {
 		return false
@@ -545,4 +661,37 @@ func hasLegacyManageQualityResult(row *ManageRow) bool {
 		row.ExitCountry != "" ||
 		row.ExitCountryCode != "" ||
 		row.ExitRegion != ""
+}
+
+func applyManageActivationState(row *ManageRow) {
+	if row == nil {
+		return
+	}
+
+	row.ActivationReady, row.ActivationBlockReason = deriveActivationState(
+		row.ManualProbeStatus,
+		row.QualityOpenAIStatus,
+		row.QualityAnthropicStatus,
+	)
+}
+
+func normalizeManageActivationReadyFilter(value string) string {
+	switch strings.TrimSpace(strings.ToLower(value)) {
+	case activationReadyReady, "true", "1", "yes":
+		return activationReadyReady
+	case activationReadyBlocked, "false", "0", "no":
+		return activationReadyBlocked
+	default:
+		return ""
+	}
+}
+
+func normalizeManageLifecycleState(value string, disabled bool) string {
+	if value = strings.TrimSpace(value); value != "" {
+		return value
+	}
+	if disabled {
+		return store.NodeLifecycleDisabled
+	}
+	return store.NodeLifecycleActive
 }

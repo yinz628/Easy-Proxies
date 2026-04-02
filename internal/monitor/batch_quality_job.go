@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"easy_proxies/internal/config"
 	"easy_proxies/internal/store"
 )
 
@@ -25,8 +26,10 @@ var ErrBatchQualityJobRunning = errors.New("a batch quality job is already runni
 const defaultBatchQualityCheckTimeout = 45 * time.Second
 
 type BatchQualityTarget struct {
-	Tag  string
-	Name string
+	Tag         string
+	Name        string
+	StoreNodeID int64
+	ConfigNode  config.NodeConfig
 }
 
 type BatchQualityJobResult struct {
@@ -37,6 +40,8 @@ type BatchQualityJobResult struct {
 	QualityStatus          string                       `json:"quality_status,omitempty"`
 	QualityOpenAIStatus    string                       `json:"quality_openai_status,omitempty"`
 	QualityAnthropicStatus string                       `json:"quality_anthropic_status,omitempty"`
+	ActivationReady        bool                         `json:"activation_ready"`
+	ActivationBlockReason  string                       `json:"activation_block_reason,omitempty"`
 	QualityScore           *int                         `json:"quality_score,omitempty"`
 	QualityGrade           string                       `json:"quality_grade,omitempty"`
 	QualitySummary         string                       `json:"quality_summary,omitempty"`
@@ -280,6 +285,8 @@ func batchQualityJobResultFromStore(target BatchQualityTarget, check *store.Node
 	result.QualityStatus = check.QualityStatus
 	result.QualityOpenAIStatus = check.QualityOpenAIStatus
 	result.QualityAnthropicStatus = check.QualityAnthropicStatus
+	result.ActivationReady = check.ActivationReady
+	result.ActivationBlockReason = check.ActivationBlockReason
 	if check.QualityScore != nil {
 		score := *check.QualityScore
 		result.QualityScore = &score

@@ -5,6 +5,7 @@ import (
 
 	"easy_proxies/internal/config"
 	"easy_proxies/internal/quality"
+	"easy_proxies/internal/store"
 )
 
 func TestBuildManageRowsMergesConfigAndRuntimeState(t *testing.T) {
@@ -299,5 +300,56 @@ func TestQueryManageRowsFiltersByQualityStatus(t *testing.T) {
 	}
 	if len(result.Items) != 1 || result.Items[0].Name != "beta" {
 		t.Fatalf("result.Items = %#v, want beta", result.Items)
+	}
+}
+
+func TestQueryManageRowsFiltersByLifecycleManualProbeAndActivationReady(t *testing.T) {
+	rows := []ManageRow{
+		{
+			Name:                  "staged-ready",
+			RuntimeStatus:         "pending",
+			LifecycleState:        store.NodeLifecycleStaged,
+			ManualProbeStatus:     store.ManualProbeStatusPass,
+			ActivationReady:       true,
+			ActivationBlockReason: "",
+		},
+		{
+			Name:                  "staged-blocked",
+			RuntimeStatus:         "pending",
+			LifecycleState:        store.NodeLifecycleStaged,
+			ManualProbeStatus:     store.ManualProbeStatusFail,
+			ActivationReady:       false,
+			ActivationBlockReason: "手工探测失败",
+		},
+		{
+			Name:                  "active-ready",
+			RuntimeStatus:         "normal",
+			LifecycleState:        store.NodeLifecycleActive,
+			ManualProbeStatus:     store.ManualProbeStatusPass,
+			ActivationReady:       true,
+			ActivationBlockReason: "",
+		},
+	}
+
+	result := QueryManageRows(rows, ManageQuery{
+		LifecycleState:   store.NodeLifecycleStaged,
+		ManualProbeStatus: store.ManualProbeStatusPass,
+		ActivationReady:  "ready",
+	})
+
+	if result.FilteredTotal != 1 {
+		t.Fatalf("result.FilteredTotal = %d, want 1", result.FilteredTotal)
+	}
+	if len(result.Items) != 1 || result.Items[0].Name != "staged-ready" {
+		t.Fatalf("result.Items = %#v, want staged-ready", result.Items)
+	}
+	if len(result.Facets.LifecycleStates) != 2 {
+		t.Fatalf("result.Facets.LifecycleStates = %#v, want 2 states", result.Facets.LifecycleStates)
+	}
+	if len(result.Facets.ManualProbeStatuses) != 2 {
+		t.Fatalf("result.Facets.ManualProbeStatuses = %#v, want 2 statuses", result.Facets.ManualProbeStatuses)
+	}
+	if len(result.Facets.ActivationReadiness) != 2 {
+		t.Fatalf("result.Facets.ActivationReadiness = %#v, want ready/blocked", result.Facets.ActivationReadiness)
 	}
 }

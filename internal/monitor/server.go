@@ -35,7 +35,14 @@ type Session struct {
 	ExpiresAt time.Time
 }
 
-// NodeManager exposes config node CRUD and reload operations.
+// NodeManager exposes config node CRUD, reload operations, and temporary
+// runtime creation for store-backed nodes that are not loaded into runtime.
+type ConfigNodeRuntime interface {
+	Probe(ctx context.Context) (time.Duration, error)
+	HTTPRequest(ctx context.Context, method, rawURL string, headers map[string]string, maxBodyBytes int64) (*HTTPCheckResult, error)
+	Close() error
+}
+
 type NodeManager interface {
 	ListConfigNodes(ctx context.Context) ([]config.NodeConfig, error)
 	CreateNode(ctx context.Context, node config.NodeConfig) (config.NodeConfig, error)
@@ -43,6 +50,7 @@ type NodeManager interface {
 	DeleteNode(ctx context.Context, name string) error
 	SetNodeEnabled(ctx context.Context, name string, enabled bool) error
 	TriggerReload(ctx context.Context) error
+	CreateConfigNodeRuntime(ctx context.Context, node config.NodeConfig) (ConfigNodeRuntime, error)
 }
 
 // Sentinel errors for node operations.
@@ -775,7 +783,7 @@ func (s *Server) handleNodeAction(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
-		checker := NewQualityChecker(s.mgr, s.store)
+		checker := NewQualityChecker(s.mgr, s.store, s.nodeMgr)
 		result, err := checker.CheckNode(r.Context(), tag)
 		if err != nil {
 			writeJSON(w, map[string]any{"error": err.Error()})
@@ -1059,14 +1067,14 @@ func (s *Server) handleQualityCheckBatch(w http.ResponseWriter, r *http.Request)
 	}
 	if s.store == nil {
 		w.WriteHeader(http.StatusServiceUnavailable)
-		writeJSON(w, map[string]any{"error": "数据存储未初始化"})
+		writeJSON(w, map[string]any{"error": "no eligible nodes"})
 		return
 	}
 
 	var req manageSelectionRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(http.StatusBadRequest)
-		writeJSON(w, map[string]any{"error": "请求格式错误"})
+		writeJSON(w, map[string]any{"error": "invalid request body"})
 		return
 	}
 	if usesNodeManagerSelection(req) && !s.ensureNodeManager(w) {
@@ -1076,45 +1084,29 @@ func (s *Server) handleQualityCheckBatch(w http.ResponseWriter, r *http.Request)
 	selectedRows, err := s.resolveSelectionRequest(r.Context(), req)
 	if err != nil {
 		w.WriteHeader(http.StatusBadRequest)
-		writeJSON(w, map[string]any{"error": "没有可检测的节点"})
+		writeJSON(w, map[string]any{"error": "no eligible nodes"})
 		return
 	}
 
-	selectedTags := tagsFromRows(selectedRows)
-	if len(selectedTags) == 0 {
-		w.WriteHeader(http.StatusBadRequest)
-		writeJSON(w, map[string]any{"error": "没有可检测的节点"})
+	targets, err := s.resolveBatchQualityTargets(r.Context(), selectedRows)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		writeJSON(w, map[string]any{"error": err.Error()})
 		return
-	}
-
-	snapshotByTag := make(map[string]Snapshot)
-	for _, snap := range s.mgr.Snapshot() {
-		if snap.Tag != "" {
-			snapshotByTag[snap.Tag] = snap
-		}
-	}
-
-	checker := NewQualityChecker(s.mgr, s.store)
-	targets := make([]BatchQualityTarget, 0, len(selectedTags))
-	for _, tag := range selectedTags {
-		snap, ok := snapshotByTag[tag]
-		if !ok {
-			continue
-		}
-		targets = append(targets, BatchQualityTarget{Tag: snap.Tag, Name: snap.Name})
 	}
 	if len(targets) == 0 {
 		w.WriteHeader(http.StatusBadRequest)
-		writeJSON(w, map[string]any{"error": "没有可检测的节点"})
+		writeJSON(w, map[string]any{"error": "no eligible nodes"})
 		return
 	}
 
+	checker := NewQualityChecker(s.mgr, s.store, s.nodeMgr)
 	job, err := s.qualityJobs.Start(targets, func(ctx context.Context, target BatchQualityTarget) (*store.NodeQualityCheck, error) {
 		if err := s.qualitySem.Acquire(ctx, 1); err != nil {
 			return nil, fmt.Errorf("quality check cancelled: %w", err)
 		}
 		defer s.qualitySem.Release(1)
-		return checker.CheckNode(ctx, target.Tag)
+		return checker.CheckTarget(ctx, target)
 	})
 	if err != nil {
 		if errors.Is(err, ErrBatchQualityJobRunning) {
@@ -1400,7 +1392,7 @@ func (s *Server) handleProbeBatchStartV2(w http.ResponseWriter, r *http.Request)
 	var req manageSelectionRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(http.StatusBadRequest)
-		writeJSON(w, map[string]any{"error": "璇锋眰鏍煎紡閿欒"})
+		writeJSON(w, map[string]any{"error": "invalid request body"})
 		return
 	}
 	if usesNodeManagerSelection(req) && !s.ensureNodeManager(w) {
@@ -1410,37 +1402,23 @@ func (s *Server) handleProbeBatchStartV2(w http.ResponseWriter, r *http.Request)
 	selectedRows, err := s.resolveSelectionRequest(r.Context(), req)
 	if err != nil {
 		w.WriteHeader(http.StatusBadRequest)
-		writeJSON(w, map[string]any{"error": "娌℃湁鍙帰娴嬬殑鑺傜偣"})
+		writeJSON(w, map[string]any{"error": "no eligible nodes"})
 		return
 	}
 
-	requestedTags := tagsFromRows(selectedRows)
-	if len(requestedTags) == 0 {
+	targets, err := s.resolveBatchProbeTargets(r.Context(), selectedRows)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		writeJSON(w, map[string]any{"error": err.Error()})
+		return
+	}
+	if len(targets) == 0 {
 		w.WriteHeader(http.StatusBadRequest)
-		writeJSON(w, map[string]any{"error": "娌℃湁鍙帰娴嬬殑鑺傜偣"})
+		writeJSON(w, map[string]any{"error": "no eligible nodes"})
 		return
 	}
 
-	snapshotsByTag := make(map[string]BatchProbeTarget)
-	for _, snap := range s.mgr.Snapshot() {
-		if snap.Tag != "" {
-			snapshotsByTag[snap.Tag] = BatchProbeTarget{Tag: snap.Tag, Name: snap.Name}
-		}
-	}
-
-	filtered := make([]BatchProbeTarget, 0, len(requestedTags))
-	for _, tag := range requestedTags {
-		if snap, ok := snapshotsByTag[tag]; ok {
-			filtered = append(filtered, snap)
-		}
-	}
-	if len(filtered) == 0 {
-		w.WriteHeader(http.StatusBadRequest)
-		writeJSON(w, map[string]any{"error": "娌℃湁鍙帰娴嬬殑鑺傜偣"})
-		return
-	}
-
-	job, err := s.probeJobs.Start(filtered, func(ctx context.Context, target BatchProbeTarget) (int64, error) {
+	job, err := s.probeJobs.Start(targets, func(ctx context.Context, target BatchProbeTarget) (int64, error) {
 		probeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		defer cancel()
 
@@ -1449,11 +1427,7 @@ func (s *Server) handleProbeBatchStartV2(w http.ResponseWriter, r *http.Request)
 		}
 		defer s.probeSem.Release(1)
 
-		latency, err := s.mgr.Probe(probeCtx, target.Tag)
-		if err != nil {
-			return -1, err
-		}
-		return latency.Milliseconds(), nil
+		return s.runManualProbeAndPersist(probeCtx, target)
 	})
 	if err != nil {
 		if errors.Is(err, ErrBatchProbeJobRunning) {
@@ -1755,6 +1729,116 @@ func (s *Server) snapshotByTag(tag string) (Snapshot, bool) {
 		}
 	}
 	return Snapshot{}, false
+}
+
+func resolveStoreNodeForManageRow(row ManageRow, nodesByURI, nodesByName map[string]*store.Node) *store.Node {
+	if node := nodesByURI[normalizeLookupKey(row.URI)]; node != nil {
+		return node
+	}
+	if node := nodesByName[normalizeLookupKey(row.Name)]; node != nil {
+		return node
+	}
+	return nil
+}
+
+func (s *Server) runManualProbeAndPersistByTag(ctx context.Context, tag string) (int64, error) {
+	snapshot, found := s.snapshotByTag(tag)
+	latency, err := s.mgr.Probe(ctx, tag)
+	resultErr := err
+	if resultErr == nil {
+		if latencyErr := ProbeLatencyError(latency); latencyErr != nil {
+			resultErr = manualProbeTimeoutError()
+		}
+	} else if isManualProbeTimeoutError(resultErr) {
+		resultErr = manualProbeTimeoutError()
+	}
+
+	if s.store != nil && found {
+		node, lookupErr := s.lookupStoreNodeForSnapshot(ctx, snapshot)
+		if lookupErr != nil {
+			return -1, lookupErr
+		}
+		if node != nil {
+			if saveErr := s.store.SaveNodeManualProbeResult(ctx, buildManualProbeResult(node.ID, latency, resultErr)); saveErr != nil {
+				return -1, saveErr
+			}
+		}
+	}
+
+	if resultErr != nil {
+		return -1, resultErr
+	}
+	return normalizeProbeLatencyMS(latency), nil
+}
+
+func (s *Server) lookupStoreNodeForSnapshot(ctx context.Context, snapshot Snapshot) (*store.Node, error) {
+	if s.store == nil {
+		return nil, nil
+	}
+
+	if uri := strings.TrimSpace(snapshot.URI); uri != "" {
+		node, err := s.store.GetNodeByURI(ctx, uri)
+		if err != nil || node != nil {
+			return node, err
+		}
+	}
+	if name := strings.TrimSpace(snapshot.Name); name != "" {
+		return s.store.GetNodeByName(ctx, name)
+	}
+	return nil, nil
+}
+
+func buildManualProbeResult(nodeID int64, latency time.Duration, err error) *store.NodeManualProbeResult {
+	result := &store.NodeManualProbeResult{
+		NodeID:    nodeID,
+		Status:    store.ManualProbeStatusPass,
+		LatencyMs: normalizeProbeLatencyMS(latency),
+		CheckedAt: time.Now().UTC(),
+	}
+	if err == nil {
+		return result
+	}
+
+	result.LatencyMs = 0
+	result.Message = err.Error()
+	if isManualProbeTimeoutError(err) {
+		result.Status = store.ManualProbeStatusTimeout
+		result.TimedOut = true
+		result.Message = manualProbeTimeoutError().Error()
+		return result
+	}
+
+	result.Status = store.ManualProbeStatusFail
+	return result
+}
+
+func normalizeProbeLatencyMS(latency time.Duration) int64 {
+	if latency <= 0 {
+		return 0
+	}
+	latencyMS := latency.Milliseconds()
+	if latencyMS == 0 {
+		return 1
+	}
+	return latencyMS
+}
+
+func manualProbeTimeoutError() error {
+	return fmt.Errorf("probe timeout after %dms", MaxAcceptedProbeLatency.Milliseconds())
+}
+
+func isManualProbeTimeoutError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "timeout") ||
+		strings.Contains(message, "deadline exceeded") ||
+		strings.Contains(message, "probe exceeded")
 }
 
 // withAuth 认证中间件，如果配置了密码则需要验证
