@@ -1,79 +1,48 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import type { ManageListResponse } from '../src/types/index.ts'
 import {
-  buildManageFilterSnapshot,
-  buildManageQueryKey,
-  normalizeManageQuery,
-  resolveManageResponsePage,
+  canSelectFilteredResults,
+  defaultManageQuery,
+  hasActiveManageFilters,
+  hasPendingManageKeywordChange,
+  resolveVisibleManageQuery,
 } from '../src/components/managePanelQuery.ts'
 
-test('buildManageQueryKey normalizes default query values', () => {
-  const keyA = buildManageQueryKey(normalizeManageQuery())
-  const keyB = buildManageQueryKey({
-    page: 1,
-    page_size: 100,
-    keyword: '   ',
-    status: '',
-    region: '',
-    source: '',
-    quality_status: '',
-    sort_key: 'name',
-    sort_dir: 'asc',
-  })
+test('resolveVisibleManageQuery uses latest keyword input before debounce sync', () => {
+  const visible = resolveVisibleManageQuery({
+    ...defaultManageQuery,
+    keyword: '',
+    status: 'normal',
+  }, ' hk ')
 
-  assert.equal(keyA, keyB)
+  assert.equal(visible.keyword, 'hk')
+  assert.equal(visible.status, 'normal')
 })
 
-test('buildManageFilterSnapshot strips page and sort fields from query state', () => {
-  const snapshot = buildManageFilterSnapshot({
-    page: 9,
-    page_size: 20,
-    keyword: ' hk ',
-    status: 'normal',
-    region: 'hk',
-    source: 'manual',
-    quality_status: 'healthy',
-    sort_key: 'latency',
-    sort_dir: 'desc',
-  })
+test('hasPendingManageKeywordChange detects unsynced keyword input', () => {
+  assert.equal(hasPendingManageKeywordChange(defaultManageQuery, ''), false)
+  assert.equal(hasPendingManageKeywordChange(defaultManageQuery, 'us'), true)
+  assert.equal(hasPendingManageKeywordChange({
+    ...defaultManageQuery,
+    keyword: 'jp',
+  }, 'jp'), false)
+})
 
-  assert.deepEqual(snapshot, {
+test('hasActiveManageFilters treats pending keyword input as an active filter', () => {
+  assert.equal(hasActiveManageFilters(defaultManageQuery, ''), false)
+  assert.equal(hasActiveManageFilters(defaultManageQuery, 'sg'), true)
+  assert.equal(hasActiveManageFilters({
+    ...defaultManageQuery,
+    lifecycle_state: 'staged',
+  }, ''), true)
+})
+
+test('canSelectFilteredResults blocks full selection when filter is empty or pending', () => {
+  assert.equal(canSelectFilteredResults(defaultManageQuery, '', 68), false)
+  assert.equal(canSelectFilteredResults(defaultManageQuery, 'hk', 68), false)
+  assert.equal(canSelectFilteredResults({
+    ...defaultManageQuery,
     keyword: 'hk',
-    status: 'normal',
-    region: 'hk',
-    source: 'manual',
-    quality_status: 'healthy',
-  })
-})
-
-test('resolveManageResponsePage clamps an empty out-of-range result back to page one', () => {
-  const page = resolveManageResponsePage(
-    normalizeManageQuery({
-      page: 3,
-      page_size: 100,
-    }),
-    {
-      items: [],
-      page: 3,
-      page_size: 100,
-      total: 0,
-      filtered_total: 0,
-      summary: {
-        normal: 0,
-        pending: 0,
-        unavailable: 0,
-        blacklisted: 0,
-        disabled: 0,
-      },
-      facets: {
-        regions: [],
-        sources: [],
-        quality_statuses: [],
-      },
-    } satisfies ManageListResponse,
-  )
-
-  assert.equal(page, 1)
+  }, 'hk', 12), true)
 })

@@ -54,7 +54,11 @@ import type { BatchQualityState } from './managePanelQuality.ts'
 import {
   buildManageFilterSnapshot,
   buildManageQueryKey,
+  canSelectFilteredResults,
+  hasActiveManageFilters,
+  hasPendingManageKeywordChange,
   normalizeManageQuery,
+  resolveVisibleManageQuery,
   resolveManageResponsePage,
 } from './managePanelQuery.ts'
 import {
@@ -441,7 +445,7 @@ export default function ManagePanelPage() {
 
   useEffect(() => {
     if (selection.mode !== 'filter') return
-    const current = buildManageFilterSnapshot(query)
+    const current = buildManageFilterSnapshot(resolveVisibleManageQuery(query, keywordInput))
     if (
       selection.filter.keyword !== current.keyword
       || selection.filter.status !== current.status
@@ -454,7 +458,7 @@ export default function ManagePanelPage() {
     ) {
       setSelection(createEmptySelection())
     }
-  }, [query, selection])
+  }, [keywordInput, query, selection])
 
   const loadManagePage = useCallback(async (nextQuery: ManageQuery, force = false) => {
     const normalized = normalizeManageQuery(nextQuery)
@@ -658,14 +662,15 @@ export default function ManagePanelPage() {
   const activationReadyOptions = pageData?.facets.activation_readiness ?? []
   const qualityStatusOptions = pageData?.facets.quality_statuses ?? []
   const currentPageNames = useMemo(() => nodes.map(node => node.name), [nodes])
-  const currentFilter = useMemo(() => buildManageFilterSnapshot(query), [query])
+  const visibleQuery = useMemo(() => resolveVisibleManageQuery(query, keywordInput), [keywordInput, query])
+  const currentFilter = useMemo(() => buildManageFilterSnapshot(visibleQuery), [visibleQuery])
   const selectionCount = useMemo(
-    () => getSelectionCount(selection, pageData?.filtered_total ?? 0, query),
-    [pageData?.filtered_total, query, selection],
+    () => getSelectionCount(selection, pageData?.filtered_total ?? 0, visibleQuery),
+    [pageData?.filtered_total, selection, visibleQuery],
   )
   const pageSelection = useMemo(
-    () => getPageSelectionState(selection, currentPageNames, query),
-    [currentPageNames, query, selection],
+    () => getPageSelectionState(selection, currentPageNames, visibleQuery),
+    [currentPageNames, selection, visibleQuery],
   )
   const selectionMatchesCurrentFilter = selection.mode === 'filter'
     && selection.filter.keyword === currentFilter.keyword
@@ -677,20 +682,20 @@ export default function ManagePanelPage() {
     && selection.filter.activation_ready === currentFilter.activation_ready
     && selection.filter.quality_status === currentFilter.quality_status
   const totalPages = Math.max(1, Math.ceil((pageData?.filtered_total ?? 0) / (query.page_size || 100)))
-  const filtersActive = Boolean(
-    query.keyword
-    || query.status
-    || query.region
-    || query.source
-    || query.lifecycle_state
-    || query.manual_probe_status
-    || query.activation_ready
-    || query.quality_status
-  )
+  const pendingKeywordChange = hasPendingManageKeywordChange(query, keywordInput)
+  const filtersActive = hasActiveManageFilters(query, keywordInput)
+  const canUseFilteredSelection = canSelectFilteredResults(query, keywordInput, pageData?.filtered_total ?? 0) && !listLoading
   const probeJobRunning = activeProbeJob?.status === 'queued' || activeProbeJob?.status === 'running'
   const qualityBatchRunning = isBatchQualityActive(batchQualityState?.status)
   const initialLoading = listLoading && !pageData
   const thClass = 'cursor-pointer select-none font-semibold transition-colors hover:text-primary'
+  const selectFilteredButtonLabel = !filtersActive
+    ? '先设置筛选条件'
+    : pendingKeywordChange || listLoading
+      ? '筛选更新中...'
+      : selectionMatchesCurrentFilter
+        ? `已选筛选结果 ${selectionCount}`
+        : `全选筛选结果${(pageData?.filtered_total ?? 0) > 0 ? ` (${pageData?.filtered_total ?? 0})` : ''}`
 
   useEffect(() => {
     const current = activeProbeJob?.status ?? null
@@ -1254,8 +1259,8 @@ export default function ManagePanelPage() {
                 <option value="">全部质检</option>
                 {qualityStatusOptions.map(status => <option key={status} value={status}>{qualityStatusLabel(status)}</option>)}
               </select>
-              <button type="button" className={`btn btn-md ${selectionMatchesCurrentFilter ? 'btn-primary' : 'btn-ghost'}`} onClick={() => setSelection({ mode: 'filter', filter: buildManageFilterSnapshot(query), excludeNames: new Set() })} disabled={(pageData?.filtered_total ?? 0) === 0 || batchProcessing || probeJobRunning || qualityBatchRunning}>
-                {selectionMatchesCurrentFilter ? `已选筛选结果 ${selectionCount}` : `全选筛选结果${(pageData?.filtered_total ?? 0) > 0 ? ` (${pageData?.filtered_total ?? 0})` : ''}`}
+              <button type="button" className={`btn btn-md ${selectionMatchesCurrentFilter ? 'btn-primary' : 'btn-ghost'}`} onClick={() => setSelection({ mode: 'filter', filter: currentFilter, excludeNames: new Set() })} disabled={!canUseFilteredSelection || batchProcessing || probeJobRunning || qualityBatchRunning} title={!filtersActive ? '请先设置至少一个筛选条件' : pendingKeywordChange || listLoading ? '等待筛选结果更新后再执行' : undefined}>
+                {selectFilteredButtonLabel}
               </button>
             </div>
           </div>
@@ -1327,7 +1332,7 @@ export default function ManagePanelPage() {
                     const isExpanded = expandedQualityNode === node.name
                     const isCheckingQuality = qualityLoadingKey === `check:${node.name}`
                     const isLoadingDetail = qualityLoadingKey === `detail:${node.name}`
-                    const checked = isNodeSelected(selection, node.name, query)
+                    const checked = isNodeSelected(selection, node.name, visibleQuery)
                     const activationReady = detail?.activation_ready ?? node.activation_ready ?? false
                     const activationBlockReason = detail?.activation_block_reason || node.activation_block_reason || ''
                     const canShowQuality = Boolean(node.tag || detail)

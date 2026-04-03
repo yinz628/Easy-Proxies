@@ -48,6 +48,41 @@ export function buildManageFilterSnapshot(query: ManageQuery): ManageFilterSnaps
   }
 }
 
+export function resolveVisibleManageQuery(query: ManageQuery, keywordInput: string): ManageQuery {
+  return normalizeManageQuery({
+    ...query,
+    keyword: keywordInput,
+  })
+}
+
+export function hasPendingManageKeywordChange(query: ManageQuery, keywordInput: string): boolean {
+  return normalizeManageQuery(query).keyword !== resolveVisibleManageQuery(query, keywordInput).keyword
+}
+
+export function hasActiveManageFilters(query: ManageQuery, keywordInput: string): boolean {
+  const visible = resolveVisibleManageQuery(query, keywordInput)
+  return Boolean(
+    visible.keyword
+    || visible.status
+    || visible.region
+    || visible.source
+    || visible.lifecycle_state
+    || visible.manual_probe_status
+    || visible.activation_ready
+    || visible.quality_status
+  )
+}
+
+export function canSelectFilteredResults(query: ManageQuery, keywordInput: string, filteredTotal: number): boolean {
+  if (filteredTotal <= 0) {
+    return false
+  }
+  if (!hasActiveManageFilters(query, keywordInput)) {
+    return false
+  }
+  return !hasPendingManageKeywordChange(query, keywordInput)
+}
+
 export function buildManageQueryKey(query: ManageQuery): string {
   const normalized = normalizeManageQuery(query)
   return JSON.stringify(normalized)
