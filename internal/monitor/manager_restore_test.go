@@ -103,3 +103,26 @@ func TestStartPeriodicHealthCheckSkipsImmediateProbeForRestoredNodes(t *testing.
 		t.Fatalf("probeCalls = %d, want 0", got)
 	}
 }
+
+func TestStartPeriodicHealthCheckDoesNotProbeImmediately(t *testing.T) {
+	mgr, err := NewManager(Config{ProbeTarget: "http://example.com:80"})
+	if err != nil {
+		t.Fatalf("NewManager() error = %v", err)
+	}
+	defer mgr.Stop()
+
+	entry := mgr.Register(NodeInfo{Tag: "tag-alpha", Name: "alpha", URI: "trojan://alpha"})
+
+	var probeCalls atomic.Int32
+	entry.SetProbe(func(ctx context.Context) (time.Duration, error) {
+		probeCalls.Add(1)
+		return 10 * time.Millisecond, nil
+	})
+
+	mgr.StartPeriodicHealthCheck(time.Hour, 50*time.Millisecond)
+	time.Sleep(150 * time.Millisecond)
+
+	if got := probeCalls.Load(); got != 0 {
+		t.Fatalf("probeCalls = %d, want 0", got)
+	}
+}

@@ -86,6 +86,9 @@ export function isNodeSelected(state: SelectionState, name: string, query: Manag
     state.filter.status !== currentFilter.status ||
     state.filter.region !== currentFilter.region ||
     state.filter.source !== currentFilter.source ||
+    state.filter.lifecycle_state !== currentFilter.lifecycle_state ||
+    state.filter.manual_probe_status !== currentFilter.manual_probe_status ||
+    state.filter.activation_ready !== currentFilter.activation_ready ||
     state.filter.quality_status !== currentFilter.quality_status
   ) {
     return false
@@ -104,6 +107,9 @@ export function getSelectionCount(state: SelectionState, filteredTotal: number, 
     state.filter.status !== currentFilter.status ||
     state.filter.region !== currentFilter.region ||
     state.filter.source !== currentFilter.source ||
+    state.filter.lifecycle_state !== currentFilter.lifecycle_state ||
+    state.filter.manual_probe_status !== currentFilter.manual_probe_status ||
+    state.filter.activation_ready !== currentFilter.activation_ready ||
     state.filter.quality_status !== currentFilter.quality_status
   ) {
     return 0

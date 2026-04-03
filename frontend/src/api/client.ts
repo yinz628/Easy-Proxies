@@ -7,10 +7,14 @@ import type {
   ConfigNodesResponse,
   ConfigNodePayload,
   ConfigNodeMutationResponse,
+  ImportNodesResponse,
+  BatchLifecycleAction,
+  BatchLifecycleResponse,
   ManageListResponse,
   ManageQuery,
   ManageSelectionRequest,
   SubscriptionStatus,
+  SubscriptionImportResponse,
   BatchProbeJob,
   BatchQualityJob,
   ProbeSSEEvent,
@@ -156,6 +160,9 @@ export async function fetchManageNodes(query: ManageQuery, signal?: AbortSignal)
   if (query.status) params.set('status', query.status)
   if (query.region) params.set('region', query.region)
   if (query.source) params.set('source', query.source)
+  if (query.lifecycle_state) params.set('lifecycle_state', query.lifecycle_state)
+  if (query.manual_probe_status) params.set('manual_probe_status', query.manual_probe_status)
+  if (query.activation_ready) params.set('activation_ready', query.activation_ready)
   if (query.quality_status) params.set('quality_status', query.quality_status)
   params.set('sort_key', query.sort_key)
   params.set('sort_dir', query.sort_dir)
@@ -164,7 +171,14 @@ export async function fetchManageNodes(query: ManageQuery, signal?: AbortSignal)
 }
 
 export async function probeNode(tag: string): Promise<{ message: string; latency_ms: number }> {
-  return request(`/api/nodes/${encodeURIComponent(tag)}/probe`, { method: 'POST' })
+  const response = await request<{ message?: string; latency_ms?: number; error?: string }>(`/api/nodes/${encodeURIComponent(tag)}/probe`, { method: 'POST' })
+  if (response.error) {
+    throw new Error(response.error)
+  }
+  return {
+    message: response.message || '探测成功',
+    latency_ms: response.latency_ms ?? -1,
+  }
 }
 
 export async function releaseNode(tag: string): Promise<{ message: string }> {
@@ -362,6 +376,13 @@ export async function batchToggleConfigNodes(selectionOrNames: ManageSelectionRe
   })
 }
 
+export async function batchLifecycleConfigNodes(selectionOrNames: ManageSelectionRequest | string[], action: BatchLifecycleAction): Promise<BatchLifecycleResponse> {
+  return request('/api/nodes/config/batch-lifecycle', {
+    method: 'POST',
+    body: JSON.stringify({ ...normalizeSelectionBody(selectionOrNames, 'names'), action }),
+  })
+}
+
 export async function batchDeleteConfigNodes(selectionOrNames: ManageSelectionRequest | string[]): Promise<{ message: string; success: number; total: number; errors?: string[] }> {
   return request('/api/nodes/config/batch-delete', {
     method: 'POST',
@@ -378,11 +399,21 @@ export async function triggerReload(): Promise<{ message: string }> {
 // ---- Subscription API ----
 
 export async function fetchSubscriptionStatus(): Promise<SubscriptionStatus> {
-  return request<SubscriptionStatus>('/api/subscription/status')
+  const response = await request<SubscriptionStatus>('/api/subscription/status')
+  return {
+    ...response,
+    node_count: response.staged_count ?? response.node_count,
+  }
 }
 
-export async function refreshSubscription(): Promise<{ message: string; node_count: number }> {
-  return request('/api/subscription/refresh', { method: 'POST' })
+export async function refreshLegacySubscriptions(): Promise<SubscriptionImportResponse> {
+  const response = await request<SubscriptionImportResponse>('/api/subscription/refresh-legacy', { method: 'POST' })
+  return { ...response, node_count: response.staged_count }
+}
+
+export async function refreshTXTSubscriptions(): Promise<SubscriptionImportResponse> {
+  const response = await request<SubscriptionImportResponse>('/api/subscription/refresh-txt', { method: 'POST' })
+  return { ...response, node_count: response.staged_count }
 }
 
 export function probeBatchNodes(
@@ -626,11 +657,12 @@ export function checkNodeQualityBatch(
   return controller
 }
 
-export async function refreshSubscriptionFeed(feedKey: string): Promise<{ message: string; feed_key: string }> {
-  return request('/api/subscription/refresh-feed', {
+export async function refreshSubscriptionFeed(feedKey: string): Promise<SubscriptionImportResponse> {
+  const response = await request<SubscriptionImportResponse>('/api/subscription/refresh-feed', {
     method: 'POST',
     body: JSON.stringify({ feed_key: feedKey }),
   })
+  return { ...response, node_count: response.staged_count }
 }
 
 // ---- Export API ----
@@ -667,9 +699,12 @@ export async function exportSelectedProxies(selection: ManageSelectionRequest): 
 
 // ---- Import API ----
 
-export async function importNodes(content: string): Promise<{ message: string; imported: number; errors?: string[] }> {
+export async function importNodes(content: string, namePrefix: string): Promise<ImportNodesResponse> {
   return request('/api/import', {
     method: 'POST',
-    body: JSON.stringify({ content }),
+    body: JSON.stringify({
+      content,
+      name_prefix: namePrefix,
+    }),
   })
 }

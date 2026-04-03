@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
-import type { NodeSnapshot, NodesResponse, ConfigNodeConfig, ConfigNodesResponse, TrafficStreamEvent } from '../types'
+import type { NodeSnapshot, NodesResponse, ConfigNodesResponse, TrafficStreamEvent } from '../types'
 import { fetchNodes, fetchConfigNodes, streamTraffic } from '../api/client'
 import { formatBytes, formatSpeed } from '../utils/format'
 import DonutChart from './charts/DonutChart'
@@ -7,6 +7,7 @@ import BarChart from './charts/BarChart'
 import LatencyRanking from './charts/LatencyRanking'
 import TrafficRanking from './charts/TrafficRanking'
 import RegionCards from './charts/RegionCards'
+import { buildMonitorPanelStats } from './monitorPanelStats'
 
 function latencyColor(ms: number): string {
   if (ms < 0) return 'text-base-content/50'
@@ -128,36 +129,14 @@ export default function MonitorPanel() {
 
   // ---- Computed stats ----
   const allNodes = useMemo(() => data?.nodes || [], [data])
-  const allConfigNodes = useMemo(() => configData?.nodes || [], [configData])
-
-  // Config-level counts (includes disabled nodes)
-  const totalConfigNodes = allConfigNodes.length
-  const disabledNodes = useMemo(
-    () => allConfigNodes.filter((n: ConfigNodeConfig) => n.disabled).length,
-    [allConfigNodes]
-  )
-  // enabledConfigNodes not directly displayed but used implicitly in monitor node count
-
-  // Runtime monitor counts (only enabled nodes that are loaded in the box)
-  const availableNodes = useMemo(
-    () => allNodes.filter((n: NodeSnapshot) => n.initial_check_done && n.available && !n.blacklisted).length,
-    [allNodes]
-  )
-
-  const unavailableNodes = useMemo(
-    () => allNodes.filter((n: NodeSnapshot) => n.initial_check_done && !n.available && !n.blacklisted).length,
-    [allNodes]
-  )
-
-  const blacklistedNodes = useMemo(
-    () => allNodes.filter((n: NodeSnapshot) => n.blacklisted).length,
-    [allNodes]
-  )
-
-  const pendingNodes = useMemo(
-    () => allNodes.filter((n: NodeSnapshot) => !n.initial_check_done && !n.blacklisted).length,
-    [allNodes]
-  )
+  const {
+    runtimeNodeCount,
+    disabledNodes,
+    availableNodes,
+    unavailableNodes,
+    blacklistedNodes,
+    pendingNodes,
+  } = useMemo(() => buildMonitorPanelStats(data, configData), [data, configData])
 
   const healthRate = useMemo(() => {
     const checked = allNodes.filter((n: NodeSnapshot) => n.initial_check_done).length
@@ -356,7 +335,7 @@ export default function MonitorPanel() {
             </div>
             <div className="text-sm font-medium text-base-content/60">总节点</div>
           </div>
-          <div className="text-3xl font-black tabular-nums tracking-tight text-base-content mb-2 relative z-10">{totalConfigNodes}</div>
+          <div className="text-3xl font-black tabular-nums tracking-tight text-base-content mb-2 relative z-10">{runtimeNodeCount}</div>
           <div className="text-xs flex flex-wrap gap-1.5 relative z-10">
             <span className="badge badge-success badge-sm badge-outline border-success/30 bg-success/5 font-medium">可用 {availableNodes}</span>
             {unavailableNodes > 0 && <span className="badge badge-error badge-sm badge-outline border-error/30 bg-error/5 font-medium">不可用 {unavailableNodes}</span>}
@@ -538,7 +517,7 @@ export default function MonitorPanel() {
       <div className="text-center text-xs text-base-content/30">
         {data && (
           <>
-            共 {totalConfigNodes} 个节点 ·
+            共 {runtimeNodeCount} 个节点 ·
             {Object.keys(data.region_stats || {}).length} 个地区 ·
             数据来自运行时监控
             {autoRefresh > 0 && ` · 每 ${autoRefresh} 秒自动刷新`}

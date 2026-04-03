@@ -2,8 +2,8 @@ import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'rea
 import type { ChangeEvent, FormEvent } from 'react'
 
 import {
+  batchLifecycleConfigNodes,
   batchDeleteConfigNodes,
-  batchToggleConfigNodes,
   cancelQualityBatchJob,
   cancelProbeBatchJob,
   checkNodeQuality,
@@ -26,11 +26,16 @@ import {
   updateConfigNode,
 } from '../api/client'
 import type {
+  ActivationReadyFilter,
+  BatchLifecycleAction,
   BatchProbeJob,
   ConfigNodePayload,
   ManageListResponse,
   ManageNodeRow,
   ManageQuery,
+  ManualProbeStatus,
+  NodeLifecycleState,
+  ImportNodesResponse,
   ManageSortDir,
   ManageSortKey,
   ManageStatus,
@@ -196,6 +201,108 @@ function formatQualityCheckedAt(iso?: string): string {
   return new Date(iso).toLocaleString()
 }
 
+function manualProbeTone(status: ManageNodeRow['manual_probe_status']): string {
+  switch (status) {
+    case 'pass':
+      return 'badge-success border-none bg-success/15 text-success'
+    case 'timeout':
+      return 'badge-warning border-none bg-warning/20 text-warning-content'
+    case 'fail':
+      return 'badge-error border-none bg-error/15 text-error'
+    default:
+      return 'badge-ghost border-none bg-base-300/40 text-base-content/50'
+  }
+}
+
+function manualProbeLabel(status: ManageNodeRow['manual_probe_status']): string {
+  switch (status) {
+    case 'pass':
+      return '入池预检通过'
+    case 'timeout':
+      return '入池预检超时'
+    case 'fail':
+      return '入池预检失败'
+    default:
+      return '未做入池预检'
+  }
+}
+
+function lifecycleLabel(state?: NodeLifecycleState | ''): string {
+  switch (state) {
+    case 'staged':
+      return '待激活'
+    case 'disabled':
+      return '已禁用'
+    default:
+      return '代理池'
+  }
+}
+
+function lifecycleTone(state?: NodeLifecycleState | ''): string {
+  switch (state) {
+    case 'staged':
+      return 'badge-warning border-none bg-warning/20 text-warning-content'
+    case 'disabled':
+      return 'badge-ghost border-none bg-base-300/40 text-base-content/50'
+    default:
+      return 'badge-info border-none bg-info/15 text-info'
+  }
+}
+
+function activationReadyLabel(ready: boolean): string {
+  return ready ? '可激活' : '未就绪'
+}
+
+function activationReadyTone(ready: boolean): string {
+  return ready
+    ? 'badge-success border-none bg-success/15 text-success'
+    : 'badge-warning border-none bg-warning/20 text-warning-content'
+}
+
+function activationReadyFilterLabel(value: ActivationReadyFilter): string {
+  switch (value) {
+    case 'ready':
+      return '可激活'
+    case 'blocked':
+      return '未就绪'
+    default:
+      return '全部激活状态'
+  }
+}
+
+function manualProbeFilterLabel(status: ManualProbeStatus | ''): string {
+  switch (status) {
+    case 'pass':
+      return '入池预检通过'
+    case 'fail':
+      return '入池预检失败'
+    case 'timeout':
+      return '入池预检超时'
+    case 'untested':
+      return '未做入池预检'
+    default:
+      return '全部入池预检'
+  }
+}
+
+function lifecycleFilterLabel(state: NodeLifecycleState | ''): string {
+  switch (state) {
+    case 'active':
+      return '代理池'
+    case 'staged':
+      return '待激活'
+    case 'disabled':
+      return '已禁用'
+    default:
+      return '全部生命周期'
+  }
+}
+
+function formatManualProbeChecked(epochSeconds?: number): string {
+  if (!epochSeconds) return '未进行入池预检'
+  return new Date(epochSeconds * 1000).toLocaleString()
+}
+
 function downloadTextFile(filename: string, text: string): void {
   const blob = new Blob([text], { type: 'text/plain' })
   const url = URL.createObjectURL(blob)
@@ -247,6 +354,22 @@ function ProviderQualityBadge({ provider, status }: { provider: string; status?:
   return <span className={`badge badge-sm ${qualityStatusTone(status)}`}>{provider} {qualityStatusLabel(status)}</span>
 }
 
+function ManualProbeBadge({ node }: { node: ManageNodeRow }) {
+  return (
+    <span className={`badge badge-sm ${manualProbeTone(node.manual_probe_status)}`} title={node.manual_probe_message || manualProbeLabel(node.manual_probe_status)}>
+      {manualProbeLabel(node.manual_probe_status)}
+    </span>
+  )
+}
+
+function ActivationBadge({ ready, reason }: { ready: boolean; reason?: string }) {
+  return (
+    <span className={`badge badge-sm ${activationReadyTone(ready)}`} title={reason || activationReadyLabel(ready)}>
+      {activationReadyLabel(ready)}
+    </span>
+  )
+}
+
 export default function ManagePanelPage() {
   const [pageData, setPageData] = useState<ManageListResponse | null>(null)
   const [query, setQuery] = useState<ManageQuery>(() => normalizeManageQuery())
@@ -287,9 +410,10 @@ export default function ManagePanelPage() {
 
   const [importModalOpen, setImportModalOpen] = useState(false)
   const [importContent, setImportContent] = useState('')
+  const [importNamePrefix, setImportNamePrefix] = useState('imported')
   const [importing, setImporting] = useState(false)
   const [importError, setImportError] = useState('')
-  const [importResult, setImportResult] = useState<{ message: string; imported: number; errors?: string[] } | null>(null)
+  const [importResult, setImportResult] = useState<ImportNodesResponse | null>(null)
 
   useEffect(() => {
     queryRef.current = query
@@ -323,6 +447,9 @@ export default function ManagePanelPage() {
       || selection.filter.status !== current.status
       || selection.filter.region !== current.region
       || selection.filter.source !== current.source
+      || selection.filter.lifecycle_state !== current.lifecycle_state
+      || selection.filter.manual_probe_status !== current.manual_probe_status
+      || selection.filter.activation_ready !== current.activation_ready
       || selection.filter.quality_status !== current.quality_status
     ) {
       setSelection(createEmptySelection())
@@ -526,6 +653,9 @@ export default function ManagePanelPage() {
 
   const summary = pageData?.summary ?? emptySummary
   const nodes = useMemo(() => pageData?.items ?? [], [pageData?.items])
+  const lifecycleStateOptions = pageData?.facets.lifecycle_states ?? []
+  const manualProbeStatusOptions = pageData?.facets.manual_probe_statuses ?? []
+  const activationReadyOptions = pageData?.facets.activation_readiness ?? []
   const qualityStatusOptions = pageData?.facets.quality_statuses ?? []
   const currentPageNames = useMemo(() => nodes.map(node => node.name), [nodes])
   const currentFilter = useMemo(() => buildManageFilterSnapshot(query), [query])
@@ -542,9 +672,21 @@ export default function ManagePanelPage() {
     && selection.filter.status === currentFilter.status
     && selection.filter.region === currentFilter.region
     && selection.filter.source === currentFilter.source
+    && selection.filter.lifecycle_state === currentFilter.lifecycle_state
+    && selection.filter.manual_probe_status === currentFilter.manual_probe_status
+    && selection.filter.activation_ready === currentFilter.activation_ready
     && selection.filter.quality_status === currentFilter.quality_status
   const totalPages = Math.max(1, Math.ceil((pageData?.filtered_total ?? 0) / (query.page_size || 100)))
-  const filtersActive = Boolean(query.keyword || query.status || query.region || query.source || query.quality_status)
+  const filtersActive = Boolean(
+    query.keyword
+    || query.status
+    || query.region
+    || query.source
+    || query.lifecycle_state
+    || query.manual_probe_status
+    || query.activation_ready
+    || query.quality_status
+  )
   const probeJobRunning = activeProbeJob?.status === 'queued' || activeProbeJob?.status === 'running'
   const qualityBatchRunning = isBatchQualityActive(batchQualityState?.status)
   const initialLoading = listLoading && !pageData
@@ -669,10 +811,11 @@ export default function ManagePanelPage() {
     if (!node.tag) return
     setProbingTag(node.tag)
     try {
-      await probeNode(node.tag)
+      const res = await probeNode(node.tag)
+      setSuccess(res.message || '入池预检通过')
       await refreshCurrentPage([node.name])
     } catch (err) {
-      setError(err instanceof Error ? err.message : '探测失败')
+      setError(err instanceof Error ? err.message : '入池预检失败')
     } finally {
       setProbingTag(null)
     }
@@ -733,16 +876,19 @@ export default function ManagePanelPage() {
     }
   }, [applyQualityResult, expandedQualityNode, qualityDetails])
 
-  const handleBatchToggle = useCallback(async (enabled: boolean) => {
+  const handleBatchLifecycle = useCallback(async (action: BatchLifecycleAction) => {
     if (selectionCount === 0) return
     setBatchProcessing(true)
     try {
-      const res = await batchToggleConfigNodes(buildSelectionRequest(selection), enabled)
-      setSuccess(res.message || '批量操作完成')
+      const res = await batchLifecycleConfigNodes(buildSelectionRequest(selection), action)
+      const combinedErrors = [res.reload_error, ...(res.errors ?? [])].filter(Boolean).join('; ')
+      setError(combinedErrors)
+      setNeedReload(Boolean(res.reload_error))
+      setSuccess(res.message || '批量生命周期操作已完成')
       setSelection(createEmptySelection())
       await refreshCurrentPage(undefined, true)
     } catch (err) {
-      setError(err instanceof Error ? err.message : '批量操作失败')
+      setError(err instanceof Error ? err.message : '批量生命周期操作失败')
     } finally {
       setBatchProcessing(false)
     }
@@ -754,9 +900,9 @@ export default function ManagePanelPage() {
       const res = await startProbeBatchJob(buildSelectionRequest(selection))
       setActiveProbeJob(res.job)
       setBatchProbeProgress({ current: res.job.completed, total: res.job.total })
-      setSuccess('批量探测任务已启动')
+      setSuccess('批量入池预检任务已启动')
     } catch (err) {
-      setError(err instanceof Error ? err.message : '批量探测启动失败')
+      setError(err instanceof Error ? err.message : '批量入池预检启动失败')
     }
   }, [selection, selectionCount])
 
@@ -764,14 +910,14 @@ export default function ManagePanelPage() {
     if (!activeProbeJob) return
     try {
       await cancelProbeBatchJob(activeProbeJob.id)
-      setSuccess('批量探测任务已取消')
+      setSuccess('批量入池预检任务已取消')
       const res = await fetchProbeBatchJobStatus()
       setActiveProbeJob(res.job)
       if (!res.job || (res.job.status !== 'queued' && res.job.status !== 'running')) {
         setBatchProbeProgress(null)
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : '取消批量探测失败')
+      setError(err instanceof Error ? err.message : '取消批量入池预检失败')
     }
   }, [activeProbeJob])
 
@@ -870,6 +1016,7 @@ export default function ManagePanelPage() {
 
   const openImportModal = useCallback(() => {
     setImportContent('')
+    setImportNamePrefix('imported')
     setImportError('')
     setImportResult(null)
     setImportModalOpen(true)
@@ -897,7 +1044,7 @@ export default function ManagePanelPage() {
     setImportError('')
     setImportResult(null)
     try {
-      const res = await importNodes(importContent)
+      const res = await importNodes(importContent, importNamePrefix)
       setImportResult(res)
       if (res.imported > 0) {
         setNeedReload(true)
@@ -910,7 +1057,7 @@ export default function ManagePanelPage() {
     } finally {
       setImporting(false)
     }
-  }, [importContent, loadManagePage])
+  }, [importContent, importNamePrefix, loadManagePage])
 
   const handleExport = useCallback(async () => {
     try {
@@ -1032,11 +1179,11 @@ export default function ManagePanelPage() {
           <div className={`rounded-2xl border px-5 py-4 shadow-sm ${probeJobRunning ? 'border-primary/30 bg-primary/5' : 'border-base-300/50 bg-base-100'}`}>
             <div className="flex flex-col gap-3 lg:flex-row lg:items-center">
               <div className="flex-1">
-                <div className="text-sm font-semibold text-base-content">批量探测任务<span className="ml-2 badge badge-sm">{activeProbeJob.status}</span></div>
+                <div className="text-sm font-semibold text-base-content">批量入池预检任务<span className="ml-2 badge badge-sm">{activeProbeJob.status}</span></div>
                 <div className="mt-1 text-xs text-base-content/60">进度 {activeProbeJob.completed}/{activeProbeJob.total} · 成功 {activeProbeJob.success} · 失败 {activeProbeJob.failed} · 活跃工作线程 {activeProbeJob.active_workers}</div>
                 {activeProbeJob.last_result && <div className="mt-1 text-xs text-base-content/50">最近完成: {activeProbeJob.last_result.name}{activeProbeJob.last_result.error ? ` · ${activeProbeJob.last_result.error}` : ` · ${activeProbeJob.last_result.latency_ms} ms`}</div>}
               </div>
-              {probeJobRunning && <button className="btn btn-sm btn-warning" onClick={() => void handleBatchProbeCancel()}>取消批量探测</button>}
+              {probeJobRunning && <button className="btn btn-sm btn-warning" onClick={() => void handleBatchProbeCancel()}>取消批量入池预检</button>}
             </div>
             <progress className="progress progress-primary mt-3 h-2 w-full" value={activeProbeJob.completed} max={activeProbeJob.total || 1}></progress>
           </div>
@@ -1073,6 +1220,24 @@ export default function ManagePanelPage() {
                 <option value="pending">⚠️ 待检查</option>
                 <option value="disabled">🚫 已禁用</option>
               </select>
+              {(lifecycleStateOptions.length ?? 0) > 0 && (
+                <select className="select select-md flex-1 bg-base-200/50 focus:bg-base-100 sm:w-32" value={query.lifecycle_state} onChange={(event) => updateQuery(prev => ({ ...prev, page: 1, lifecycle_state: event.target.value as NodeLifecycleState | '' }))}>
+                  <option value="">{lifecycleFilterLabel('')}</option>
+                  {lifecycleStateOptions.map(state => <option key={state} value={state}>{lifecycleFilterLabel(state)}</option>)}
+                </select>
+              )}
+              {(manualProbeStatusOptions.length ?? 0) > 0 && (
+                <select className="select select-md flex-1 bg-base-200/50 focus:bg-base-100 sm:w-32" value={query.manual_probe_status} onChange={(event) => updateQuery(prev => ({ ...prev, page: 1, manual_probe_status: event.target.value as ManualProbeStatus | '' }))}>
+                  <option value="">{manualProbeFilterLabel('')}</option>
+                  {manualProbeStatusOptions.map(status => <option key={status} value={status}>{manualProbeFilterLabel(status)}</option>)}
+                </select>
+              )}
+              {(activationReadyOptions.length ?? 0) > 0 && (
+                <select className="select select-md flex-1 bg-base-200/50 focus:bg-base-100 sm:w-32" value={query.activation_ready} onChange={(event) => updateQuery(prev => ({ ...prev, page: 1, activation_ready: event.target.value as ActivationReadyFilter }))}>
+                  <option value="">{activationReadyFilterLabel('')}</option>
+                  {activationReadyOptions.map(status => <option key={status} value={status}>{activationReadyFilterLabel(status)}</option>)}
+                </select>
+              )}
               {(pageData?.facets.regions.length ?? 0) > 0 && (
                 <select className="select select-md flex-1 bg-base-200/50 focus:bg-base-100 sm:w-32" value={query.region} onChange={(event) => updateQuery(prev => ({ ...prev, page: 1, region: event.target.value }))}>
                   <option value="">全部地区</option>
@@ -1106,14 +1271,15 @@ export default function ManagePanelPage() {
               </span>
               <div className="ml-auto flex flex-wrap gap-2">
                 <button className="btn btn-sm btn-primary gap-1.5 shadow-sm" onClick={() => void handleBatchProbe()} disabled={batchProcessing || probeJobRunning || qualityBatchRunning}>
-                  {batchProbeProgress ? <><span className="loading loading-spinner loading-xs"></span> {batchProbeProgress.current}/{batchProbeProgress.total}</> : <><svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M13 10V3L4 14h7v7l9-11h-7z" /></svg>批量探测</>}
+                  {batchProbeProgress ? <><span className="loading loading-spinner loading-xs"></span> {batchProbeProgress.current}/{batchProbeProgress.total}</> : <><svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M13 10V3L4 14h7v7l9-11h-7z" /></svg>批量入池预检</>}
                 </button>
                 <button className="btn btn-sm btn-secondary gap-1.5 shadow-sm" onClick={handleBatchQualityCheck} disabled={batchProcessing || probeJobRunning || qualityBatchRunning}>
                   {qualityBatchRunning ? <><span className="loading loading-spinner loading-xs"></span> {batchQualityState?.current || 0}/{batchQualityState?.total || 0}</> : <><svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 12l2 2 4-4m5-2a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>批量质检</>}
                 </button>
                 <div className="mx-1 h-6 w-px self-center bg-base-300"></div>
-                <button className="btn btn-sm border-none bg-success/15 text-success hover:bg-success hover:text-success-content" onClick={() => void handleBatchToggle(true)} disabled={batchProcessing || probeJobRunning || qualityBatchRunning}>启用</button>
-                <button className="btn btn-sm border-none bg-warning/15 text-warning-content hover:bg-warning hover:text-warning-content" onClick={() => void handleBatchToggle(false)} disabled={batchProcessing || probeJobRunning || qualityBatchRunning}>禁用</button>
+                <button className="btn btn-sm border-none bg-success/15 text-success hover:bg-success hover:text-success-content" onClick={() => void handleBatchLifecycle('activate')} disabled={batchProcessing || probeJobRunning || qualityBatchRunning}>激活</button>
+                <button className="btn btn-sm border-none bg-info/15 text-info hover:bg-info hover:text-info-content" onClick={() => void handleBatchLifecycle('deactivate')} disabled={batchProcessing || probeJobRunning || qualityBatchRunning}>移回待激活</button>
+                <button className="btn btn-sm border-none bg-warning/15 text-warning-content hover:bg-warning hover:text-warning-content" onClick={() => void handleBatchLifecycle('disable')} disabled={batchProcessing || probeJobRunning || qualityBatchRunning}>禁用</button>
                 <button className="btn btn-sm border-none bg-error/15 text-error hover:bg-error hover:text-error-content" onClick={() => setBatchDeleteConfirm(true)} disabled={batchProcessing || probeJobRunning || qualityBatchRunning}>删除</button>
                 <div className="mx-1 h-6 w-px self-center bg-base-300"></div>
                 <button className="btn btn-sm btn-ghost hover:bg-base-300" onClick={() => setSelection(createEmptySelection())} disabled={batchProcessing || probeJobRunning || qualityBatchRunning}>取消选择</button>
@@ -1162,6 +1328,8 @@ export default function ManagePanelPage() {
                     const isCheckingQuality = qualityLoadingKey === `check:${node.name}`
                     const isLoadingDetail = qualityLoadingKey === `detail:${node.name}`
                     const checked = isNodeSelected(selection, node.name, query)
+                    const activationReady = detail?.activation_ready ?? node.activation_ready ?? false
+                    const activationBlockReason = detail?.activation_block_reason || node.activation_block_reason || ''
                     const canShowQuality = Boolean(node.tag || detail)
 
                     return (
@@ -1176,6 +1344,13 @@ export default function ManagePanelPage() {
                               <span className="max-w-[200px] truncate" title={node.name}>{node.name}</span>
                             </div>
                             <div className="mt-1 flex flex-wrap items-center gap-2 text-xs">
+                              <span className={`badge badge-sm ${lifecycleTone(node.lifecycle_state)}`}>{lifecycleLabel(node.lifecycle_state)}</span>
+                              <ManualProbeBadge node={node} />
+                              <ActivationBadge ready={activationReady} reason={activationBlockReason} />
+                              {node.manual_probe_status === 'pass' && node.manual_probe_latency_ms >= 0 && <span className="font-mono text-base-content/55">预检 {node.manual_probe_latency_ms} ms</span>}
+                              {node.manual_probe_checked && <span className="text-base-content/45">{formatManualProbeChecked(node.manual_probe_checked)}</span>}
+                              {node.manual_probe_message && node.manual_probe_status !== 'pass' && <span className="max-w-[320px] truncate text-base-content/50" title={node.manual_probe_message}>{node.manual_probe_message}</span>}
+                              {!activationReady && activationBlockReason && <span className="max-w-[320px] truncate text-base-content/50" title={activationBlockReason}>{activationBlockReason}</span>}
                               {detail && (
                                 <>
                                   <ProviderQualityBadge provider="OpenAI" status={detail.quality_openai_status} />
@@ -1195,7 +1370,7 @@ export default function ManagePanelPage() {
                           <td className="hidden lg:table-cell"><div className="badge badge-ghost badge-sm border-base-300 bg-transparent opacity-70">{sourceLabel(node.source)}</div></td>
                           <td>
                             <div className="flex gap-1.5 opacity-60 transition-opacity group-hover:opacity-100">
-                              {!node.disabled && node.tag && <button className="btn btn-sm btn-square btn-ghost text-primary hover:bg-primary/10" onClick={() => void handleProbe(node)} disabled={probingTag === node.tag || qualityBatchRunning} title="探测延迟">{probingTag === node.tag ? <span className="loading loading-spinner loading-xs"></span> : <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M13 10V3L4 14h7v7l9-11h-7z" /></svg>}</button>}
+                              {!node.disabled && node.tag && <button className="btn btn-sm btn-square btn-ghost text-primary hover:bg-primary/10" onClick={() => void handleProbe(node)} disabled={probingTag === node.tag || qualityBatchRunning} title="执行入池预检">{probingTag === node.tag ? <span className="loading loading-spinner loading-xs"></span> : <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M13 10V3L4 14h7v7l9-11h-7z" /></svg>}</button>}
                               {!node.disabled && node.tag && <button className="btn btn-sm btn-square btn-ghost text-secondary hover:bg-secondary/10" onClick={() => void handleQualityCheck(node)} disabled={isCheckingQuality || qualityBatchRunning} title="执行质量检测">{isCheckingQuality ? <span className="loading loading-spinner loading-xs"></span> : <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 12l2 2 4-4m5-2a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>}</button>}
                               {node.runtime_status === 'blacklisted' && node.tag && <button className="btn btn-sm btn-square btn-ghost text-warning hover:bg-warning/10" onClick={() => void handleRelease(node)} title="解除黑名单"><svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M8 11V7a4 4 0 118 0m-4 8v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2z" /></svg></button>}
                               <button className={`btn btn-sm btn-square btn-ghost ${node.disabled ? 'text-success hover:bg-success/10' : 'text-warning hover:bg-warning/10'}`} onClick={() => void handleToggle(node)} disabled={toggling === node.name || qualityBatchRunning} title={node.disabled ? '启用该节点' : '禁用该节点'}>{toggling === node.name ? <span className="loading loading-spinner loading-xs"></span> : node.disabled ? <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M5 13l4 4L19 7" /></svg> : <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M18.364 18.364A9 9 0 005.636 5.636m12.728 12.728A9 9 0 015.636 5.636m12.728 12.728L5.636 5.636" /></svg>}</button>
@@ -1211,6 +1386,8 @@ export default function ManagePanelPage() {
                                 <div className="flex flex-col gap-4 lg:flex-row lg:items-start">
                                   <div className="flex-1 space-y-3">
                                     <div className="flex flex-wrap items-center gap-2">
+                                      <span className={`badge badge-sm ${lifecycleTone(node.lifecycle_state)}`}>{lifecycleLabel(node.lifecycle_state)}</span>
+                                      <ActivationBadge ready={activationReady} reason={activationBlockReason} />
                                       <ProviderQualityBadge provider="OpenAI" status={detail?.quality_openai_status || node.quality_openai_status} />
                                       <ProviderQualityBadge provider="Anthropic" status={detail?.quality_anthropic_status || node.quality_anthropic_status} />
                                       <span className={`badge badge-sm ${qualityStatusTone(detail?.quality_status)}`}>{detail?.quality_grade || node.quality_grade || '-'} · {detail?.quality_status || node.quality_status || 'unknown'}</span>
@@ -1219,6 +1396,7 @@ export default function ManagePanelPage() {
                                       {isLoadingDetail && <span className="loading loading-spinner loading-xs text-primary"></span>}
                                     </div>
                                     <div className="text-sm text-base-content/75">{detail?.quality_summary || node.quality_summary || '暂无质量检测摘要'}</div>
+                                    {!activationReady && activationBlockReason && <div className="text-sm text-base-content/60">激活阻塞：{activationBlockReason}</div>}
                                     <div className="hidden flex-wrap gap-2 text-xs text-base-content/60">
                                       {(detail?.exit_ip || node.exit_ip) && <span className="badge badge-ghost badge-sm">出口 IP {detail?.exit_ip || node.exit_ip}</span>}
                                       {(detail?.exit_country || node.exit_country) && <span className="badge badge-ghost badge-sm">{(detail?.exit_country_code || node.exit_country_code || '').toUpperCase()} {detail?.exit_country || node.exit_country}</span>}
@@ -1324,6 +1502,21 @@ export default function ManagePanelPage() {
                 </div>
               )}
               <p className="mb-3 text-sm text-base-content/60">每行一个代理 URI（支持 trojan://、vless://、vmess://、ss://、hysteria2:// 等），可以直接粘贴导出文件的内容或从文件导入。</p>
+              <label className="form-control mb-3">
+                <div className="label pb-1">
+                  <span className="label-text text-sm font-medium">命名前缀</span>
+                </div>
+                <input
+                  type="text"
+                  className="input input-bordered w-full"
+                  value={importNamePrefix}
+                  onChange={(event) => setImportNamePrefix(event.target.value)}
+                  placeholder="imported"
+                />
+                <div className="label pt-1">
+                  <span className="label-text-alt text-xs text-base-content/50">无名称或重名节点会自动命名为 &lt;前缀&gt;-序号</span>
+                </div>
+              </label>
               <div className="mb-3">
                 <label className="btn btn-soft btn-sm">
                   <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" /></svg>
@@ -1333,6 +1526,21 @@ export default function ManagePanelPage() {
               </div>
               <textarea className="textarea textarea-bordered h-48 w-full font-mono text-xs" placeholder={'trojan://password@host:port?sni=example.com#节点名称\nvless://uuid@host:port?encryption=none#另一个节点\n...'} value={importContent} onChange={(event) => setImportContent(event.target.value)} />
               <div className="mt-1 text-xs text-base-content/40">{importContent.trim() ? `${importContent.trim().split('\n').filter(line => line.trim() && !line.trim().startsWith('#')).length} 行有效内容` : '等待输入...'}</div>
+              {importResult && importResult.renamed > 0 && (
+                <div className="mt-2 text-xs text-base-content/70">自动改名 {importResult.renamed} 个节点</div>
+              )}
+              {importResult?.items && importResult.items.length > 0 && (
+                <details className="mt-2 rounded-lg border border-base-300/60 bg-base-200/40 p-3">
+                  <summary className="cursor-pointer text-xs font-medium text-base-content/70">查看导入命名结果</summary>
+                  <ul className="mt-2 space-y-1 text-xs text-base-content/70">
+                    {importResult.items.map((item) => (
+                      <li key={`${item.line}-${item.final_name}`}>
+                        第 {item.line} 行：{item.requested_name || '(无名称)'} -&gt; {item.final_name}
+                      </li>
+                    ))}
+                  </ul>
+                </details>
+              )}
               <div className="modal-action">
                 <button type="button" className="btn btn-ghost" onClick={() => setImportModalOpen(false)}>{importResult?.imported ? '完成' : '取消'}</button>
                 <button type="button" className="btn btn-primary" onClick={() => void handleImport()} disabled={importing || !importContent.trim()}>{importing ? <span className="loading loading-spinner loading-xs"></span> : '导入'}</button>

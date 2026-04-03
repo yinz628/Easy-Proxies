@@ -5,6 +5,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 )
 
@@ -53,15 +54,19 @@ func TestLoadAppliesExampleAlignedDefaults(t *testing.T) {
 	}
 }
 
-func TestLoadIncludesTXTSubscriptionsOnInitialStartup(t *testing.T) {
+func TestLoadDoesNotFetchLegacyOrTXTSubscriptionsOnInitialStartup(t *testing.T) {
+	var requests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
 		_, _ = w.Write([]byte("1.0.171.213:8080\n"))
 	}))
 	defer server.Close()
 
 	tempDir := t.TempDir()
 	configPath := filepath.Join(tempDir, "config.yaml")
-	configBody := "txt_subscriptions:\n" +
+	configBody := "subscriptions:\n" +
+		"  - " + server.URL + "/legacy.txt\n" +
+		"txt_subscriptions:\n" +
 		"  - name: vmheaven\n" +
 		"    url: " + server.URL + "/all_proxies.txt\n" +
 		"    default_protocol: socks5\n" +
@@ -76,11 +81,10 @@ func TestLoadIncludesTXTSubscriptionsOnInitialStartup(t *testing.T) {
 		t.Fatalf("Load() error = %v", err)
 	}
 
-	if len(cfg.Nodes) != 1 {
-		t.Fatalf("len(cfg.Nodes) = %d, want 1", len(cfg.Nodes))
+	if len(cfg.Nodes) != 0 {
+		t.Fatalf("len(cfg.Nodes) = %d, want 0", len(cfg.Nodes))
 	}
-
-	if got, want := cfg.Nodes[0].URI, "socks5://1.0.171.213:8080"; got != want {
-		t.Fatalf("cfg.Nodes[0].URI = %q, want %q", got, want)
+	if got := requests.Load(); got != 0 {
+		t.Fatalf("subscription requests = %d, want 0", got)
 	}
 }

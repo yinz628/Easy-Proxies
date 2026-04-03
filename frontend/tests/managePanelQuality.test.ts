@@ -2,11 +2,13 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import {
+  applyQualityResultToManageList,
   buildQualityCacheEntry,
   buildQualityResultFromJobResult,
   mergeQualityJobSnapshot,
   reduceBatchQualityEvent,
 } from '../src/components/managePanelQuality.ts'
+import type { ManageListResponse } from '../src/types/index.ts'
 import type { BatchQualityState, BatchQualityLastResult } from '../src/components/managePanelQuality.ts'
 
 test('buildQualityCacheEntry only restores ai_reachability_v2 results', () => {
@@ -144,4 +146,46 @@ test('mergeQualityJobSnapshot preserves last streamed result when snapshot omits
 
   assert.equal(merged?.lastResult?.name, 'Node A')
   assert.equal(merged?.success, 1)
+})
+
+test('applyQualityResultToManageList tolerates null items from empty manage responses', () => {
+  const page = {
+    items: null,
+    page: 1,
+    page_size: 100,
+    total: 0,
+    filtered_total: 0,
+    summary: {
+      normal: 0,
+      pending: 0,
+      unavailable: 0,
+      blacklisted: 0,
+      disabled: 0,
+    },
+    facets: {
+      regions: [],
+      sources: [],
+      lifecycle_states: [],
+      manual_probe_statuses: [],
+      activation_readiness: [],
+      quality_statuses: [],
+    },
+  } as unknown as ManageListResponse
+
+  const next = applyQualityResultToManageList(page, 'JP-26', {
+    node_id: 0,
+    quality_version: 'ai_reachability_v2',
+    quality_status: 'unavailable',
+    quality_openai_status: 'fail',
+    quality_anthropic_status: 'fail',
+    activation_ready: false,
+    activation_block_reason: 'OpenAI 和 Anthropic 均不可用',
+    quality_score: 0,
+    quality_grade: 'F',
+    quality_summary: 'OpenAI 不可用，Anthropic 不可用',
+    quality_checked_at: '2026-04-02T18:16:26.506875821Z',
+    items: [],
+  })
+
+  assert.deepEqual(next?.items, [])
 })

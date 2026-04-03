@@ -62,7 +62,8 @@ var (
 
 // SubscriptionRefresher interface for subscription manager.
 type SubscriptionRefresher interface {
-	RefreshNow() error
+	RefreshLegacy() error
+	RefreshTXT() error
 	RefreshFeed(feedKey string) error
 	Status() SubscriptionStatus
 }
@@ -158,6 +159,7 @@ func NewServer(cfg Config, mgr *Manager, logger *log.Logger) *Server {
 	mux.HandleFunc("/api/nodes", s.withAuth(s.handleNodes))
 	mux.HandleFunc("/api/nodes/manage", s.withAuth(s.handleManageNodes))
 	mux.HandleFunc("/api/nodes/config", s.withAuth(s.handleConfigNodes))
+	mux.HandleFunc("/api/nodes/config/batch-lifecycle", s.withAuth(s.handleConfigNodesBatchLifecycle))
 	mux.HandleFunc("/api/nodes/config/batch-toggle", s.withAuth(s.handleConfigNodesBatchToggle))
 	mux.HandleFunc("/api/nodes/config/batch-delete", s.withAuth(s.handleConfigNodesBatchDelete))
 	mux.HandleFunc("/api/nodes/config/", s.withAuth(s.handleConfigNodeItem))
@@ -176,7 +178,8 @@ func NewServer(cfg Config, mgr *Manager, logger *log.Logger) *Server {
 	mux.HandleFunc("/api/export", s.withAuth(s.handleExport))
 	mux.HandleFunc("/api/import", s.withAuth(s.handleImport))
 	mux.HandleFunc("/api/subscription/status", s.withAuth(s.handleSubscriptionStatus))
-	mux.HandleFunc("/api/subscription/refresh", s.withAuth(s.handleSubscriptionRefresh))
+	mux.HandleFunc("/api/subscription/refresh-legacy", s.withAuth(s.handleSubscriptionRefreshLegacy))
+	mux.HandleFunc("/api/subscription/refresh-txt", s.withAuth(s.handleSubscriptionRefreshTXT))
 	mux.HandleFunc("/api/subscription/refresh-feed", s.withAuth(s.handleSubscriptionRefreshFeed))
 	mux.HandleFunc("/api/reload", s.withAuth(s.handleReload))
 
@@ -610,37 +613,96 @@ func (s *Server) handleNodes(w http.ResponseWriter, r *http.Request) {
 	}
 	// 返回所有注册节点，让前端根据状态过滤展示
 	allNodes := s.mgr.Snapshot()
+	filteredNodes, err := s.filterMonitorSnapshots(r.Context(), allNodes)
+	if err == nil {
+		allNodes = filteredNodes
+	}
 	totalNodes := len(allNodes)
 
-	// Calculate region statistics and traffic totals
 	regionStats := make(map[string]int)
 	regionHealthy := make(map[string]int)
+	var totalUpload int64
+	var totalDownload int64
+	var uploadSpeed int64
+	var downloadSpeed int64
 	for _, snap := range allNodes {
 		region := snap.Region
 		if region == "" {
 			region = "other"
 		}
 		regionStats[region]++
-		// Count healthy nodes per region
 		if snap.InitialCheckDone && snap.Available && !snap.Blacklisted {
 			regionHealthy[region]++
 		}
+		totalUpload += snap.TotalUpload
+		totalDownload += snap.TotalDownload
+		uploadSpeed += snap.UploadSpeed
+		downloadSpeed += snap.DownloadSpeed
 	}
-
-	traffic := s.mgr.TrafficSummary(false)
 
 	payload := map[string]any{
 		"nodes":           allNodes,
 		"total_nodes":     totalNodes,
-		"total_upload":    traffic.TotalUpload,
-		"total_download":  traffic.TotalDownload,
-		"upload_speed":    traffic.UploadSpeed,
-		"download_speed":  traffic.DownloadSpeed,
-		"traffic_sampled": traffic.SampledAt,
+		"total_upload":    totalUpload,
+		"total_download":  totalDownload,
+		"upload_speed":    uploadSpeed,
+		"download_speed":  downloadSpeed,
+		"traffic_sampled": time.Now(),
 		"region_stats":    regionStats,
 		"region_healthy":  regionHealthy,
 	}
 	writeJSON(w, payload)
+}
+
+func (s *Server) filterMonitorSnapshots(ctx context.Context, snapshots []Snapshot) ([]Snapshot, error) {
+	if s == nil || s.nodeMgr == nil || len(snapshots) == 0 {
+		return snapshots, nil
+	}
+
+	configNodes, err := s.nodeMgr.ListConfigNodes(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	activeKeys := make(map[string]struct{}, len(configNodes)*2)
+	for _, node := range configNodes {
+		if !isRuntimeVisibleConfigNode(node) {
+			continue
+		}
+		if uriKey := normalizeLookupKey(node.URI); uriKey != "" {
+			activeKeys[uriKey] = struct{}{}
+		}
+		if nameKey := normalizeLookupKey(node.Name); nameKey != "" {
+			activeKeys[nameKey] = struct{}{}
+		}
+	}
+	if len(activeKeys) == 0 {
+		return []Snapshot{}, nil
+	}
+
+	filtered := make([]Snapshot, 0, len(snapshots))
+	for _, snap := range snapshots {
+		if _, ok := activeKeys[normalizeLookupKey(snap.URI)]; ok {
+			filtered = append(filtered, snap)
+			continue
+		}
+		if _, ok := activeKeys[normalizeLookupKey(snap.Name)]; ok {
+			filtered = append(filtered, snap)
+		}
+	}
+	return filtered, nil
+}
+
+func isRuntimeVisibleConfigNode(node config.NodeConfig) bool {
+	if node.Disabled {
+		return false
+	}
+	switch strings.TrimSpace(node.LifecycleState) {
+	case "", store.NodeLifecycleActive:
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *Server) handleManageNodes(w http.ResponseWriter, r *http.Request) {
@@ -659,13 +721,11 @@ func (s *Server) handleManageNodes(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	configNodes, err := s.nodeMgr.ListConfigNodes(r.Context())
+	rows, err := s.loadManageRows(r.Context())
 	if err != nil {
 		s.respondNodeError(w, err)
 		return
 	}
-
-	rows := BuildManageRows(configNodes, s.mgr.Snapshot())
 	writeJSON(w, QueryManageRows(rows, query))
 }
 
@@ -674,7 +734,7 @@ func (s *Server) handleDebug(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
-	snapshots := s.mgr.Snapshot()
+	snapshots := s.mgr.SnapshotDetailed()
 	var totalCalls, totalSuccess int64
 	debugNodes := make([]map[string]any, 0, len(snapshots))
 	for _, snap := range snapshots {
@@ -733,16 +793,18 @@ func (s *Server) handleNodeAction(w http.ResponseWriter, r *http.Request) {
 		}
 		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 		defer cancel()
-		latency, err := s.mgr.Probe(ctx, tag)
+		if err := s.probeSem.Acquire(ctx, 1); err != nil {
+			writeJSON(w, map[string]any{"error": fmt.Sprintf("probe cancelled: %v", err)})
+			return
+		}
+		defer s.probeSem.Release(1)
+
+		latencyMs, err := s.runManualProbeAndPersistByTag(ctx, tag)
 		if err != nil {
 			writeJSON(w, map[string]any{"error": err.Error()})
 			return
 		}
-		latencyMs := latency.Milliseconds()
-		if latencyMs == 0 && latency > 0 {
-			latencyMs = 1 // Round up sub-millisecond latencies to 1ms
-		}
-		writeJSON(w, map[string]any{"message": "探测成功", "latency_ms": latencyMs})
+		writeJSON(w, map[string]any{"message": "入池预检通过", "latency_ms": latencyMs})
 	case "quality-check":
 		if s.store == nil {
 			w.WriteHeader(http.StatusServiceUnavailable)
@@ -774,6 +836,10 @@ func (s *Server) handleNodeAction(w http.ResponseWriter, r *http.Request) {
 			if result == nil {
 				w.WriteHeader(http.StatusNotFound)
 				writeJSON(w, map[string]any{"error": "quality check result not found"})
+				return
+			}
+			if err := s.applyActivationStateToPersistedQualityCheck(r.Context(), node.ID, result); err != nil {
+				writeJSON(w, map[string]any{"error": err.Error()})
 				return
 			}
 			writeJSON(w, map[string]any{"result": result})
@@ -825,6 +891,25 @@ type manageSelectionRequest struct {
 	Tags      []string         `json:"tags,omitempty"`
 }
 
+type batchLifecycleAction string
+
+const (
+	batchLifecycleActivate   batchLifecycleAction = "activate"
+	batchLifecycleDeactivate batchLifecycleAction = "deactivate"
+	batchLifecycleDisable    batchLifecycleAction = "disable"
+)
+
+type batchLifecycleSummary struct {
+	Message     string   `json:"message"`
+	Action      string   `json:"action"`
+	Total       int      `json:"total"`
+	Success     int      `json:"success"`
+	Skipped     int      `json:"skipped"`
+	Errors      []string `json:"errors,omitempty"`
+	Reloaded    bool     `json:"reloaded"`
+	ReloadError string   `json:"reload_error,omitempty"`
+}
+
 func (s *Server) handleProbeBatchStart(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.WriteHeader(http.StatusMethodNotAllowed)
@@ -857,6 +942,12 @@ func (s *Server) handleProbeBatchStart(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(selectedTags) == 0 {
 		w.WriteHeader(http.StatusBadRequest)
+		writeJSON(w, map[string]any{"error": "娌℃湁鍙帰娴嬬殑鑺傜偣"})
+		return
+	}
+	var err error
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
 		writeJSON(w, map[string]any{"error": "没有可探测的节点"})
 		return
 	}
@@ -875,19 +966,7 @@ func (s *Server) handleProbeBatchStart(w http.ResponseWriter, r *http.Request) {
 	}
 
 	job, err := s.probeJobs.Start(filtered, func(ctx context.Context, target BatchProbeTarget) (int64, error) {
-		probeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		defer cancel()
-
-		if err := s.probeSem.Acquire(probeCtx, 1); err != nil {
-			return -1, fmt.Errorf("probe cancelled: %w", err)
-		}
-		defer s.probeSem.Release(1)
-
-		latency, err := s.mgr.Probe(probeCtx, target.Tag)
-		if err != nil {
-			return -1, err
-		}
-		return latency.Milliseconds(), nil
+		return s.runBatchProbeTarget(ctx, target)
 	})
 	if err != nil {
 		if errors.Is(err, ErrBatchProbeJobRunning) {
@@ -943,7 +1022,7 @@ func (s *Server) handleProbeBatchCancel(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	writeJSON(w, map[string]any{"message": "批量探测已取消", "job_id": req.JobID})
+	writeJSON(w, map[string]any{"message": "批量入池预检已取消", "job_id": req.JobID})
 }
 
 func (s *Server) streamProbeSnapshots(w http.ResponseWriter, r *http.Request, targets []BatchProbeTarget) {
@@ -1005,7 +1084,7 @@ func (s *Server) streamProbeSnapshots(w http.ResponseWriter, r *http.Request, ta
 			probeCtx, probeCancel := context.WithTimeout(ctx, 10*time.Second)
 			defer probeCancel()
 
-			latency, err := s.mgr.Probe(probeCtx, target.Tag)
+			latency, err := s.runManualProbeAndPersistByTag(probeCtx, target.Tag)
 			if err != nil {
 				results <- probeResult{
 					tag:     target.Tag,
@@ -1017,7 +1096,7 @@ func (s *Server) streamProbeSnapshots(w http.ResponseWriter, r *http.Request, ta
 				results <- probeResult{
 					tag:     target.Tag,
 					name:    target.Name,
-					latency: latency.Milliseconds(),
+					latency: latency,
 					err:     "",
 				}
 			}
@@ -1067,14 +1146,14 @@ func (s *Server) handleQualityCheckBatch(w http.ResponseWriter, r *http.Request)
 	}
 	if s.store == nil {
 		w.WriteHeader(http.StatusServiceUnavailable)
-		writeJSON(w, map[string]any{"error": "no eligible nodes"})
+		writeJSON(w, map[string]any{"error": "数据存储未初始化"})
 		return
 	}
 
 	var req manageSelectionRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(http.StatusBadRequest)
-		writeJSON(w, map[string]any{"error": "invalid request body"})
+		writeJSON(w, map[string]any{"error": "请求格式错误"})
 		return
 	}
 	if usesNodeManagerSelection(req) && !s.ensureNodeManager(w) {
@@ -1084,7 +1163,7 @@ func (s *Server) handleQualityCheckBatch(w http.ResponseWriter, r *http.Request)
 	selectedRows, err := s.resolveSelectionRequest(r.Context(), req)
 	if err != nil {
 		w.WriteHeader(http.StatusBadRequest)
-		writeJSON(w, map[string]any{"error": "no eligible nodes"})
+		writeJSON(w, map[string]any{"error": "没有可检测的节点"})
 		return
 	}
 
@@ -1096,11 +1175,17 @@ func (s *Server) handleQualityCheckBatch(w http.ResponseWriter, r *http.Request)
 	}
 	if len(targets) == 0 {
 		w.WriteHeader(http.StatusBadRequest)
-		writeJSON(w, map[string]any{"error": "no eligible nodes"})
+		writeJSON(w, map[string]any{"error": "没有可检测的节点"})
 		return
 	}
 
 	checker := NewQualityChecker(s.mgr, s.store, s.nodeMgr)
+	if len(targets) == 0 {
+		w.WriteHeader(http.StatusBadRequest)
+		writeJSON(w, map[string]any{"error": "没有可检测的节点"})
+		return
+	}
+
 	job, err := s.qualityJobs.Start(targets, func(ctx context.Context, target BatchQualityTarget) (*store.NodeQualityCheck, error) {
 		if err := s.qualitySem.Acquire(ctx, 1); err != nil {
 			return nil, fmt.Errorf("quality check cancelled: %w", err)
@@ -1242,6 +1327,8 @@ func (s *Server) handleQualityCheckBatchStream(w http.ResponseWriter, r *http.Re
 			"quality_status":           job.LastResult.QualityStatus,
 			"quality_openai_status":    job.LastResult.QualityOpenAIStatus,
 			"quality_anthropic_status": job.LastResult.QualityAnthropicStatus,
+			"activation_ready":         job.LastResult.ActivationReady,
+			"activation_block_reason":  job.LastResult.ActivationBlockReason,
 			"quality_score":            job.LastResult.QualityScore,
 			"quality_grade":            job.LastResult.QualityGrade,
 			"quality_summary":          job.LastResult.QualitySummary,
@@ -1282,6 +1369,8 @@ func (s *Server) handleQualityCheckBatchStream(w http.ResponseWriter, r *http.Re
 				"quality_status":           event.Result.QualityStatus,
 				"quality_openai_status":    event.Result.QualityOpenAIStatus,
 				"quality_anthropic_status": event.Result.QualityAnthropicStatus,
+				"activation_ready":         event.Result.ActivationReady,
+				"activation_block_reason":  event.Result.ActivationBlockReason,
 				"quality_score":            event.Result.QualityScore,
 				"quality_grade":            event.Result.QualityGrade,
 				"quality_summary":          event.Result.QualitySummary,
@@ -1392,7 +1481,7 @@ func (s *Server) handleProbeBatchStartV2(w http.ResponseWriter, r *http.Request)
 	var req manageSelectionRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(http.StatusBadRequest)
-		writeJSON(w, map[string]any{"error": "invalid request body"})
+		writeJSON(w, map[string]any{"error": "璇锋眰鏍煎紡閿欒"})
 		return
 	}
 	if usesNodeManagerSelection(req) && !s.ensureNodeManager(w) {
@@ -1402,32 +1491,45 @@ func (s *Server) handleProbeBatchStartV2(w http.ResponseWriter, r *http.Request)
 	selectedRows, err := s.resolveSelectionRequest(r.Context(), req)
 	if err != nil {
 		w.WriteHeader(http.StatusBadRequest)
-		writeJSON(w, map[string]any{"error": "no eligible nodes"})
+		writeJSON(w, map[string]any{"error": "娌℃湁鍙帰娴嬬殑鑺傜偣"})
 		return
 	}
 
 	targets, err := s.resolveBatchProbeTargets(r.Context(), selectedRows)
 	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		writeJSON(w, map[string]any{"error": err.Error()})
+		w.WriteHeader(http.StatusBadRequest)
+		writeJSON(w, map[string]any{"error": "娌℃湁鍙帰娴嬬殑鑺傜偣"})
 		return
 	}
+
 	if len(targets) == 0 {
 		w.WriteHeader(http.StatusBadRequest)
-		writeJSON(w, map[string]any{"error": "no eligible nodes"})
+		writeJSON(w, map[string]any{"error": "濞屸剝婀侀崣顖涘赴濞村娈戦懞鍌滃仯"})
+		return
+	}
+	requestedTags := []string{}
+
+	snapshotsByTag := make(map[string]BatchProbeTarget)
+	for _, snap := range s.mgr.Snapshot() {
+		if snap.Tag != "" {
+			snapshotsByTag[snap.Tag] = BatchProbeTarget{Tag: snap.Tag, Name: snap.Name}
+		}
+	}
+
+	filtered := targets
+	for _, tag := range requestedTags {
+		if snap, ok := snapshotsByTag[tag]; ok {
+			filtered = append(filtered, snap)
+		}
+	}
+	if len(filtered) == 0 {
+		w.WriteHeader(http.StatusBadRequest)
+		writeJSON(w, map[string]any{"error": "娌℃湁鍙帰娴嬬殑鑺傜偣"})
 		return
 	}
 
-	job, err := s.probeJobs.Start(targets, func(ctx context.Context, target BatchProbeTarget) (int64, error) {
-		probeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		defer cancel()
-
-		if err := s.probeSem.Acquire(probeCtx, 1); err != nil {
-			return -1, fmt.Errorf("probe cancelled: %w", err)
-		}
-		defer s.probeSem.Release(1)
-
-		return s.runManualProbeAndPersist(probeCtx, target)
+	job, err := s.probeJobs.Start(filtered, func(ctx context.Context, target BatchProbeTarget) (int64, error) {
+		return s.runBatchProbeTarget(ctx, target)
 	})
 	if err != nil {
 		if errors.Is(err, ErrBatchProbeJobRunning) {
@@ -1444,6 +1546,54 @@ func (s *Server) handleProbeBatchStartV2(w http.ResponseWriter, r *http.Request)
 
 func (s *Server) handleQualityCheckBatchV2(w http.ResponseWriter, r *http.Request) {
 	s.handleQualityCheckBatch(w, r)
+}
+
+func (s *Server) handleConfigNodesBatchLifecycle(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.ensureNodeManager(w) {
+		return
+	}
+	if s.store == nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		writeJSON(w, map[string]any{"error": "数据存储未初始化"})
+		return
+	}
+
+	var body struct {
+		manageSelectionRequest
+		Action string `json:"action"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		writeJSON(w, map[string]any{"error": "请求格式错误"})
+		return
+	}
+
+	action := normalizeBatchLifecycleAction(body.Action)
+	if action == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		writeJSON(w, map[string]any{"error": "action 不支持"})
+		return
+	}
+
+	selectedRows, err := s.resolveSelectionRequest(r.Context(), body.manageSelectionRequest)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		writeJSON(w, map[string]any{"error": "节点列表为空"})
+		return
+	}
+
+	summary, err := s.applyBatchLifecycleAction(r.Context(), selectedRows, action)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		writeJSON(w, map[string]any{"error": err.Error()})
+		return
+	}
+
+	writeJSON(w, summary)
 }
 
 func (s *Server) handleConfigNodesBatchToggleV2(w http.ResponseWriter, r *http.Request) {
@@ -1502,6 +1652,193 @@ func (s *Server) handleConfigNodesBatchToggleV2(w http.ResponseWriter, r *http.R
 		result["errors"] = errs
 	}
 	writeJSON(w, result)
+}
+
+func normalizeBatchLifecycleAction(value string) batchLifecycleAction {
+	switch strings.TrimSpace(strings.ToLower(value)) {
+	case string(batchLifecycleActivate):
+		return batchLifecycleActivate
+	case string(batchLifecycleDeactivate):
+		return batchLifecycleDeactivate
+	case string(batchLifecycleDisable):
+		return batchLifecycleDisable
+	default:
+		return ""
+	}
+}
+
+func batchLifecycleActionLabel(action batchLifecycleAction) string {
+	switch action {
+	case batchLifecycleActivate:
+		return "激活"
+	case batchLifecycleDeactivate:
+		return "移回待激活"
+	case batchLifecycleDisable:
+		return "禁用"
+	default:
+		return "更新"
+	}
+}
+
+func batchLifecycleTargetState(action batchLifecycleAction) string {
+	switch action {
+	case batchLifecycleActivate:
+		return store.NodeLifecycleActive
+	case batchLifecycleDeactivate:
+		return store.NodeLifecycleStaged
+	case batchLifecycleDisable:
+		return store.NodeLifecycleDisabled
+	default:
+		return ""
+	}
+}
+
+func (s *Server) applyBatchLifecycleAction(ctx context.Context, selectedRows []ManageRow, action batchLifecycleAction) (batchLifecycleSummary, error) {
+	summary := batchLifecycleSummary{
+		Action: string(action),
+		Total:  len(selectedRows),
+	}
+
+	storeNodes, err := s.store.ListNodes(ctx, store.NodeFilter{})
+	if err != nil {
+		return summary, err
+	}
+
+	nodesByURI := make(map[string]*store.Node, len(storeNodes))
+	nodesByName := make(map[string]*store.Node, len(storeNodes))
+	for idx := range storeNodes {
+		node := &storeNodes[idx]
+		if uriKey := normalizeLookupKey(node.URI); uriKey != "" {
+			if _, exists := nodesByURI[uriKey]; !exists {
+				nodesByURI[uriKey] = node
+			}
+		}
+		if nameKey := normalizeLookupKey(node.Name); nameKey != "" {
+			if _, exists := nodesByName[nameKey]; !exists {
+				nodesByName[nameKey] = node
+			}
+		}
+	}
+
+	seenIDs := make(map[int64]struct{}, len(selectedRows))
+	nodeIDs := make([]int64, 0, len(selectedRows))
+	for _, row := range selectedRows {
+		displayName := firstNonEmpty(strings.TrimSpace(row.Name), strings.TrimSpace(row.Tag), strings.TrimSpace(row.URI), "unknown")
+		resolved := resolveStoreNodeForManageRow(row, nodesByURI, nodesByName)
+		if resolved == nil {
+			summary.Skipped++
+			summary.Errors = append(summary.Errors, fmt.Sprintf("%s: 节点未持久化到数据库", displayName))
+			continue
+		}
+		if _, exists := seenIDs[resolved.ID]; exists {
+			continue
+		}
+		seenIDs[resolved.ID] = struct{}{}
+
+		if row.Source == string(config.NodeSourceInline) || resolved.Source == store.NodeSourceInline {
+			summary.Skipped++
+			summary.Errors = append(summary.Errors, fmt.Sprintf("%s: inline 节点不支持生命周期切换", displayName))
+			continue
+		}
+
+		if reason := validateBatchLifecycleTransition(ctx, s, resolved, action); reason != "" {
+			summary.Skipped++
+			summary.Errors = append(summary.Errors, fmt.Sprintf("%s: %s", displayName, reason))
+			continue
+		}
+
+		nodeIDs = append(nodeIDs, resolved.ID)
+	}
+
+	summary.Success = len(nodeIDs)
+	summary.Skipped += summary.Total - summary.Success - summary.Skipped
+
+	if len(nodeIDs) > 0 {
+		if err := s.store.BatchUpdateNodeLifecycle(ctx, nodeIDs, batchLifecycleTargetState(action)); err != nil {
+			return summary, err
+		}
+		if err := s.nodeMgr.TriggerReload(ctx); err != nil {
+			summary.ReloadError = err.Error()
+		} else {
+			summary.Reloaded = true
+		}
+	}
+
+	summary.Message = fmt.Sprintf("%s %d 个节点，跳过 %d 个节点", batchLifecycleActionLabel(action), summary.Success, summary.Skipped)
+	if summary.ReloadError != "" {
+		summary.Message += "（自动重载失败，请手动重载）"
+	} else if summary.Reloaded {
+		summary.Message += "（已自动重载）"
+	}
+
+	return summary, nil
+}
+
+func validateBatchLifecycleTransition(ctx context.Context, s *Server, node *store.Node, action batchLifecycleAction) string {
+	switch action {
+	case batchLifecycleActivate:
+		if node.LifecycleState != store.NodeLifecycleStaged {
+			return "仅 staged 节点可激活"
+		}
+		ready, reason, err := s.lookupStoreNodeActivationState(ctx, node.ID)
+		if err != nil {
+			return fmt.Sprintf("读取激活状态失败: %v", err)
+		}
+		if !ready {
+			if strings.TrimSpace(reason) == "" {
+				reason = "未满足激活条件"
+			}
+			return reason
+		}
+	case batchLifecycleDeactivate:
+		if node.LifecycleState != store.NodeLifecycleActive {
+			return "仅 active 节点可移回待激活"
+		}
+	case batchLifecycleDisable:
+		if node.LifecycleState == store.NodeLifecycleDisabled {
+			return "节点已禁用"
+		}
+	default:
+		return "action 不支持"
+	}
+
+	return ""
+}
+
+func (s *Server) lookupStoreNodeActivationState(ctx context.Context, nodeID int64) (bool, string, error) {
+	manualProbe, err := s.store.GetNodeManualProbeResult(ctx, nodeID)
+	if err != nil {
+		return false, "", err
+	}
+	check, err := s.store.GetNodeQualityCheck(ctx, nodeID)
+	if err != nil {
+		return false, "", err
+	}
+
+	manualProbeStatus := store.ManualProbeStatusUntested
+	if manualProbe != nil {
+		manualProbeStatus = manualProbe.Status
+	}
+
+	openAIStatus := ""
+	anthropicStatus := ""
+	if check != nil {
+		openAIStatus = check.QualityOpenAIStatus
+		anthropicStatus = check.QualityAnthropicStatus
+	}
+
+	ready, reason := deriveActivationState(manualProbeStatus, openAIStatus, anthropicStatus)
+	return ready, reason, nil
+}
+
+func resolveStoreNodeForManageRow(row ManageRow, nodesByURI, nodesByName map[string]*store.Node) *store.Node {
+	if node := nodesByURI[normalizeLookupKey(row.URI)]; node != nil {
+		return node
+	}
+	if node := nodesByName[normalizeLookupKey(row.Name)]; node != nil {
+		return node
+	}
+	return nil
 }
 
 func (s *Server) handleConfigNodesBatchDeleteV2(w http.ResponseWriter, r *http.Request) {
@@ -1654,7 +1991,36 @@ func (s *Server) loadManageRows(ctx context.Context) ([]ManageRow, error) {
 	if err != nil {
 		return nil, err
 	}
-	return BuildManageRows(configNodes, s.mgr.Snapshot()), nil
+
+	rows := BuildManageRows(configNodes, s.mgr.Snapshot())
+	if s.store == nil {
+		return rows, nil
+	}
+
+	storeNodes, err := s.store.ListNodes(ctx, store.NodeFilter{})
+	if err != nil {
+		return nil, err
+	}
+	results, err := s.store.GetAllNodeManualProbeResults(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	ApplyManageManualProbeResults(rows, storeNodes, results)
+	return rows, nil
+}
+
+func (s *Server) applyActivationStateToPersistedQualityCheck(ctx context.Context, nodeID int64, result *store.NodeQualityCheck) error {
+	if s == nil || s.store == nil || result == nil {
+		return nil
+	}
+
+	manualProbe, err := s.store.GetNodeManualProbeResult(ctx, nodeID)
+	if err != nil {
+		return err
+	}
+	applyActivationStateToQualityCheck(result, manualProbe)
+	return nil
 }
 
 func namesFromRows(rows []ManageRow) []string {
@@ -1731,16 +2097,6 @@ func (s *Server) snapshotByTag(tag string) (Snapshot, bool) {
 	return Snapshot{}, false
 }
 
-func resolveStoreNodeForManageRow(row ManageRow, nodesByURI, nodesByName map[string]*store.Node) *store.Node {
-	if node := nodesByURI[normalizeLookupKey(row.URI)]; node != nil {
-		return node
-	}
-	if node := nodesByName[normalizeLookupKey(row.Name)]; node != nil {
-		return node
-	}
-	return nil
-}
-
 func (s *Server) runManualProbeAndPersistByTag(ctx context.Context, tag string) (int64, error) {
 	snapshot, found := s.snapshotByTag(tag)
 	latency, err := s.mgr.Probe(ctx, tag)
@@ -1754,12 +2110,15 @@ func (s *Server) runManualProbeAndPersistByTag(ctx context.Context, tag string) 
 	}
 
 	if s.store != nil && found {
-		node, lookupErr := s.lookupStoreNodeForSnapshot(ctx, snapshot)
+		persistCtx, cancel := manualProbePersistContext(ctx)
+		defer cancel()
+
+		node, lookupErr := s.lookupStoreNodeForSnapshot(persistCtx, snapshot)
 		if lookupErr != nil {
 			return -1, lookupErr
 		}
 		if node != nil {
-			if saveErr := s.store.SaveNodeManualProbeResult(ctx, buildManualProbeResult(node.ID, latency, resultErr)); saveErr != nil {
+			if saveErr := s.store.SaveNodeManualProbeResult(persistCtx, buildManualProbeResult(node.ID, latency, resultErr)); saveErr != nil {
 				return -1, saveErr
 			}
 		}
@@ -1978,7 +2337,8 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		Content string `json:"content"` // 节点 URI 文本，每行一个
+		Content    string `json:"content"`     // 节点 URI 文本，每行一个
+		NamePrefix string `json:"name_prefix"` // 自动命名前缀
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(http.StatusBadRequest)
@@ -1993,57 +2353,140 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 解析每行 URI
+	existingNodes, err := s.nodeMgr.ListConfigNodes(r.Context())
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		writeJSON(w, map[string]any{"error": fmt.Sprintf("读取现有节点失败: %v", err)})
+		return
+	}
+	existingNames := make([]string, 0, len(existingNodes))
+	for _, node := range existingNodes {
+		existingNames = append(existingNames, node.Name)
+	}
+	naming := newImportNamingState(existingNames)
+
+	type importResultItem struct {
+		Line          int    `json:"line"`
+		RequestedName string `json:"requested_name,omitempty"`
+		FinalName     string `json:"final_name"`
+		Status        string `json:"status"`
+		Reason        string `json:"reason,omitempty"`
+	}
+
 	lines := strings.Split(content, "\n")
 	var imported int
+	var renamed int
 	var errs []string
+	items := make([]importResultItem, 0, len(lines))
 
-	for _, line := range lines {
+	for idx, line := range lines {
 		line = strings.TrimSpace(line)
-		// 跳过空行和注释
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
 
-		// 验证是否为合法代理 URI
 		if !config.IsProxyURI(line) {
-			errs = append(errs, fmt.Sprintf("无效的代理 URI: %s", truncateStr(line, 60)))
+			errs = append(errs, fmt.Sprintf("第 %d 行代理 URI 无效: %s", idx+1, truncateStr(line, 60)))
 			continue
 		}
 
-		// 从 URI 中提取名称
-		name := ""
-		if parsed, err := url.Parse(line); err == nil && parsed.Fragment != "" {
-			if decoded, decErr := url.QueryUnescape(parsed.Fragment); decErr == nil {
-				name = decoded
-			} else {
-				name = parsed.Fragment
-			}
-		}
-		if name == "" {
-			name = fmt.Sprintf("imported-%d", imported+1)
-		}
+		requestedName := extractImportNodeName(line)
+		finalName, wasRenamed, reason := resolveImportedNodeName(requestedName, req.NamePrefix, naming.reservedNames, naming.prefixCounters)
 
 		node := config.NodeConfig{
-			Name: name,
+			Name: finalName,
 			URI:  line,
 		}
 
-		if _, err := s.nodeMgr.CreateNode(r.Context(), node); err != nil {
-			errs = append(errs, fmt.Sprintf("添加节点 %q 失败: %v", name, err))
+		storedNode, created, err := s.createImportedNode(r.Context(), node)
+		if err != nil {
+			errs = append(errs, fmt.Sprintf("第 %d 行添加节点 %q 失败: %v", idx+1, finalName, err))
 			continue
 		}
-		imported++
+
+		itemStatus := "imported"
+		itemReason := reason
+		itemFinalName := finalName
+		if storedNode.Name != "" {
+			itemFinalName = storedNode.Name
+		}
+		if !created {
+			itemStatus = "existing"
+			itemReason = "duplicate_uri"
+		}
+
+		if created && wasRenamed {
+			renamed++
+		}
+		items = append(items, importResultItem{
+			Line:          idx + 1,
+			RequestedName: requestedName,
+			FinalName:     itemFinalName,
+			Status:        itemStatus,
+			Reason:        itemReason,
+		})
+		if created {
+			imported++
+		}
 	}
 
 	result := map[string]any{
 		"message":  fmt.Sprintf("成功导入 %d 个节点", imported),
 		"imported": imported,
+		"renamed":  renamed,
+		"items":    items,
 	}
 	if len(errs) > 0 {
 		result["errors"] = errs
 	}
 	writeJSON(w, result)
+}
+
+func (s *Server) createImportedNode(ctx context.Context, node config.NodeConfig) (config.NodeConfig, bool, error) {
+	if s != nil && s.store != nil {
+		existing, err := s.store.GetNodeByURI(ctx, node.URI)
+		if err != nil {
+			return config.NodeConfig{}, false, fmt.Errorf("lookup existing node: %w", err)
+		}
+		if existing != nil {
+			return config.NodeConfig{
+				Name:           existing.Name,
+				URI:            existing.URI,
+				Port:           existing.Port,
+				Username:       existing.Username,
+				Password:       existing.Password,
+				Source:         config.NodeSource(existing.Source),
+				LifecycleState: existing.LifecycleState,
+			}, false, nil
+		}
+
+		storeNode := &store.Node{
+			URI:            node.URI,
+			Name:           node.Name,
+			Source:         store.NodeSourceManual,
+			Port:           node.Port,
+			Username:       node.Username,
+			Password:       node.Password,
+			Enabled:        true,
+			LifecycleState: store.NodeLifecycleStaged,
+		}
+		if err := s.store.CreateNode(ctx, storeNode); err != nil {
+			return config.NodeConfig{}, false, fmt.Errorf("save to store: %w", err)
+		}
+		node.Source = config.NodeSourceManual
+		node.LifecycleState = store.NodeLifecycleStaged
+		return node, true, nil
+	}
+
+	if s == nil || s.nodeMgr == nil {
+		return config.NodeConfig{}, false, errors.New("node manager not initialized")
+	}
+
+	createdNode, err := s.nodeMgr.CreateNode(ctx, node)
+	if err != nil {
+		return config.NodeConfig{}, false, err
+	}
+	return createdNode, true, nil
 }
 
 // truncateStr truncates a string to maxLen and appends "..." if truncated.
@@ -2100,6 +2543,7 @@ func (s *Server) handleSubscriptionStatus(w http.ResponseWriter, r *http.Request
 		resp := map[string]any{
 			"enabled":           false,
 			"has_subscriptions": false,
+			"staged_count":      0,
 			"feeds":             []SubscriptionFeedStatus{},
 			"message":           "订阅管理器未初始化",
 		}
@@ -2119,7 +2563,7 @@ func (s *Server) handleSubscriptionStatus(w http.ResponseWriter, r *http.Request
 		"has_subscriptions": status.HasSubscriptions,
 		"last_refresh":      status.LastRefresh,
 		"next_refresh":      status.NextRefresh,
-		"node_count":        status.NodeCount,
+		"staged_count":      status.NodeCount,
 		"last_error":        status.LastError,
 		"refresh_count":     status.RefreshCount,
 		"is_refreshing":     status.IsRefreshing,
@@ -2128,7 +2572,7 @@ func (s *Server) handleSubscriptionStatus(w http.ResponseWriter, r *http.Request
 }
 
 // handleSubscriptionRefresh triggers an immediate subscription refresh.
-func (s *Server) handleSubscriptionRefresh(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleSubscriptionRefreshLegacy(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
@@ -2140,7 +2584,7 @@ func (s *Server) handleSubscriptionRefresh(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	if err := s.subRefresher.RefreshNow(); err != nil {
+	if err := s.subRefresher.RefreshLegacy(); err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
 		writeJSON(w, map[string]any{"error": err.Error()})
 		return
@@ -2148,8 +2592,33 @@ func (s *Server) handleSubscriptionRefresh(w http.ResponseWriter, r *http.Reques
 
 	status := s.subRefresher.Status()
 	writeJSON(w, map[string]any{
-		"message":    "刷新成功",
-		"node_count": status.NodeCount,
+		"message":      "刷新成功",
+		"staged_count": status.NodeCount,
+	})
+}
+
+func (s *Server) handleSubscriptionRefreshTXT(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	if s.subRefresher == nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		writeJSON(w, map[string]any{"error": "订阅管理器未初始化，请重启程序"})
+		return
+	}
+
+	if err := s.subRefresher.RefreshTXT(); err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		writeJSON(w, map[string]any{"error": err.Error()})
+		return
+	}
+
+	status := s.subRefresher.Status()
+	writeJSON(w, map[string]any{
+		"message":      "TXT 订阅已导入候选节点",
+		"staged_count": status.NodeCount,
 	})
 }
 
@@ -2186,8 +2655,9 @@ func (s *Server) handleSubscriptionRefreshFeed(w http.ResponseWriter, r *http.Re
 	}
 
 	writeJSON(w, map[string]any{
-		"message":  "单源刷新成功",
-		"feed_key": req.FeedKey,
+		"message":      "单源刷新成功",
+		"feed_key":     req.FeedKey,
+		"staged_count": s.subRefresher.Status().NodeCount,
 	})
 }
 

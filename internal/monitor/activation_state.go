@@ -21,11 +21,11 @@ func deriveActivationState(manualProbeStatus, openAIStatus, anthropicStatus stri
 		}
 		return false, activationBlockedByQuality(openAIStatus, anthropicStatus)
 	case store.ManualProbeStatusFail:
-		return false, "手工探测失败"
+		return false, "入池预检失败"
 	case store.ManualProbeStatusTimeout:
-		return false, "手工探测超时"
+		return false, "入池预检超时"
 	default:
-		return false, "未完成手工探测"
+		return false, "未完成入池预检"
 	}
 }
 

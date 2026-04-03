@@ -184,7 +184,7 @@ func (n *NodeConfig) NodeKey() string {
 }
 
 // Load reads YAML config from disk and applies defaults/validation.
-// This is used for the initial startup and will fetch subscription URLs.
+// Startup does not fetch subscription URLs; store-backed nodes are loaded later by app.go.
 func Load(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -205,7 +205,7 @@ func Load(path string) (*Config, error) {
 		cfg.GeoIP.DatabasePath = filepath.Join(configDir, cfg.GeoIP.DatabasePath)
 	}
 
-	if err := cfg.normalizeInternal(false); err != nil {
+	if err := cfg.normalizeInternal(false, true); err != nil {
 		return nil, err
 	}
 	return &cfg, nil
@@ -235,14 +235,14 @@ func LoadForReload(path string) (*Config, error) {
 		cfg.GeoIP.DatabasePath = filepath.Join(configDir, cfg.GeoIP.DatabasePath)
 	}
 
-	if err := cfg.normalizeInternal(true); err != nil {
+	if err := cfg.normalizeInternal(false, false); err != nil {
 		return nil, err
 	}
 	return &cfg, nil
 }
 
 func (c *Config) normalize() error {
-	return c.normalizeInternal(false)
+	return c.normalizeInternal(false, true)
 }
 
 // applyDefaults sets default values for all config fields.
@@ -344,11 +344,10 @@ func (c *Config) applyDefaults() error {
 	return nil
 }
 
-// normalizeInternal applies defaults, loads external nodes, and validates config.
-// If skipSubscriptionFetch is true (reload/refresh scenario), only inline nodes
-// from config.yaml are loaded. Subscription and manual nodes are managed by the
-// SQLite Store and loaded by the caller (app.go / boxmgr).
-func (c *Config) normalizeInternal(skipSubscriptionFetch bool) error {
+// normalizeInternal applies defaults, optionally loads nodes_file and subscriptions,
+// and validates config. Subscription and manual nodes are loaded from SQLite Store by
+// the caller (app.go / boxmgr), so callers can suppress network fetches entirely.
+func (c *Config) normalizeInternal(loadSubscriptions bool, loadNodesFile bool) error {
 	if err := c.applyDefaults(); err != nil {
 		return err
 	}
@@ -358,16 +357,10 @@ func (c *Config) normalizeInternal(skipSubscriptionFetch bool) error {
 		c.Nodes[idx].Source = NodeSourceInline
 	}
 
-	if skipSubscriptionFetch {
-		// ---- Reload mode ----
-		// Nodes will be loaded from SQLite Store by the caller (app.go / boxmgr).
-		// Only inline nodes from config.yaml are included here.
-		log.Printf("[config] reload mode: %d inline nodes from config.yaml", len(c.Nodes))
-	} else {
-		// ---- Initial load mode ----
-
-		// Load nodes from file if specified (but NOT if subscriptions exist - subscription takes priority)
-		if c.NodesFile != "" && len(c.Subscriptions) == 0 {
+	if loadNodesFile {
+		// Load nodes from file if specified. When subscription fetch is disabled,
+		// nodes_file remains a local bootstrap source.
+		if c.NodesFile != "" && (!loadSubscriptions || len(c.Subscriptions) == 0) {
 			fileNodes, err := loadNodesFromFile(c.NodesFile)
 			if err != nil {
 				return fmt.Errorf("load nodes from file %q: %w", c.NodesFile, err)
@@ -377,7 +370,9 @@ func (c *Config) normalizeInternal(skipSubscriptionFetch bool) error {
 			}
 			c.Nodes = append(c.Nodes, fileNodes...)
 		}
+	}
 
+	if loadSubscriptions {
 		// Load nodes from subscriptions (fetched into memory, persisted to Store by app.go)
 		if len(c.Subscriptions) > 0 {
 			var subNodes []NodeConfig
@@ -414,6 +409,10 @@ func (c *Config) normalizeInternal(skipSubscriptionFetch bool) error {
 				c.Nodes = append(c.Nodes, nodes...)
 			}
 		}
+	} else if loadNodesFile {
+		log.Printf("[config] startup mode: %d inline/file nodes loaded without subscription fetch", len(c.Nodes))
+	} else {
+		log.Printf("[config] reload mode: %d inline nodes from config.yaml", len(c.Nodes))
 	}
 
 	// Note: Manual nodes are loaded from SQLite Store by app.go, not from files.

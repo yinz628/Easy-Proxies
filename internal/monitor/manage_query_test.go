@@ -319,7 +319,7 @@ func TestQueryManageRowsFiltersByLifecycleManualProbeAndActivationReady(t *testi
 			LifecycleState:        store.NodeLifecycleStaged,
 			ManualProbeStatus:     store.ManualProbeStatusFail,
 			ActivationReady:       false,
-			ActivationBlockReason: "手工探测失败",
+			ActivationBlockReason: "入池预检失败",
 		},
 		{
 			Name:                  "active-ready",
@@ -351,5 +351,124 @@ func TestQueryManageRowsFiltersByLifecycleManualProbeAndActivationReady(t *testi
 	}
 	if len(result.Facets.ActivationReadiness) != 2 {
 		t.Fatalf("result.Facets.ActivationReadiness = %#v, want ready/blocked", result.Facets.ActivationReadiness)
+	}
+}
+
+func TestApplyManageManualProbeResultsUsesManualProbeAsFallbackDisplayForPendingNodes(t *testing.T) {
+	rows := BuildManageRows(
+		[]config.NodeConfig{
+			{
+				Name:           "staged-pass",
+				URI:            "socks5://1.1.1.1:1080",
+				Source:         config.NodeSourceTXTSubscription,
+				LifecycleState: store.NodeLifecycleStaged,
+			},
+			{
+				Name:           "staged-timeout",
+				URI:            "socks5://2.2.2.2:1080",
+				Source:         config.NodeSourceTXTSubscription,
+				LifecycleState: store.NodeLifecycleStaged,
+			},
+		},
+		nil,
+	)
+
+	storeNodes := []store.Node{
+		{ID: 1, Name: "staged-pass", URI: "socks5://1.1.1.1:1080", LifecycleState: store.NodeLifecycleStaged},
+		{ID: 2, Name: "staged-timeout", URI: "socks5://2.2.2.2:1080", LifecycleState: store.NodeLifecycleStaged},
+	}
+	results := map[int64]*store.NodeManualProbeResult{
+		1: {
+			NodeID:    1,
+			Status:    store.ManualProbeStatusPass,
+			LatencyMs: 55,
+		},
+		2: {
+			NodeID:    2,
+			Status:    store.ManualProbeStatusTimeout,
+			LatencyMs: 0,
+			TimedOut:  true,
+			Message:   "probe timeout after 10000ms",
+		},
+	}
+
+	ApplyManageManualProbeResults(rows, storeNodes, results)
+
+	byName := make(map[string]ManageRow, len(rows))
+	for _, row := range rows {
+		byName[row.Name] = row
+	}
+
+	passRow := byName["staged-pass"]
+	if passRow.RuntimeStatus != "normal" {
+		t.Fatalf("passRow.RuntimeStatus = %q, want normal", passRow.RuntimeStatus)
+	}
+	if passRow.LatencyMS != 55 {
+		t.Fatalf("passRow.LatencyMS = %d, want 55", passRow.LatencyMS)
+	}
+	if passRow.ManualProbeStatus != store.ManualProbeStatusPass {
+		t.Fatalf("passRow.ManualProbeStatus = %q, want pass", passRow.ManualProbeStatus)
+	}
+
+	timeoutRow := byName["staged-timeout"]
+	if timeoutRow.RuntimeStatus != "unavailable" {
+		t.Fatalf("timeoutRow.RuntimeStatus = %q, want unavailable", timeoutRow.RuntimeStatus)
+	}
+	if timeoutRow.LatencyMS != -1 {
+		t.Fatalf("timeoutRow.LatencyMS = %d, want -1", timeoutRow.LatencyMS)
+	}
+	if timeoutRow.ManualProbeStatus != store.ManualProbeStatusTimeout {
+		t.Fatalf("timeoutRow.ManualProbeStatus = %q, want timeout", timeoutRow.ManualProbeStatus)
+	}
+}
+
+func TestApplyManageManualProbeResultsDoesNotOverrideExistingRuntimeDisplay(t *testing.T) {
+	rows := BuildManageRows(
+		[]config.NodeConfig{
+			{
+				Name:           "active-runtime",
+				URI:            "socks5://3.3.3.3:1080",
+				Source:         config.NodeSourceManual,
+				LifecycleState: store.NodeLifecycleActive,
+			},
+		},
+		[]Snapshot{
+			{
+				NodeInfo: NodeInfo{
+					Tag:  "tag-runtime",
+					Name: "active-runtime",
+					URI:  "socks5://3.3.3.3:1080",
+				},
+				LastLatencyMs:    42,
+				Available:        true,
+				InitialCheckDone: true,
+			},
+		},
+	)
+
+	storeNodes := []store.Node{
+		{ID: 3, Name: "active-runtime", URI: "socks5://3.3.3.3:1080", LifecycleState: store.NodeLifecycleActive},
+	}
+	results := map[int64]*store.NodeManualProbeResult{
+		3: {
+			NodeID:    3,
+			Status:    store.ManualProbeStatusTimeout,
+			LatencyMs: 0,
+			TimedOut:  true,
+			Message:   "probe timeout after 10000ms",
+		},
+	}
+
+	ApplyManageManualProbeResults(rows, storeNodes, results)
+
+	row := rows[0]
+	if row.RuntimeStatus != "normal" {
+		t.Fatalf("row.RuntimeStatus = %q, want normal", row.RuntimeStatus)
+	}
+	if row.LatencyMS != 42 {
+		t.Fatalf("row.LatencyMS = %d, want 42", row.LatencyMS)
+	}
+	if row.ManualProbeStatus != store.ManualProbeStatusTimeout {
+		t.Fatalf("row.ManualProbeStatus = %q, want timeout", row.ManualProbeStatus)
 	}
 }

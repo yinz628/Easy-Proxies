@@ -338,10 +338,16 @@ func (s *sqliteStore) BulkUpsertNodes(ctx context.Context, nodes []Node) error {
 			`INSERT INTO nodes (uri, name, source, feed_key, port, username, password, region, country, enabled, lifecycle_state, created_at, updated_at)
 			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			 ON CONFLICT(uri) DO UPDATE SET
-			   name=excluded.name, source=excluded.source, feed_key=excluded.feed_key, port=excluded.port,
-			   username=excluded.username, password=excluded.password,
-			   region=excluded.region, country=excluded.country,
-			   enabled=excluded.enabled, lifecycle_state=excluded.lifecycle_state,
+			   name=CASE WHEN source = excluded.source THEN excluded.name ELSE name END,
+			   source=source,
+			   feed_key=CASE WHEN source = excluded.source THEN excluded.feed_key ELSE feed_key END,
+			   port=CASE WHEN source = excluded.source THEN excluded.port ELSE port END,
+			   username=CASE WHEN source = excluded.source THEN excluded.username ELSE username END,
+			   password=CASE WHEN source = excluded.source THEN excluded.password ELSE password END,
+			   region=CASE WHEN source = excluded.source THEN excluded.region ELSE region END,
+			   country=CASE WHEN source = excluded.source THEN excluded.country ELSE country END,
+			   enabled=enabled,
+			   lifecycle_state=lifecycle_state,
 			   updated_at=excluded.updated_at`)
 		if err != nil {
 			return fmt.Errorf("prepare bulk upsert: %w", err)

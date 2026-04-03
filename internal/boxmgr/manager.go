@@ -127,6 +127,10 @@ func (m *Manager) Start(ctx context.Context) error {
 	cfg := m.cfg
 	m.mu.Unlock()
 
+	if len(cfg.Nodes) == 0 {
+		return m.enterIdle(cfg)
+	}
+
 	// Try to start, with automatic port conflict resolution
 	var instance *box.Box
 	maxRetries := 10
@@ -166,13 +170,15 @@ func (m *Manager) Start(ctx context.Context) error {
 	}
 	m.mu.Unlock()
 
+	healthCheckTimeout := cfg.SubscriptionRefresh.HealthCheckTimeout
+	if healthCheckTimeout <= 0 {
+		healthCheckTimeout = defaultHealthCheckTimeout
+	}
+	m.kickoffPendingHealthCheck(healthCheckTimeout)
+
 	// Wait for initial health check if min nodes configured
 	if cfg.SubscriptionRefresh.MinAvailableNodes > 0 {
-		timeout := cfg.SubscriptionRefresh.HealthCheckTimeout
-		if timeout <= 0 {
-			timeout = defaultHealthCheckTimeout
-		}
-		if err := m.waitForHealthCheck(timeout); err != nil {
+		if err := m.waitForHealthCheck(healthCheckTimeout); err != nil {
 			m.logger.Warnf("initial health check warning: %v", err)
 			// Don't fail startup, just warn
 		}
@@ -281,10 +287,12 @@ func (m *Manager) Reload(newCfg *config.Config) error {
 		l.OnConfigUpdate(newCfg)
 	}
 
-	// Reload 成功后立即触发 1 次全量探测（内部去重，避免多次 Reload 造成突发）
-	if m.monitorMgr != nil {
-		go m.monitorMgr.RequestProbeAllOnce(periodicHealthTimeout)
+	healthCheckTimeout := newCfg.SubscriptionRefresh.HealthCheckTimeout
+	if healthCheckTimeout <= 0 {
+		healthCheckTimeout = defaultHealthCheckTimeout
 	}
+	m.kickoffPendingHealthCheck(healthCheckTimeout)
+
 	m.logger.Infof("reload completed successfully with %d nodes", len(newCfg.Nodes))
 	return nil
 }
@@ -446,6 +454,16 @@ func (m *Manager) waitForHealthCheck(timeout time.Duration) error {
 		}
 		<-ticker.C
 	}
+}
+
+func (m *Manager) kickoffPendingHealthCheck(timeout time.Duration) {
+	if m.monitorMgr == nil {
+		return
+	}
+	if timeout <= 0 {
+		timeout = defaultHealthCheckTimeout
+	}
+	m.monitorMgr.RequestProbePendingOnce(timeout)
 }
 
 // availableNodeCount returns (available, total) node counts.
@@ -698,6 +716,7 @@ func (m *Manager) ListConfigNodes(ctx context.Context) ([]config.NodeConfig, err
 			Username:               n.Username,
 			Password:               n.Password,
 			Source:                 config.NodeSource(n.Source),
+			LifecycleState:         n.LifecycleState,
 			FeedKey:                n.FeedKey,
 			Disabled:               !n.Enabled,
 			QualityVersion:         qualityVersion,
@@ -881,24 +900,30 @@ func (m *Manager) DeleteNode(ctx context.Context, name string) error {
 	}
 
 	idx := m.nodeIndexLocked(name)
-	if idx == -1 {
-		return monitor.ErrNodeNotFound
-	}
 
 	// Delete from Store if available
+	var existing *store.Node
 	if m.store != nil {
-		existing, err := m.store.GetNodeByName(ctx, name)
+		var err error
+		existing, err = m.store.GetNodeByName(ctx, name)
 		if err != nil {
 			return fmt.Errorf("lookup in store: %w", err)
 		}
-		if existing != nil {
-			if err := m.store.DeleteNode(ctx, existing.ID); err != nil {
-				return fmt.Errorf("delete from store: %w", err)
-			}
+	}
+
+	if idx == -1 && existing == nil {
+		return monitor.ErrNodeNotFound
+	}
+
+	if existing != nil {
+		if err := m.store.DeleteNode(ctx, existing.ID); err != nil {
+			return fmt.Errorf("delete from store: %w", err)
 		}
 	}
 
-	m.cfg.Nodes = append(m.cfg.Nodes[:idx], m.cfg.Nodes[idx+1:]...)
+	if idx != -1 {
+		m.cfg.Nodes = append(m.cfg.Nodes[:idx], m.cfg.Nodes[idx+1:]...)
+	}
 	return nil
 }
 
@@ -944,38 +969,16 @@ func (m *Manager) TriggerReload(ctx context.Context) error {
 		return errConfigUnavailable
 	}
 
-	// Merge inline nodes (from config.yaml) with store nodes (subscription + manual).
-	// Inline nodes take priority; store nodes are added if their URI is not already present.
+	// Merge inline nodes (from config.yaml) with active store nodes.
+	// Inline nodes take priority; only active lifecycle store nodes are added.
 	if m.store != nil {
 		storeNodes, err := m.store.ListNodes(ctx, store.NodeFilter{})
 		if err != nil {
 			m.logger.Warnf("failed to list nodes from store during reload: %v", err)
 		} else if len(storeNodes) > 0 {
-			// Build set of URIs already present from inline nodes
-			inlineURIs := make(map[string]bool, len(newCfg.Nodes))
-			for _, n := range newCfg.Nodes {
-				inlineURIs[n.URI] = true
-			}
-
-			// Merge store nodes, skipping duplicates and disabled nodes
-			for _, n := range storeNodes {
-				if !n.Enabled {
-					continue
-				}
-				if inlineURIs[n.URI] {
-					continue // inline node takes priority
-				}
-				newCfg.Nodes = append(newCfg.Nodes, config.NodeConfig{
-					Name:     n.Name,
-					URI:      n.URI,
-					Port:     n.Port,
-					Username: n.Username,
-					Password: n.Password,
-					Source:   config.NodeSource(n.Source),
-					FeedKey:  n.FeedKey,
-				})
-			}
-			m.logger.Infof("merged nodes for reload: %d inline + store nodes = %d total", len(inlineURIs), len(newCfg.Nodes))
+			inlineCount := len(newCfg.Nodes)
+			added := mergeActiveStoreNodesForReload(newCfg, storeNodes)
+			m.logger.Infof("merged nodes for reload: %d inline + %d active store nodes = %d total", inlineCount, added, len(newCfg.Nodes))
 		}
 	}
 
@@ -999,6 +1002,40 @@ func (m *Manager) TriggerReload(ctx context.Context) error {
 	}
 
 	return m.ReloadWithPortMap(newCfg, portMap)
+}
+
+func mergeActiveStoreNodesForReload(cfg *config.Config, storeNodes []store.Node) int {
+	if cfg == nil || len(storeNodes) == 0 {
+		return 0
+	}
+
+	inlineURIs := make(map[string]struct{}, len(cfg.Nodes))
+	for _, n := range cfg.Nodes {
+		inlineURIs[n.URI] = struct{}{}
+	}
+
+	added := 0
+	for _, n := range storeNodes {
+		if n.LifecycleState != store.NodeLifecycleActive {
+			continue
+		}
+		if _, exists := inlineURIs[n.URI]; exists {
+			continue
+		}
+		cfg.Nodes = append(cfg.Nodes, config.NodeConfig{
+			Name:           n.Name,
+			URI:            n.URI,
+			Port:           n.Port,
+			Username:       n.Username,
+			Password:       n.Password,
+			Source:         config.NodeSource(n.Source),
+			LifecycleState: n.LifecycleState,
+			FeedKey:        n.FeedKey,
+		})
+		inlineURIs[n.URI] = struct{}{}
+		added++
+	}
+	return added
 }
 
 // ReloadWithPortMap gracefully switches to a new configuration, preserving port assignments.

@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
+	"time"
 
 	"easy_proxies/internal/config"
 	"easy_proxies/internal/store"
@@ -166,19 +168,81 @@ func storeNodeToConfigNode(node *store.Node) config.NodeConfig {
 	}
 }
 
+func (s *Server) runBatchProbeTarget(ctx context.Context, target BatchProbeTarget) (int64, error) {
+	probeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	done := make(chan struct{})
+	defer close(done)
+
+	if target.StoreNodeID > 0 {
+		go func() {
+			select {
+			case <-probeCtx.Done():
+				if resultErr := normalizeManualProbeContextError(probeCtx.Err()); resultErr != nil {
+					_ = s.saveManualProbeResultIfPossible(probeCtx, target.StoreNodeID, 0, resultErr)
+				}
+			case <-done:
+			}
+		}()
+	}
+
+	if err := s.probeSem.Acquire(probeCtx, 1); err != nil {
+		return -1, fmt.Errorf("probe cancelled: %w", err)
+	}
+	defer s.probeSem.Release(1)
+
+	return s.runManualProbeAndPersist(probeCtx, target)
+}
+
 func (s *Server) runManualProbeAndPersist(ctx context.Context, target BatchProbeTarget) (int64, error) {
 	if strings.TrimSpace(target.Tag) != "" {
 		return s.runManualProbeAndPersistByTag(ctx, target.Tag)
 	}
 	if s.nodeMgr == nil {
-		return -1, errors.New("node manager not initialized")
+		err := errors.New("node manager not initialized")
+		if saveErr := s.saveManualProbeResultIfPossible(ctx, target.StoreNodeID, 0, err); saveErr != nil {
+			return -1, saveErr
+		}
+		return -1, err
 	}
 
 	runtimeNode, err := s.nodeMgr.CreateConfigNodeRuntime(ctx, target.ConfigNode)
 	if err != nil {
+		if saveErr := s.saveManualProbeResultIfPossible(ctx, target.StoreNodeID, 0, err); saveErr != nil {
+			return -1, saveErr
+		}
 		return -1, err
 	}
-	defer runtimeNode.Close()
+	var closeOnce sync.Once
+	closeRuntime := func() {
+		closeOnce.Do(func() {
+			_ = runtimeNode.Close()
+		})
+	}
+	defer closeRuntime()
+
+	var persistOnce sync.Once
+	var persistErr error
+	persistResult := func(latency time.Duration, resultErr error) error {
+		persistOnce.Do(func() {
+			persistErr = s.saveManualProbeResultIfPossible(ctx, target.StoreNodeID, latency, resultErr)
+		})
+		return persistErr
+	}
+
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		select {
+		case <-ctx.Done():
+			closeRuntime()
+			if resultErr := normalizeManualProbeContextError(ctx.Err()); resultErr != nil {
+				_ = persistResult(0, resultErr)
+			}
+		case <-done:
+		}
+	}()
 
 	latency, probeErr := runtimeNode.Probe(ctx)
 	resultErr := probeErr
@@ -190,14 +254,38 @@ func (s *Server) runManualProbeAndPersist(ctx context.Context, target BatchProbe
 		resultErr = manualProbeTimeoutError()
 	}
 
-	if s.store != nil && target.StoreNodeID > 0 {
-		if saveErr := s.store.SaveNodeManualProbeResult(ctx, buildManualProbeResult(target.StoreNodeID, latency, resultErr)); saveErr != nil {
-			return -1, saveErr
-		}
+	if saveErr := persistResult(latency, resultErr); saveErr != nil {
+		return -1, saveErr
 	}
 
 	if resultErr != nil {
 		return -1, resultErr
 	}
 	return normalizeProbeLatencyMS(latency), nil
+}
+
+func (s *Server) saveManualProbeResultIfPossible(ctx context.Context, nodeID int64, latency time.Duration, err error) error {
+	if s == nil || s.store == nil || nodeID <= 0 {
+		return nil
+	}
+	saveCtx, cancel := manualProbePersistContext(ctx)
+	defer cancel()
+	return s.store.SaveNodeManualProbeResult(saveCtx, buildManualProbeResult(nodeID, latency, err))
+}
+
+func manualProbePersistContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if ctx != nil && ctx.Err() == nil {
+		return context.WithTimeout(ctx, 5*time.Second)
+	}
+	return context.WithTimeout(context.Background(), 5*time.Second)
+}
+
+func normalizeManualProbeContextError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if isManualProbeTimeoutError(err) {
+		return manualProbeTimeoutError()
+	}
+	return err
 }

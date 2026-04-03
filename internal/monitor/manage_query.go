@@ -643,7 +643,27 @@ func applyManageManualProbeResult(row *ManageRow, result *store.NodeManualProbeR
 		checked := result.CheckedAt.Unix()
 		row.ManualProbeChecked = &checked
 	}
+	applyManageManualProbeDisplayFallback(row, result)
 	applyManageActivationState(row)
+}
+
+func applyManageManualProbeDisplayFallback(row *ManageRow, result *store.NodeManualProbeResult) {
+	if row == nil || result == nil {
+		return
+	}
+	if row.RuntimeStatus != "pending" {
+		return
+	}
+
+	switch normalizeManualProbeStatus(result.Status) {
+	case store.ManualProbeStatusPass:
+		row.RuntimeStatus = "normal"
+		if row.LatencyMS < 0 {
+			row.LatencyMS = result.LatencyMs
+		}
+	case store.ManualProbeStatusFail, store.ManualProbeStatusTimeout:
+		row.RuntimeStatus = "unavailable"
+	}
 }
 
 func hasLegacyManageQualityResult(row *ManageRow) bool {

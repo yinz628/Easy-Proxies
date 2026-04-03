@@ -21,6 +21,8 @@ export interface BatchQualityLastResult {
   quality_status?: string
   quality_openai_status?: string
   quality_anthropic_status?: string
+  activation_ready?: boolean
+  activation_block_reason?: string
   quality_score?: number
   quality_grade?: string
 }
@@ -50,6 +52,8 @@ export function buildQualityCacheEntry(node: ConfigNodeConfig): NodeQualityCheck
     quality_status: node.quality_status,
     quality_openai_status: node.quality_openai_status,
     quality_anthropic_status: node.quality_anthropic_status,
+    activation_ready: Boolean(node.activation_ready),
+    activation_block_reason: node.activation_block_reason,
     quality_score: node.quality_score,
     quality_grade: node.quality_grade || '-',
     quality_summary: node.quality_summary || '',
@@ -65,6 +69,8 @@ export function applyQualityResultToConfigNode(node: ConfigNodeConfig, result: N
     quality_status: result.quality_status,
     quality_openai_status: result.quality_openai_status,
     quality_anthropic_status: result.quality_anthropic_status,
+    activation_ready: result.activation_ready,
+    activation_block_reason: result.activation_block_reason,
     quality_score: result.quality_score,
     quality_grade: result.quality_grade,
     quality_summary: result.quality_summary,
@@ -81,9 +87,11 @@ export function applyQualityResultToManageList(
     return page
   }
 
+  const items = page.items ?? []
+
   return {
     ...page,
-    items: page.items.map(item => (
+    items: items.map(item => (
       item.name === nodeName
         ? { ...item, ...applyQualityResultToConfigNode(item, result) }
         : item
@@ -102,6 +110,8 @@ export function buildQualityResultFromBatchProgress(event: QualityCheckBatchProg
     quality_status: event.quality_status,
     quality_openai_status: event.quality_openai_status,
     quality_anthropic_status: event.quality_anthropic_status,
+    activation_ready: Boolean(event.activation_ready),
+    activation_block_reason: event.activation_block_reason,
     quality_score: event.quality_score,
     quality_grade: event.quality_grade || '-',
     quality_summary: event.quality_summary || '',
@@ -121,6 +131,8 @@ export function buildQualityResultFromJobResult(result?: BatchQualityJobResult):
     quality_status: result.quality_status,
     quality_openai_status: result.quality_openai_status,
     quality_anthropic_status: result.quality_anthropic_status,
+    activation_ready: Boolean(result.activation_ready),
+    activation_block_reason: result.activation_block_reason,
     quality_score: result.quality_score,
     quality_grade: result.quality_grade || '-',
     quality_summary: result.quality_summary || '',
@@ -142,6 +154,8 @@ function toLastResult(result?: BatchQualityJobResult): BatchQualityLastResult | 
     quality_status: result.quality_status,
     quality_openai_status: result.quality_openai_status,
     quality_anthropic_status: result.quality_anthropic_status,
+    activation_ready: result.activation_ready,
+    activation_block_reason: result.activation_block_reason,
     quality_score: result.quality_score,
     quality_grade: result.quality_grade,
   }
@@ -175,6 +189,8 @@ function reduceProgress(event: QualityCheckBatchProgress): BatchQualityState {
       quality_status: event.quality_status,
       quality_openai_status: event.quality_openai_status,
       quality_anthropic_status: event.quality_anthropic_status,
+      activation_ready: event.activation_ready,
+      activation_block_reason: event.activation_block_reason,
       quality_score: event.quality_score,
       quality_grade: event.quality_grade,
     },

@@ -265,9 +265,6 @@ func (m *Manager) StartPeriodicHealthCheck(interval, timeout time.Duration) {
 	m.healthMu.Unlock()
 
 	go func() {
-		// 启动后立即进行一次检查（走去重）
-		m.RequestProbePendingOnce(timeout)
-
 		for {
 			select {
 			case <-m.ctx.Done():
@@ -401,22 +398,12 @@ func (m *Manager) probeNodes(timeout time.Duration, onlyPending bool) {
 			latency, err := probe(ctx)
 			cancel()
 
-			entry.mu.Lock()
 			if err != nil {
 				failedCount.Add(1)
-				entry.lastError = err.Error()
-				entry.lastFail = time.Now()
-				entry.lastProbe = 0
-				entry.available = false
-				entry.initialCheckDone = true
 			} else {
 				availableCount.Add(1)
-				entry.lastOK = time.Now()
-				entry.lastProbe = latency
-				entry.available = true
-				entry.initialCheckDone = true
 			}
-			entry.mu.Unlock()
+			entry.recordProbeResult(latency, err)
 
 			if err != nil && m.logger != nil {
 				m.logger.Warn("probe failed for ", tag, ": ", err)
@@ -725,21 +712,7 @@ func (m *Manager) Probe(ctx context.Context, tag string) (time.Duration, error) 
 	if e.probe == nil {
 		return 0, errors.New("probe not available for this node")
 	}
-	latency, err := e.probe(ctx)
-	if err != nil {
-		// 探测失败：标记节点为不可用，清除旧延迟数据
-		e.mu.Lock()
-		e.available = false
-		e.initialCheckDone = true
-		e.lastProbe = 0 // 清除延迟，前端显示"未测试"
-		e.lastError = err.Error()
-		e.lastFail = time.Now()
-		e.mu.Unlock()
-		return 0, err
-	}
-	// 探测成功：recordSuccessWithLatency 已在 probe 函数内更新 available=true
-	e.recordProbeLatency(latency)
-	return latency, nil
+	return e.probe(ctx)
 }
 
 func (m *Manager) HTTPRequest(ctx context.Context, tag, method, rawURL string, headers map[string]string, maxBodyBytes int64) (*HTTPCheckResult, error) {
@@ -875,6 +848,34 @@ func (e *entry) recordSuccessWithLatency(latency time.Duration) {
 	e.lastProbe = latency
 	e.available = true
 	e.initialCheckDone = true
+	latencyMs := latency.Milliseconds()
+	if latencyMs == 0 && latency > 0 {
+		latencyMs = 1
+	}
+	e.appendTimelineLocked(true, latencyMs, "", "")
+}
+
+func (e *entry) recordProbeResult(latency time.Duration, err error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if err != nil {
+		e.failure++
+		e.lastError = err.Error()
+		e.lastFail = time.Now()
+		e.lastProbe = 0
+		e.available = false
+		e.initialCheckDone = true
+		e.appendTimelineLocked(false, 0, e.lastError, "")
+		return
+	}
+
+	e.success++
+	e.lastOK = time.Now()
+	e.lastProbe = latency
+	e.available = true
+	e.initialCheckDone = true
+
 	latencyMs := latency.Milliseconds()
 	if latencyMs == 0 && latency > 0 {
 		latencyMs = 1

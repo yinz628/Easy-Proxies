@@ -18,7 +18,7 @@ EasyProxiesV2 是一个轻量级、高性能的代理池与订阅管理工具，
 
 - 现代化 Web UI（React + Vite + Tailwind + DaisyUI）
 - 前后端一体化（前端静态资源已内嵌到 Go 二进制，单文件即可运行）
-- 节点订阅与自动刷新
+- 节点订阅导入与 staged / active 手动激活工作流
 - 代理池智能调度与故障隔离
 - GeoIP 分区路由（可选）
 - SQLite 持久化存储运行状态与统计数据
@@ -118,6 +118,34 @@ cp ./config.example.yaml ./config.yaml
 - 每个 TXT 订阅都可以单独设置 `auto_update_enabled`，决定它是否参与自动更新
 
 示例配置请查看 `config.example.yaml` 中的 `txt_subscriptions` 注释块。
+
+### staged / active 节点工作流
+
+从当前版本开始，`legacy subscriptions` 和 `txt_subscriptions` 的导入流程改为“候选池 -> 运行池”两段式：
+
+- 程序启动时不会自动拉取 legacy 订阅或 TXT 订阅
+- 在 Settings 页面需要手动点击 `Update Legacy`、`Update TXT` 或单个 feed 的 `Refresh`
+- 订阅刷新导入的节点会先进入 `staged` 候选池，不会自动进入运行代理池
+- 管理页中的入池预检结果与运行时健康状态分离；批量入池预检不会覆盖运行中的健康状态
+- 质量检测只用于判断 AI 可达性，当前以 `openai_reachability` / `anthropic_reachability` 为主
+- 只有满足 `probe_passed && (openai_pass || anthropic_pass)` 的 `staged` 节点，才会显示为可激活
+- 只有被手动 `Activate` 的节点才会进入 `active`，并参与运行代理池
+- `Deactivate` 会把节点从 `active` 移回 `staged`
+- `Disable` 会把节点移出候选/运行流转，不再参与运行池
+
+推荐操作顺序：
+
+1. 在 Settings 页面手动刷新 legacy 或 TXT 订阅
+2. 在管理页筛选 `staged` 节点，执行批量 `Probe selected`
+3. 对需要的节点执行 `Quality check selected`
+4. 按 `activation_ready` 或质量结果筛选
+5. 仅对需要上线的节点执行 `Activate selected`
+
+说明：
+
+- `active` 节点才会进入运行池并参与自动健康检查
+- 订阅节点默认不会因为导入成功而自动 reload 到运行池
+- 配置文件内联节点 / 本地节点源仍按现有方式加载；新的 staged / active 工作流主要针对订阅导入节点
 
 ---
 
