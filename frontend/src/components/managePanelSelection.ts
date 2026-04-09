@@ -2,11 +2,11 @@ import type { ManageQuery, ManageSelectionRequest, SelectionState } from '../typ
 import { buildManageFilterSnapshot } from './managePanelQuery.ts'
 
 export function buildSelectionRequest(state: SelectionState): ManageSelectionRequest {
-  if (state.mode === 'names') {
+  if (state.mode === 'uris') {
     return {
       selection: {
-        mode: 'names',
-        names: Array.from(state.names),
+        mode: 'uris',
+        uris: Array.from(state.uris),
       },
     }
   }
@@ -15,69 +15,69 @@ export function buildSelectionRequest(state: SelectionState): ManageSelectionReq
     selection: {
       mode: 'filter',
       filter: state.filter,
-      exclude_names: Array.from(state.excludeNames),
+      exclude_uris: Array.from(state.excludeUris),
     },
   }
 }
 
-export function toggleNodeSelection(state: SelectionState, name: string): SelectionState {
-  if (!name) {
+export function toggleNodeSelection(state: SelectionState, uri: string): SelectionState {
+  if (!uri) {
     return state
   }
 
-  if (state.mode === 'names') {
-    const next = new Set(state.names)
-    if (next.has(name)) {
-      next.delete(name)
+  if (state.mode === 'uris') {
+    const next = new Set(state.uris)
+    if (next.has(uri)) {
+      next.delete(uri)
     } else {
-      next.add(name)
+      next.add(uri)
     }
-    return { mode: 'names', names: next }
+    return { mode: 'uris', uris: next }
   }
 
-  const next = new Set(state.excludeNames)
-  if (next.has(name)) {
-    next.delete(name)
+  const next = new Set(state.excludeUris)
+  if (next.has(uri)) {
+    next.delete(uri)
   } else {
-    next.add(name)
+    next.add(uri)
   }
-  return { ...state, excludeNames: next }
+  return { ...state, excludeUris: next }
 }
 
-export function togglePageSelection(state: SelectionState, pageNames: string[]): SelectionState {
-  const uniquePageNames = Array.from(new Set(pageNames.filter(Boolean)))
-  if (uniquePageNames.length === 0) {
+export function togglePageSelection(state: SelectionState, pageUris: string[]): SelectionState {
+  const uniquePageUris = Array.from(new Set(pageUris.filter(Boolean)))
+  if (uniquePageUris.length === 0) {
     return state
   }
 
-  if (state.mode === 'names') {
-    const next = new Set(state.names)
-    const allSelected = uniquePageNames.every(name => next.has(name))
-    for (const name of uniquePageNames) {
+  if (state.mode === 'uris') {
+    const next = new Set(state.uris)
+    const allSelected = uniquePageUris.every(uri => next.has(uri))
+    for (const uri of uniquePageUris) {
       if (allSelected) {
-        next.delete(name)
+        next.delete(uri)
       } else {
-        next.add(name)
+        next.add(uri)
       }
     }
-    return { mode: 'names', names: next }
+    return { mode: 'uris', uris: next }
   }
 
-  const next = new Set(state.excludeNames)
-  const allSelected = uniquePageNames.every(name => !next.has(name))
-  for (const name of uniquePageNames) {
+  const next = new Set(state.excludeUris)
+  const allSelected = uniquePageUris.every(uri => !next.has(uri))
+  for (const uri of uniquePageUris) {
     if (allSelected) {
-      next.add(name)
+      next.add(uri)
     } else {
-      next.delete(name)
+      next.delete(uri)
     }
   }
-  return { ...state, excludeNames: next }
+  return { ...state, excludeUris: next }
 }
 
-export function isNodeSelected(state: SelectionState, name: string, query: ManageQuery): boolean {
-  if (state.mode === 'names') {
-    return state.names.has(name)
+export function isNodeSelected(state: SelectionState, uri: string, query: ManageQuery): boolean {
+  if (state.mode === 'uris') {
+    return state.uris.has(uri)
   }
 
   const currentFilter = buildManageFilterSnapshot(query)
@@ -93,12 +93,12 @@ export function isNodeSelected(state: SelectionState, name: string, query: Manag
   ) {
     return false
   }
-  return !state.excludeNames.has(name)
+  return !state.excludeUris.has(uri)
 }
 
 export function getSelectionCount(state: SelectionState, filteredTotal: number, query: ManageQuery): number {
-  if (state.mode === 'names') {
-    return state.names.size
+  if (state.mode === 'uris') {
+    return state.uris.size
   }
 
   const currentFilter = buildManageFilterSnapshot(query)
@@ -115,19 +115,19 @@ export function getSelectionCount(state: SelectionState, filteredTotal: number, 
     return 0
   }
 
-  return Math.max(filteredTotal - state.excludeNames.size, 0)
+  return Math.max(filteredTotal - state.excludeUris.size, 0)
 }
 
 export function getPageSelectionState(
   state: SelectionState,
-  pageNames: string[],
+  pageUris: string[],
   query: ManageQuery,
 ): { selectedCount: number; allSelected: boolean; partiallySelected: boolean } {
-  const uniquePageNames = Array.from(new Set(pageNames.filter(Boolean)))
-  const selectedCount = uniquePageNames.filter(name => isNodeSelected(state, name, query)).length
+  const uniquePageUris = Array.from(new Set(pageUris.filter(Boolean)))
+  const selectedCount = uniquePageUris.filter(uri => isNodeSelected(state, uri, query)).length
   return {
     selectedCount,
-    allSelected: uniquePageNames.length > 0 && selectedCount === uniquePageNames.length,
-    partiallySelected: selectedCount > 0 && selectedCount < uniquePageNames.length,
+    allSelected: uniquePageUris.length > 0 && selectedCount === uniquePageUris.length,
+    partiallySelected: selectedCount > 0 && selectedCount < uniquePageUris.length,
   }
 }

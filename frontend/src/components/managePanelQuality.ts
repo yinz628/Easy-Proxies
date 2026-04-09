@@ -16,6 +16,7 @@ const aiQualityVersion = 'ai_reachability_v2'
 export interface BatchQualityLastResult {
   tag: string
   name: string
+  uri: string
   status: 'success' | 'error'
   error: string
   quality_status?: string
@@ -80,10 +81,10 @@ export function applyQualityResultToConfigNode(node: ConfigNodeConfig, result: N
 
 export function applyQualityResultToManageList(
   page: ManageListResponse | null,
-  nodeName: string,
+  nodeURI: string,
   result: NodeQualityCheckResult,
 ): ManageListResponse | null {
-  if (!page) {
+  if (!page || !nodeURI) {
     return page
   }
 
@@ -92,7 +93,7 @@ export function applyQualityResultToManageList(
   return {
     ...page,
     items: items.map(item => (
-      item.name === nodeName
+      item.uri === nodeURI
         ? { ...item, ...applyQualityResultToConfigNode(item, result) }
         : item
     )),
@@ -149,6 +150,7 @@ function toLastResult(result?: BatchQualityJobResult): BatchQualityLastResult | 
   return {
     tag: result.tag,
     name: result.name,
+    uri: result.uri,
     status: result.error ? 'error' : 'success',
     error: result.error || '',
     quality_status: result.quality_status,
@@ -184,6 +186,7 @@ function reduceProgress(event: QualityCheckBatchProgress): BatchQualityState {
     lastResult: {
       tag: event.tag,
       name: event.name,
+      uri: event.uri,
       status: event.status,
       error: event.error,
       quality_status: event.quality_status,

@@ -253,12 +253,12 @@ export interface ManageListResponse {
 }
 
 export type SelectionState =
-  | { mode: 'names'; names: Set<string> }
-  | { mode: 'filter'; filter: ManageFilterSnapshot; excludeNames: Set<string> }
+  | { mode: 'uris'; uris: Set<string> }
+  | { mode: 'filter'; filter: ManageFilterSnapshot; excludeUris: Set<string> }
 
 export type ManageSelectionRequest =
-  | { selection: { mode: 'names'; names: string[] } }
-  | { selection: { mode: 'filter'; filter: ManageFilterSnapshot; exclude_names: string[] } }
+  | { selection: { mode: 'uris'; uris: string[] } }
+  | { selection: { mode: 'filter'; filter: ManageFilterSnapshot; exclude_uris: string[] } }
 
 export interface ConfigNodeMutationResponse {
   node?: ConfigNodeConfig
@@ -380,6 +380,7 @@ export interface QualityCheckBatchProgress {
   job_id: string
   tag: string
   name: string
+  uri: string
   status: 'success' | 'error'
   error: string
   quality_version?: string
@@ -418,6 +419,7 @@ export type QualityCheckBatchEvent = QualityCheckBatchStart | QualityCheckBatchP
 export interface BatchQualityJobResult {
   tag: string
   name: string
+  uri: string
   error?: string
   quality_version?: string
   quality_status?: QualityStatus

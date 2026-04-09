@@ -887,6 +887,7 @@ func (s *Server) handleProbeBatch(w http.ResponseWriter, r *http.Request) {
 
 type manageSelectionRequest struct {
 	Selection *ManageSelection `json:"selection,omitempty"`
+	URIs      []string         `json:"uris,omitempty"`
 	Names     []string         `json:"names,omitempty"`
 	Tags      []string         `json:"tags,omitempty"`
 }
@@ -1323,6 +1324,7 @@ func (s *Server) handleQualityCheckBatchStream(w http.ResponseWriter, r *http.Re
 			"error":                    job.LastResult.Error,
 			"tag":                      job.LastResult.Tag,
 			"name":                     job.LastResult.Name,
+			"uri":                      job.LastResult.URI,
 			"quality_version":          job.LastResult.QualityVersion,
 			"quality_status":           job.LastResult.QualityStatus,
 			"quality_openai_status":    job.LastResult.QualityOpenAIStatus,
@@ -1365,6 +1367,7 @@ func (s *Server) handleQualityCheckBatchStream(w http.ResponseWriter, r *http.Re
 				"error":                    event.Result.Error,
 				"tag":                      event.Result.Tag,
 				"name":                     event.Result.Name,
+				"uri":                      event.Result.URI,
 				"quality_version":          event.Result.QualityVersion,
 				"quality_status":           event.Result.QualityStatus,
 				"quality_openai_status":    event.Result.QualityOpenAIStatus,
@@ -1614,12 +1617,12 @@ func (s *Server) handleConfigNodesBatchToggleV2(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	selectedNames := namesFromRows(selectedRows)
+	selectedURIs := urisFromRows(selectedRows)
 	var errs []string
 	successCount := 0
-	for _, name := range selectedNames {
-		if err := s.nodeMgr.SetNodeEnabled(r.Context(), name, body.Enabled); err != nil {
-			errs = append(errs, fmt.Sprintf("%s: %v", name, err))
+	for _, uri := range selectedURIs {
+		if err := s.nodeMgr.SetNodeEnabled(r.Context(), uri, body.Enabled); err != nil {
+			errs = append(errs, fmt.Sprintf("%s: %v", uri, err))
 		} else {
 			successCount++
 		}
@@ -1646,7 +1649,7 @@ func (s *Server) handleConfigNodesBatchToggleV2(w http.ResponseWriter, r *http.R
 		*/
 		"message": fmt.Sprintf("%s %d 个节点%s", action, successCount, reloadMsg),
 		"success": successCount,
-		"total":   len(selectedNames),
+		"total":   len(selectedURIs),
 	}
 	if len(errs) > 0 {
 		result["errors"] = errs
@@ -1858,12 +1861,12 @@ func (s *Server) handleConfigNodesBatchDeleteV2(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	selectedNames := namesFromRows(selectedRows)
+	selectedURIs := urisFromRows(selectedRows)
 	var errs []string
 	successCount := 0
-	for _, name := range selectedNames {
-		if err := s.nodeMgr.DeleteNode(r.Context(), name); err != nil {
-			errs = append(errs, fmt.Sprintf("%s: %v", name, err))
+	for _, uri := range selectedURIs {
+		if err := s.nodeMgr.DeleteNode(r.Context(), uri); err != nil {
+			errs = append(errs, fmt.Sprintf("%s: %v", uri, err))
 		} else {
 			successCount++
 		}
@@ -1885,7 +1888,7 @@ func (s *Server) handleConfigNodesBatchDeleteV2(w http.ResponseWriter, r *http.R
 		*/
 		"message": fmt.Sprintf("删除 %d 个节点%s", successCount, reloadMsg),
 		"success": successCount,
-		"total":   len(selectedNames),
+		"total":   len(selectedURIs),
 	}
 	if len(errs) > 0 {
 		result["errors"] = errs
@@ -1925,7 +1928,7 @@ func (s *Server) handleExportSelected(w http.ResponseWriter, r *http.Request) {
 }
 
 func usesNodeManagerSelection(req manageSelectionRequest) bool {
-	return req.Selection != nil || len(req.Names) > 0
+	return req.Selection != nil || len(req.URIs) > 0 || len(req.Names) > 0
 }
 
 func (s *Server) resolveSelectionRequest(ctx context.Context, req manageSelectionRequest) ([]ManageRow, error) {
@@ -1943,6 +1946,14 @@ func (s *Server) resolveSelectionRequest(ctx context.Context, req manageSelectio
 			return nil, err
 		}
 		return ResolveManageSelection(rows, ManageSelection{Mode: "names", Names: req.Names})
+	}
+
+	if len(req.URIs) > 0 {
+		rows, err := s.loadManageRows(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return ResolveManageSelection(rows, ManageSelection{Mode: "uris", URIs: req.URIs})
 	}
 
 	if len(req.Tags) > 0 {

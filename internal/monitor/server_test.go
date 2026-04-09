@@ -557,8 +557,40 @@ func TestHandleConfigNodesBatchToggleResolvesFilterSelection(t *testing.T) {
 	if len(nodeMgr.toggles) != 1 {
 		t.Fatalf("len(nodeMgr.toggles) = %d, want 1", len(nodeMgr.toggles))
 	}
-	if nodeMgr.toggles[0].name != "alpha-hk" || nodeMgr.toggles[0].enabled {
-		t.Fatalf("toggle call = %#v, want alpha-hk disabled", nodeMgr.toggles[0])
+	if nodeMgr.toggles[0].name != "trojan://alpha" || nodeMgr.toggles[0].enabled {
+		t.Fatalf("toggle call = %#v, want trojan://alpha disabled", nodeMgr.toggles[0])
+	}
+}
+
+func TestHandleConfigNodesBatchToggleResolvesURISelectionWithDuplicateNames(t *testing.T) {
+	server, nodeMgr := newManageListTestServer(t)
+	nodeMgr.nodes = []config.NodeConfig{
+		{Name: "duplicate-node", URI: "http://49.0.246.130:443", Source: config.NodeSourceManual},
+		{Name: "duplicate-node", URI: "socks5://49.0.246.130:443", Source: config.NodeSourceManual},
+	}
+
+	body := `{
+		"selection": {
+			"mode": "uris",
+			"uris": ["socks5://49.0.246.130:443"]
+		},
+		"enabled": false
+	}`
+
+	req := httptest.NewRequest(http.MethodPost, "/api/nodes/config/batch-toggle", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	server.handleConfigNodesBatchToggle(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if len(nodeMgr.toggles) != 1 {
+		t.Fatalf("len(nodeMgr.toggles) = %d, want 1", len(nodeMgr.toggles))
+	}
+	if nodeMgr.toggles[0].name != "socks5://49.0.246.130:443" || nodeMgr.toggles[0].enabled {
+		t.Fatalf("toggle call = %#v, want socks5://49.0.246.130:443 disabled", nodeMgr.toggles[0])
 	}
 }
 

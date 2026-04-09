@@ -250,9 +250,21 @@ func TestQueryManageRowsFiltersSortsAndPaginates(t *testing.T) {
 
 func TestResolveManageSelectionSupportsNamesAndFilterMode(t *testing.T) {
 	rows := []ManageRow{
-		{Name: "alpha", RuntimeStatus: "normal", Region: "hk", Source: "manual", Tag: "tag-alpha", QualityStatus: "healthy"},
-		{Name: "beta", RuntimeStatus: "normal", Region: "hk", Source: "manual", Tag: "tag-beta", QualityStatus: "healthy"},
-		{Name: "gamma", RuntimeStatus: "unavailable", Region: "us", Source: "subscription", Tag: "tag-gamma", QualityStatus: "warn"},
+		{Name: "alpha", URI: "trojan://alpha", RuntimeStatus: "normal", Region: "hk", Source: "manual", Tag: "tag-alpha", QualityStatus: "healthy"},
+		{Name: "beta", URI: "trojan://beta", RuntimeStatus: "normal", Region: "hk", Source: "manual", Tag: "tag-beta", QualityStatus: "healthy"},
+		{Name: "beta", URI: "socks5://beta", RuntimeStatus: "normal", Region: "hk", Source: "manual", Tag: "tag-beta-2", QualityStatus: "healthy"},
+		{Name: "gamma", URI: "trojan://gamma", RuntimeStatus: "unavailable", Region: "us", Source: "subscription", Tag: "tag-gamma", QualityStatus: "warn"},
+	}
+
+	byURIs, err := ResolveManageSelection(rows, ManageSelection{
+		Mode: "uris",
+		URIs: []string{"socks5://beta", "trojan://alpha"},
+	})
+	if err != nil {
+		t.Fatalf("ResolveManageSelection(uris) error = %v", err)
+	}
+	if len(byURIs) != 2 || byURIs[0].URI != "trojan://alpha" || byURIs[1].URI != "socks5://beta" {
+		t.Fatalf("byURIs = %#v", byURIs)
 	}
 
 	byNames, err := ResolveManageSelection(rows, ManageSelection{
@@ -262,7 +274,7 @@ func TestResolveManageSelectionSupportsNamesAndFilterMode(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ResolveManageSelection(names) error = %v", err)
 	}
-	if len(byNames) != 2 || byNames[0].Name != "alpha" || byNames[1].Name != "beta" {
+	if len(byNames) != 3 || byNames[0].Name != "alpha" || byNames[1].Name != "beta" || byNames[2].URI != "socks5://beta" {
 		t.Fatalf("byNames = %#v", byNames)
 	}
 
@@ -274,12 +286,12 @@ func TestResolveManageSelectionSupportsNamesAndFilterMode(t *testing.T) {
 			Source:        "manual",
 			QualityStatus: "healthy",
 		},
-		ExcludeNames: []string{"beta"},
+		ExcludeURIs: []string{"socks5://beta"},
 	})
 	if err != nil {
 		t.Fatalf("ResolveManageSelection(filter) error = %v", err)
 	}
-	if len(byFilter) != 1 || byFilter[0].Name != "alpha" {
+	if len(byFilter) != 2 || byFilter[0].Name != "alpha" || byFilter[1].URI != "trojan://beta" {
 		t.Fatalf("byFilter = %#v", byFilter)
 	}
 }

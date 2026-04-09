@@ -162,8 +162,8 @@ test('checkNodeQualityBatch starts, streams, and cancels by job id', async () =>
 
   const controller = client.checkNodeQualityBatch({
     selection: {
-      mode: 'names',
-      names: ['node-a', 'node-b'],
+      mode: 'uris',
+      uris: ['socks5://node-a', 'socks5://node-b'],
     },
   }, (event: unknown) => {
     events.push(event)
@@ -176,8 +176,8 @@ test('checkNodeQualityBatch starts, streams, and cancels by job id', async () =>
     assert.equal(fetchCalls[0].input, '/api/nodes/quality-check-batch')
     assert.equal(fetchCalls[0].init?.body, JSON.stringify({
       selection: {
-        mode: 'names',
-        names: ['node-a', 'node-b'],
+        mode: 'uris',
+        uris: ['socks5://node-a', 'socks5://node-b'],
       },
     }))
     assert.equal(fetchCalls[1].input, '/api/nodes/quality-check-batch/stream?job_id=job-1')

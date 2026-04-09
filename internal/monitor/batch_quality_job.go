@@ -35,6 +35,7 @@ type BatchQualityTarget struct {
 type BatchQualityJobResult struct {
 	Tag                    string                       `json:"tag"`
 	Name                   string                       `json:"name"`
+	URI                    string                       `json:"uri"`
 	Error                  string                       `json:"error,omitempty"`
 	QualityVersion         string                       `json:"quality_version,omitempty"`
 	QualityStatus          string                       `json:"quality_status,omitempty"`
@@ -273,6 +274,7 @@ func batchQualityJobResultFromStore(target BatchQualityTarget, check *store.Node
 	result := &BatchQualityJobResult{
 		Tag:  target.Tag,
 		Name: target.Name,
+		URI:  target.ConfigNode.URI,
 	}
 	if err != nil {
 		result.Error = err.Error()

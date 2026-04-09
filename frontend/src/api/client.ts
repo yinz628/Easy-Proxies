@@ -105,8 +105,8 @@ function normalizeSelectionBody(selectionOrNames: ManageSelectionRequest | strin
     }
     return {
       selection: {
-        mode: 'names',
-        names: selectionOrNames,
+        mode: 'uris',
+        uris: selectionOrNames,
       },
     }
   }
@@ -349,21 +349,21 @@ export async function createConfigNode(payload: ConfigNodePayload): Promise<Conf
   })
 }
 
-export async function updateConfigNode(name: string, payload: ConfigNodePayload): Promise<ConfigNodeMutationResponse> {
-  return request<ConfigNodeMutationResponse>(`/api/nodes/config/${encodeURIComponent(name)}`, {
+export async function updateConfigNode(identifier: string, payload: ConfigNodePayload): Promise<ConfigNodeMutationResponse> {
+  return request<ConfigNodeMutationResponse>(`/api/nodes/config/${encodeURIComponent(identifier)}`, {
     method: 'PUT',
     body: JSON.stringify(payload),
   })
 }
 
-export async function deleteConfigNode(name: string): Promise<ConfigNodeMutationResponse> {
-  return request<ConfigNodeMutationResponse>(`/api/nodes/config/${encodeURIComponent(name)}`, {
+export async function deleteConfigNode(identifier: string): Promise<ConfigNodeMutationResponse> {
+  return request<ConfigNodeMutationResponse>(`/api/nodes/config/${encodeURIComponent(identifier)}`, {
     method: 'DELETE',
   })
 }
 
-export async function toggleConfigNode(name: string, enabled: boolean): Promise<ConfigNodeMutationResponse> {
-  return request<ConfigNodeMutationResponse>(`/api/nodes/config/${encodeURIComponent(name)}`, {
+export async function toggleConfigNode(identifier: string, enabled: boolean): Promise<ConfigNodeMutationResponse> {
+  return request<ConfigNodeMutationResponse>(`/api/nodes/config/${encodeURIComponent(identifier)}`, {
     method: 'PATCH',
     body: JSON.stringify({ enabled }),
   })

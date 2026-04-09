@@ -55,11 +55,14 @@ import {
   buildManageFilterSnapshot,
   buildManageQueryKey,
   canSelectFilteredResults,
+  getStoredManagePageSize,
   hasActiveManageFilters,
   hasPendingManageKeywordChange,
+  managePageSizeOptions,
   normalizeManageQuery,
   resolveVisibleManageQuery,
   resolveManageResponsePage,
+  saveManagePageSize,
 } from './managePanelQuery.ts'
 import {
   buildSelectionRequest,
@@ -89,7 +92,7 @@ const emptySummary = {
 const maxManagePageCacheEntries = 8
 
 function createEmptySelection(): SelectionState {
-  return { mode: 'names', names: new Set() }
+  return { mode: 'uris', uris: new Set() }
 }
 
 function trimManagePageCache(cache: Map<string, ManageListResponse>) {
@@ -376,7 +379,9 @@ function ActivationBadge({ ready, reason }: { ready: boolean; reason?: string })
 
 export default function ManagePanelPage() {
   const [pageData, setPageData] = useState<ManageListResponse | null>(null)
-  const [query, setQuery] = useState<ManageQuery>(() => normalizeManageQuery())
+  const [query, setQuery] = useState<ManageQuery>(() => normalizeManageQuery({
+    page_size: typeof window === 'undefined' ? undefined : getStoredManagePageSize(window.localStorage),
+  }))
   const [keywordInput, setKeywordInput] = useState('')
   const [listLoading, setListLoading] = useState(true)
   const [error, setError] = useState('')
@@ -402,7 +407,7 @@ export default function ManagePanelPage() {
   const [batchQualityState, setBatchQualityState] = useState<BatchQualityState | null>(null)
   const batchQualityControllerRef = useRef<AbortController | null>(null)
   const batchQualityStreamJobIdRef = useRef<string | null>(null)
-  const batchQualityTouchedNamesRef = useRef(new Set<string>())
+  const batchQualityTouchedURIsRef = useRef(new Set<string>())
   const [lastQualityJobStatus, setLastQualityJobStatus] = useState<BatchQualityState['status'] | null>(null)
 
   const [selection, setSelection] = useState<SelectionState>(createEmptySelection)
@@ -422,6 +427,13 @@ export default function ManagePanelPage() {
   useEffect(() => {
     queryRef.current = query
   }, [query])
+
+  useEffect(() => {
+    if (typeof window === 'undefined') {
+      return
+    }
+    saveManagePageSize(query.page_size, window.localStorage)
+  }, [query.page_size])
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -536,36 +548,40 @@ export default function ManagePanelPage() {
     }
   }, [])
 
-  const invalidateCachedPages = useCallback((names?: string[], clearAll = false) => {
+  const invalidateCachedPages = useCallback((uris?: string[], clearAll = false) => {
     if (clearAll) {
       pageCacheRef.current.clear()
       return
     }
 
     const currentKey = buildManageQueryKey(queryRef.current)
-    if (!names || names.length === 0) {
+    if (!uris || uris.length === 0) {
       pageCacheRef.current.delete(currentKey)
       return
     }
 
-    const touched = new Set(names)
+    const touched = new Set(uris)
     for (const [key, value] of Array.from(pageCacheRef.current.entries())) {
-      if (key === currentKey || value.items.some(item => touched.has(item.name))) {
+      if (key === currentKey || value.items.some(item => touched.has(item.uri))) {
         pageCacheRef.current.delete(key)
       }
     }
   }, [])
 
-  const refreshCurrentPage = useCallback(async (names?: string[], clearAll = false) => {
-    invalidateCachedPages(names, clearAll)
+  const refreshCurrentPage = useCallback(async (uris?: string[], clearAll = false) => {
+    invalidateCachedPages(uris, clearAll)
     await loadManagePage(queryRef.current, true)
   }, [invalidateCachedPages, loadManagePage])
 
-  const applyQualityResult = useCallback((nodeName: string, result: NodeQualityCheckResult) => {
-    setQualityDetails(prev => ({ ...prev, [nodeName]: result }))
-    setPageData(prev => applyQualityResultToManageList(prev, nodeName, result))
+  const applyQualityResult = useCallback((nodeURI: string, result: NodeQualityCheckResult) => {
+    if (!nodeURI) {
+      return
+    }
+
+    setQualityDetails(prev => ({ ...prev, [nodeURI]: result }))
+    setPageData(prev => applyQualityResultToManageList(prev, nodeURI, result))
     for (const [key, value] of Array.from(pageCacheRef.current.entries())) {
-      const next = applyQualityResultToManageList(value, nodeName, result)
+      const next = applyQualityResultToManageList(value, nodeURI, result)
       if (next) {
         pageCacheRef.current.set(key, next)
       }
@@ -583,8 +599,8 @@ export default function ManagePanelPage() {
       if (event.status === 'success') {
         const result = buildQualityResultFromBatchProgress(event)
         if (result) {
-          batchQualityTouchedNamesRef.current.add(event.name)
-          applyQualityResult(event.name, result)
+          batchQualityTouchedURIsRef.current.add(event.uri)
+          applyQualityResult(event.uri, result)
         }
       }
       return
@@ -622,7 +638,7 @@ export default function ManagePanelPage() {
         if (res.job?.last_result) {
           const restored = buildQualityResultFromJobResult(res.job.last_result)
           if (restored) {
-            applyQualityResult(res.job.last_result.name, restored)
+            applyQualityResult(res.job.last_result.uri, restored)
           }
         }
 
@@ -661,7 +677,7 @@ export default function ManagePanelPage() {
   const manualProbeStatusOptions = pageData?.facets.manual_probe_statuses ?? []
   const activationReadyOptions = pageData?.facets.activation_readiness ?? []
   const qualityStatusOptions = pageData?.facets.quality_statuses ?? []
-  const currentPageNames = useMemo(() => nodes.map(node => node.name), [nodes])
+  const currentPageURIs = useMemo(() => nodes.map(node => node.uri), [nodes])
   const visibleQuery = useMemo(() => resolveVisibleManageQuery(query, keywordInput), [keywordInput, query])
   const currentFilter = useMemo(() => buildManageFilterSnapshot(visibleQuery), [visibleQuery])
   const selectionCount = useMemo(
@@ -669,8 +685,8 @@ export default function ManagePanelPage() {
     [pageData?.filtered_total, selection, visibleQuery],
   )
   const pageSelection = useMemo(
-    () => getPageSelectionState(selection, currentPageNames, visibleQuery),
-    [currentPageNames, selection, visibleQuery],
+    () => getPageSelectionState(selection, currentPageURIs, visibleQuery),
+    [currentPageURIs, selection, visibleQuery],
   )
   const selectionMatchesCurrentFilter = selection.mode === 'filter'
     && selection.filter.keyword === currentFilter.keyword
@@ -711,9 +727,9 @@ export default function ManagePanelPage() {
   useEffect(() => {
     const current = batchQualityState?.status ?? null
     if (lastQualityJobStatus && current && current !== lastQualityJobStatus && isBatchQualityTerminal(current)) {
-      const touchedNames = Array.from(batchQualityTouchedNamesRef.current)
-      batchQualityTouchedNamesRef.current = new Set()
-      void refreshCurrentPage(touchedNames, touchedNames.length === 0)
+      const touchedURIs = Array.from(batchQualityTouchedURIsRef.current)
+      batchQualityTouchedURIsRef.current = new Set()
+      void refreshCurrentPage(touchedURIs, touchedURIs.length === 0)
     }
     if (current !== lastQualityJobStatus) {
       setLastQualityJobStatus(current)
@@ -741,7 +757,7 @@ export default function ManagePanelPage() {
   }, [])
 
   const openEditModal = useCallback((node: ManageNodeRow) => {
-    setEditingNode(node.name)
+    setEditingNode(node.uri)
     setForm({
       name: node.name,
       uri: node.uri,
@@ -800,11 +816,11 @@ export default function ManagePanelPage() {
   }, [deleteTarget, loadManagePage])
 
   const handleToggle = useCallback(async (node: ManageNodeRow) => {
-    setToggling(node.name)
+    setToggling(node.uri)
     try {
-      const res = await toggleConfigNode(node.name, !!node.disabled)
+      const res = await toggleConfigNode(node.uri, !!node.disabled)
       setSuccess(res.message || (node.disabled ? '节点已启用' : '节点已禁用'))
-      await refreshCurrentPage([node.name])
+      await refreshCurrentPage([node.uri])
     } catch (err) {
       setError(err instanceof Error ? err.message : '操作失败')
     } finally {
@@ -818,7 +834,7 @@ export default function ManagePanelPage() {
     try {
       const res = await probeNode(node.tag)
       setSuccess(res.message || '入池预检通过')
-      await refreshCurrentPage([node.name])
+      await refreshCurrentPage([node.uri])
     } catch (err) {
       setError(err instanceof Error ? err.message : '入池预检失败')
     } finally {
@@ -831,7 +847,7 @@ export default function ManagePanelPage() {
     try {
       await releaseNode(node.tag)
       setSuccess('已解除黑名单')
-      await refreshCurrentPage([node.name])
+      await refreshCurrentPage([node.uri])
     } catch (err) {
       setError(err instanceof Error ? err.message : '解除失败')
     }
@@ -843,14 +859,14 @@ export default function ManagePanelPage() {
       return
     }
 
-    const loadingKey = `check:${node.name}`
-    setExpandedQualityNode(node.name)
+    const loadingKey = `check:${node.uri}`
+    setExpandedQualityNode(node.uri)
     setQualityLoadingKey(loadingKey)
     try {
       const res = await checkNodeQuality(node.tag)
-      applyQualityResult(node.name, res.result)
+      applyQualityResult(node.uri, res.result)
       setSuccess(res.message || '质量检测完成')
-      await refreshCurrentPage([node.name])
+      await refreshCurrentPage([node.uri])
     } catch (err) {
       setError(err instanceof Error ? err.message : '质量检测失败')
     } finally {
@@ -859,21 +875,21 @@ export default function ManagePanelPage() {
   }, [applyQualityResult, refreshCurrentPage])
 
   const handleToggleQualityDetails = useCallback(async (node: ManageNodeRow) => {
-    if (expandedQualityNode === node.name) {
+    if (expandedQualityNode === node.uri) {
       setExpandedQualityNode(null)
       return
     }
 
-    setExpandedQualityNode(node.name)
-    const cached = qualityDetails[node.name]
+    setExpandedQualityNode(node.uri)
+    const cached = qualityDetails[node.uri]
     if (cached && cached.items.length > 0) return
     if (!node.tag) return
 
-    const loadingKey = `detail:${node.name}`
+    const loadingKey = `detail:${node.uri}`
     setQualityLoadingKey(loadingKey)
     try {
       const res = await getNodeQuality(node.tag)
-      applyQualityResult(node.name, res.result)
+      applyQualityResult(node.uri, res.result)
     } catch (err) {
       setError(err instanceof Error ? err.message : '加载质量检测详情失败')
     } finally {
@@ -929,7 +945,7 @@ export default function ManagePanelPage() {
   const handleBatchQualityCheck = useCallback(async () => {
     if (selectionCount === 0) return
 
-    batchQualityTouchedNamesRef.current = new Set()
+    batchQualityTouchedURIsRef.current = new Set()
     batchQualityControllerRef.current?.abort()
     batchQualityControllerRef.current = null
     batchQualityStreamJobIdRef.current = null
@@ -1208,16 +1224,17 @@ export default function ManagePanelPage() {
         )}
 
         <div className="rounded-2xl border border-base-300/50 bg-base-100 p-4 shadow-sm">
-          <div className="flex flex-col items-center gap-4 lg:flex-row">
-            <div className="relative w-full flex-1">
+          <div className="flex flex-col gap-4">
+            <div className="relative w-full">
               <div className="pointer-events-none absolute inset-y-0 left-0 flex items-center pl-3.5 text-base-content/40">
                 <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" /></svg>
               </div>
               <input type="text" className="input input-md w-full bg-base-200/50 pl-11 transition-colors focus:border-primary/50 focus:bg-base-100" placeholder="搜索节点名称、URI 或 地区..." value={keywordInput} onChange={(event) => setKeywordInput(event.target.value)} />
             </div>
 
-            <div className="flex w-full flex-wrap gap-3 sm:flex-nowrap lg:w-auto">
-              <select className="select select-md flex-1 bg-base-200/50 focus:bg-base-100 sm:w-36" value={query.status} onChange={(event) => updateQuery(prev => ({ ...prev, page: 1, status: event.target.value as ManageStatus }))}>
+            <div className="flex flex-col gap-3 xl:flex-row xl:items-start">
+              <div className="flex flex-1 flex-wrap gap-3">
+                <select className="select select-md w-full bg-base-200/50 focus:bg-base-100 sm:w-36" value={query.status} onChange={(event) => updateQuery(prev => ({ ...prev, page: 1, status: event.target.value as ManageStatus }))}>
                 <option value="">全部状态</option>
                 <option value="normal">✅ 正常运行</option>
                 <option value="unavailable">❌ 不可用</option>
@@ -1226,42 +1243,59 @@ export default function ManagePanelPage() {
                 <option value="disabled">🚫 已禁用</option>
               </select>
               {(lifecycleStateOptions.length ?? 0) > 0 && (
-                <select className="select select-md flex-1 bg-base-200/50 focus:bg-base-100 sm:w-32" value={query.lifecycle_state} onChange={(event) => updateQuery(prev => ({ ...prev, page: 1, lifecycle_state: event.target.value as NodeLifecycleState | '' }))}>
+                <select className="select select-md w-full bg-base-200/50 focus:bg-base-100 sm:w-32" value={query.lifecycle_state} onChange={(event) => updateQuery(prev => ({ ...prev, page: 1, lifecycle_state: event.target.value as NodeLifecycleState | '' }))}>
                   <option value="">{lifecycleFilterLabel('')}</option>
                   {lifecycleStateOptions.map(state => <option key={state} value={state}>{lifecycleFilterLabel(state)}</option>)}
                 </select>
               )}
               {(manualProbeStatusOptions.length ?? 0) > 0 && (
-                <select className="select select-md flex-1 bg-base-200/50 focus:bg-base-100 sm:w-32" value={query.manual_probe_status} onChange={(event) => updateQuery(prev => ({ ...prev, page: 1, manual_probe_status: event.target.value as ManualProbeStatus | '' }))}>
+                <select className="select select-md w-full bg-base-200/50 focus:bg-base-100 sm:w-32" value={query.manual_probe_status} onChange={(event) => updateQuery(prev => ({ ...prev, page: 1, manual_probe_status: event.target.value as ManualProbeStatus | '' }))}>
                   <option value="">{manualProbeFilterLabel('')}</option>
                   {manualProbeStatusOptions.map(status => <option key={status} value={status}>{manualProbeFilterLabel(status)}</option>)}
                 </select>
               )}
               {(activationReadyOptions.length ?? 0) > 0 && (
-                <select className="select select-md flex-1 bg-base-200/50 focus:bg-base-100 sm:w-32" value={query.activation_ready} onChange={(event) => updateQuery(prev => ({ ...prev, page: 1, activation_ready: event.target.value as ActivationReadyFilter }))}>
+                <select className="select select-md w-full bg-base-200/50 focus:bg-base-100 sm:w-32" value={query.activation_ready} onChange={(event) => updateQuery(prev => ({ ...prev, page: 1, activation_ready: event.target.value as ActivationReadyFilter }))}>
                   <option value="">{activationReadyFilterLabel('')}</option>
                   {activationReadyOptions.map(status => <option key={status} value={status}>{activationReadyFilterLabel(status)}</option>)}
                 </select>
               )}
               {(pageData?.facets.regions.length ?? 0) > 0 && (
-                <select className="select select-md flex-1 bg-base-200/50 focus:bg-base-100 sm:w-32" value={query.region} onChange={(event) => updateQuery(prev => ({ ...prev, page: 1, region: event.target.value }))}>
+                <select className="select select-md w-full bg-base-200/50 focus:bg-base-100 sm:w-32" value={query.region} onChange={(event) => updateQuery(prev => ({ ...prev, page: 1, region: event.target.value }))}>
                   <option value="">全部地区</option>
                   {pageData?.facets.regions.map(region => <option key={region} value={region}>{regionFlag(region)} {region.toUpperCase()}</option>)}
                 </select>
               )}
               {(pageData?.facets.sources.length ?? 0) > 1 && (
-                <select className="select select-md flex-1 bg-base-200/50 focus:bg-base-100 sm:w-32" value={query.source} onChange={(event) => updateQuery(prev => ({ ...prev, page: 1, source: event.target.value }))}>
+                <select className="select select-md w-full bg-base-200/50 focus:bg-base-100 sm:w-32" value={query.source} onChange={(event) => updateQuery(prev => ({ ...prev, page: 1, source: event.target.value }))}>
                   <option value="">全部来源</option>
                   {pageData?.facets.sources.map(source => <option key={source} value={source}>{sourceLabel(source)}</option>)}
                 </select>
               )}
-              <select className="select select-md flex-1 bg-base-200/50 focus:bg-base-100 sm:w-32" value={query.quality_status} onChange={(event) => updateQuery(prev => ({ ...prev, page: 1, quality_status: event.target.value }))}>
+              <select className="select select-md w-full bg-base-200/50 focus:bg-base-100 sm:w-32" value={query.quality_status} onChange={(event) => updateQuery(prev => ({ ...prev, page: 1, quality_status: event.target.value }))}>
                 <option value="">全部质检</option>
                 {qualityStatusOptions.map(status => <option key={status} value={status}>{qualityStatusLabel(status)}</option>)}
               </select>
-              <button type="button" className={`btn btn-md ${selectionMatchesCurrentFilter ? 'btn-primary' : 'btn-ghost'}`} onClick={() => setSelection({ mode: 'filter', filter: currentFilter, excludeNames: new Set() })} disabled={!canUseFilteredSelection || batchProcessing || probeJobRunning || qualityBatchRunning} title={!filtersActive ? '请先设置至少一个筛选条件' : pendingKeywordChange || listLoading ? '等待筛选结果更新后再执行' : undefined}>
+              <label className="flex w-full items-center justify-between gap-2 rounded-box bg-base-200/50 px-3 py-2 text-sm text-base-content/70 sm:w-auto sm:justify-start">
+                <span className="whitespace-nowrap">每页显示</span>
+                <select
+                  className="select select-sm min-w-[88px] bg-base-100"
+                  value={query.page_size}
+                  onChange={(event) => {
+                    const nextPageSize = Number.parseInt(event.target.value, 10)
+                    updateQuery(prev => ({ ...prev, page: 1, page_size: nextPageSize }))
+                  }}
+                  disabled={listLoading}
+                >
+                  {managePageSizeOptions.map(pageSize => (
+                    <option key={pageSize} value={pageSize}>{pageSize}</option>
+                  ))}
+                </select>
+              </label>
+              <button type="button" className={`btn btn-md w-full shrink-0 whitespace-nowrap sm:w-auto ${selectionMatchesCurrentFilter ? 'btn-primary' : 'btn-ghost'}`} onClick={() => setSelection({ mode: 'filter', filter: currentFilter, excludeUris: new Set() })} disabled={!canUseFilteredSelection || batchProcessing || probeJobRunning || qualityBatchRunning} title={!filtersActive ? '请先设置至少一个筛选条件' : pendingKeywordChange || listLoading ? '等待筛选结果更新后再执行' : undefined}>
                 {selectFilteredButtonLabel}
               </button>
+              </div>
             </div>
           </div>
         </div>
@@ -1272,7 +1306,7 @@ export default function ManagePanelPage() {
             <div className="flex flex-wrap items-center gap-4">
               <span className="flex items-center gap-2 text-base font-medium text-base-content/80">
                 <span className="badge badge-primary badge-md font-bold">{selectionCount}</span>
-                {selection.mode === 'filter' && selectionMatchesCurrentFilter ? `项已按筛选选中（排除 ${selection.excludeNames.size} 项）` : '项已选择'}
+                {selection.mode === 'filter' && selectionMatchesCurrentFilter ? `项已按筛选选中（排除 ${selection.excludeUris.size} 项）` : '项已选择'}
               </span>
               <div className="ml-auto flex flex-wrap gap-2">
                 <button className="btn btn-sm btn-primary gap-1.5 shadow-sm" onClick={() => void handleBatchProbe()} disabled={batchProcessing || probeJobRunning || qualityBatchRunning}>
@@ -1300,7 +1334,7 @@ export default function ManagePanelPage() {
               <thead>
                 <tr className="border-b border-base-300/50 bg-base-200/50 text-base-content/70 shadow-sm">
                   <th className="w-8">
-                    <input type="checkbox" className="checkbox checkbox-xs" checked={pageSelection.allSelected} onChange={() => setSelection(prev => togglePageSelection(prev, currentPageNames))} ref={(element) => { if (element) { element.indeterminate = pageSelection.partiallySelected } }} />
+                    <input type="checkbox" className="checkbox checkbox-xs" checked={pageSelection.allSelected} onChange={() => setSelection(prev => togglePageSelection(prev, currentPageURIs))} ref={(element) => { if (element) { element.indeterminate = pageSelection.partiallySelected } }} />
                   </th>
                   <th className={thClass} onClick={() => handleSort('name')}>名称 <SortIcon active={query.sort_key === 'name'} dir={query.sort_dir} /></th>
                   <th className={thClass} onClick={() => handleSort('status')}>状态 <SortIcon active={query.sort_key === 'status'} dir={query.sort_dir} /></th>
@@ -1328,20 +1362,20 @@ export default function ManagePanelPage() {
                   </tr>
                 ) : (
                   nodes.map((node) => {
-                    const detail = qualityDetails[node.name] ?? buildQualityCacheEntry(node)
-                    const isExpanded = expandedQualityNode === node.name
-                    const isCheckingQuality = qualityLoadingKey === `check:${node.name}`
-                    const isLoadingDetail = qualityLoadingKey === `detail:${node.name}`
-                    const checked = isNodeSelected(selection, node.name, visibleQuery)
+                    const detail = qualityDetails[node.uri] ?? buildQualityCacheEntry(node)
+                    const isExpanded = expandedQualityNode === node.uri
+                    const isCheckingQuality = qualityLoadingKey === `check:${node.uri}`
+                    const isLoadingDetail = qualityLoadingKey === `detail:${node.uri}`
+                    const checked = isNodeSelected(selection, node.uri, visibleQuery)
                     const activationReady = detail?.activation_ready ?? node.activation_ready ?? false
                     const activationBlockReason = detail?.activation_block_reason || node.activation_block_reason || ''
                     const canShowQuality = Boolean(node.tag || detail)
 
                     return (
-                      <Fragment key={node.name}>
+                      <Fragment key={node.uri}>
                         <tr className={`group border-b border-base-200/50 transition-colors ${node.runtime_status === 'disabled' ? 'opacity-50 grayscale-[0.5]' : ''} ${node.runtime_status === 'blacklisted' ? 'opacity-80' : ''} ${checked ? 'bg-primary/5' : 'hover:bg-base-200/40'}`}>
                           <td className="w-8">
-                            <input type="checkbox" className="checkbox checkbox-sm" checked={checked} onChange={() => setSelection(prev => toggleNodeSelection(prev, node.name))} />
+                            <input type="checkbox" className="checkbox checkbox-sm" checked={checked} onChange={() => setSelection(prev => toggleNodeSelection(prev, node.uri))} />
                           </td>
                           <td>
                             <div className="flex items-center gap-2 text-sm font-semibold">
@@ -1378,9 +1412,9 @@ export default function ManagePanelPage() {
                               {!node.disabled && node.tag && <button className="btn btn-sm btn-square btn-ghost text-primary hover:bg-primary/10" onClick={() => void handleProbe(node)} disabled={probingTag === node.tag || qualityBatchRunning} title="执行入池预检">{probingTag === node.tag ? <span className="loading loading-spinner loading-xs"></span> : <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M13 10V3L4 14h7v7l9-11h-7z" /></svg>}</button>}
                               {!node.disabled && node.tag && <button className="btn btn-sm btn-square btn-ghost text-secondary hover:bg-secondary/10" onClick={() => void handleQualityCheck(node)} disabled={isCheckingQuality || qualityBatchRunning} title="执行质量检测">{isCheckingQuality ? <span className="loading loading-spinner loading-xs"></span> : <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 12l2 2 4-4m5-2a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>}</button>}
                               {node.runtime_status === 'blacklisted' && node.tag && <button className="btn btn-sm btn-square btn-ghost text-warning hover:bg-warning/10" onClick={() => void handleRelease(node)} title="解除黑名单"><svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M8 11V7a4 4 0 118 0m-4 8v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2z" /></svg></button>}
-                              <button className={`btn btn-sm btn-square btn-ghost ${node.disabled ? 'text-success hover:bg-success/10' : 'text-warning hover:bg-warning/10'}`} onClick={() => void handleToggle(node)} disabled={toggling === node.name || qualityBatchRunning} title={node.disabled ? '启用该节点' : '禁用该节点'}>{toggling === node.name ? <span className="loading loading-spinner loading-xs"></span> : node.disabled ? <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M5 13l4 4L19 7" /></svg> : <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M18.364 18.364A9 9 0 005.636 5.636m12.728 12.728A9 9 0 015.636 5.636m12.728 12.728L5.636 5.636" /></svg>}</button>
+                              <button className={`btn btn-sm btn-square btn-ghost ${node.disabled ? 'text-success hover:bg-success/10' : 'text-warning hover:bg-warning/10'}`} onClick={() => void handleToggle(node)} disabled={toggling === node.uri || qualityBatchRunning} title={node.disabled ? '启用该节点' : '禁用该节点'}>{toggling === node.uri ? <span className="loading loading-spinner loading-xs"></span> : node.disabled ? <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M5 13l4 4L19 7" /></svg> : <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M18.364 18.364A9 9 0 005.636 5.636m12.728 12.728A9 9 0 015.636 5.636m12.728 12.728L5.636 5.636" /></svg>}</button>
                               <button className="btn btn-sm btn-square btn-ghost text-info hover:bg-info/10" onClick={() => openEditModal(node)} title="编辑节点配置"><svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" /></svg></button>
-                              <button className="btn btn-sm btn-square btn-ghost text-error hover:bg-error/10" onClick={() => setDeleteTarget(node.name)} title="删除节点"><svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg></button>
+                              <button className="btn btn-sm btn-square btn-ghost text-error hover:bg-error/10" onClick={() => setDeleteTarget(node.uri)} title="删除节点"><svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg></button>
                             </div>
                           </td>
                         </tr>

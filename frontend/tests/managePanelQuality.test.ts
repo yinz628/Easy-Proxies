@@ -49,6 +49,7 @@ test('buildQualityResultFromJobResult restores persisted provider results', () =
   const result = buildQualityResultFromJobResult({
     tag: 'tag-a',
     name: 'Node A',
+    uri: 'socks5://127.0.0.1:1080',
     quality_version: 'ai_reachability_v2',
     quality_status: 'dual_available',
     quality_openai_status: 'pass',
@@ -87,6 +88,7 @@ test('reduceBatchQualityEvent keeps success and failure counters from progress e
     job_id: 'job-1',
     tag: 'tag-a',
     name: 'Node A',
+    uri: 'socks5://127.0.0.1:1080',
     status: 'success',
     error: '',
     quality_version: 'ai_reachability_v2',
@@ -115,6 +117,7 @@ test('mergeQualityJobSnapshot preserves last streamed result when snapshot omits
   const lastResult: BatchQualityLastResult = {
     tag: 'tag-a',
     name: 'Node A',
+    uri: 'socks5://127.0.0.1:1080',
     status: 'success',
     error: '',
     quality_status: 'dual_available',
@@ -188,4 +191,78 @@ test('applyQualityResultToManageList tolerates null items from empty manage resp
   })
 
   assert.deepEqual(next?.items, [])
+})
+
+test('applyQualityResultToManageList only updates the matching uri when names are duplicated', () => {
+  const page: ManageListResponse = {
+    items: [
+      {
+        name: 'duplicate-node',
+        uri: 'http://49.0.246.130:443',
+        port: 443,
+        username: '',
+        password: '',
+        runtime_status: 'pending',
+        latency_ms: -1,
+        manual_probe_status: 'untested',
+        manual_probe_latency_ms: -1,
+        activation_ready: false,
+        active_connections: 0,
+        success_count: 0,
+        failure_count: 0,
+      },
+      {
+        name: 'duplicate-node',
+        uri: 'socks5://49.0.246.130:443',
+        port: 443,
+        username: '',
+        password: '',
+        runtime_status: 'pending',
+        latency_ms: -1,
+        manual_probe_status: 'untested',
+        manual_probe_latency_ms: -1,
+        activation_ready: false,
+        active_connections: 0,
+        success_count: 0,
+        failure_count: 0,
+      },
+    ],
+    page: 1,
+    page_size: 50,
+    total: 2,
+    filtered_total: 2,
+    summary: {
+      normal: 0,
+      pending: 2,
+      unavailable: 0,
+      blacklisted: 0,
+      disabled: 0,
+    },
+    facets: {
+      regions: [],
+      sources: [],
+      lifecycle_states: [],
+      manual_probe_statuses: [],
+      activation_readiness: [],
+      quality_statuses: [],
+    },
+  }
+
+  const next = applyQualityResultToManageList(page, 'socks5://49.0.246.130:443', {
+    node_id: 0,
+    quality_version: 'ai_reachability_v2',
+    quality_status: 'openai_only',
+    quality_openai_status: 'pass',
+    quality_anthropic_status: 'fail',
+    activation_ready: true,
+    activation_block_reason: '',
+    quality_score: 80,
+    quality_grade: 'B',
+    quality_summary: 'OpenAI 可用',
+    quality_checked_at: '2026-04-03T00:00:00Z',
+    items: [],
+  })
+
+  assert.equal(next?.items[0].quality_status, undefined)
+  assert.equal(next?.items[1].quality_status, 'openai_only')
 })

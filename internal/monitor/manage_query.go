@@ -86,8 +86,10 @@ type ManageRow struct {
 
 type ManageSelection struct {
 	Mode         string      `json:"mode"`
+	URIs         []string    `json:"uris,omitempty"`
 	Names        []string    `json:"names,omitempty"`
 	Filter       ManageQuery `json:"filter,omitempty"`
+	ExcludeURIs  []string    `json:"exclude_uris,omitempty"`
 	ExcludeNames []string    `json:"exclude_names,omitempty"`
 }
 
@@ -255,6 +257,31 @@ func QueryManageRows(rows []ManageRow, query ManageQuery) ManageListResponse {
 
 func ResolveManageSelection(rows []ManageRow, selection ManageSelection) ([]ManageRow, error) {
 	switch strings.ToLower(strings.TrimSpace(selection.Mode)) {
+	case "uris":
+		if len(selection.URIs) == 0 {
+			return nil, errInvalidManageSelection
+		}
+		uriSet := make(map[string]struct{}, len(selection.URIs))
+		for _, uri := range selection.URIs {
+			trimmed := strings.TrimSpace(uri)
+			if trimmed == "" {
+				continue
+			}
+			uriSet[trimmed] = struct{}{}
+		}
+		if len(uriSet) == 0 {
+			return nil, errInvalidManageSelection
+		}
+		selected := make([]ManageRow, 0, len(uriSet))
+		for _, row := range rows {
+			if _, ok := uriSet[row.URI]; ok {
+				selected = append(selected, row)
+			}
+		}
+		if len(selected) == 0 {
+			return nil, errInvalidManageSelection
+		}
+		return selected, nil
 	case "names":
 		if len(selection.Names) == 0 {
 			return nil, errInvalidManageSelection
@@ -285,6 +312,14 @@ func ResolveManageSelection(rows []ManageRow, selection ManageSelection) ([]Mana
 		if len(filtered) == 0 {
 			return nil, errInvalidManageSelection
 		}
+		excludedURIs := make(map[string]struct{}, len(selection.ExcludeURIs))
+		for _, uri := range selection.ExcludeURIs {
+			trimmed := strings.TrimSpace(uri)
+			if trimmed == "" {
+				continue
+			}
+			excludedURIs[trimmed] = struct{}{}
+		}
 		excluded := make(map[string]struct{}, len(selection.ExcludeNames))
 		for _, name := range selection.ExcludeNames {
 			trimmed := strings.TrimSpace(name)
@@ -295,6 +330,9 @@ func ResolveManageSelection(rows []ManageRow, selection ManageSelection) ([]Mana
 		}
 		selected := make([]ManageRow, 0, len(filtered))
 		for _, row := range filtered {
+			if _, skip := excludedURIs[row.URI]; skip {
+				continue
+			}
 			if _, skip := excluded[row.Name]; skip {
 				continue
 			}

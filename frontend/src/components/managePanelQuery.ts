@@ -1,5 +1,8 @@
 import type { ManageFilterSnapshot, ManageListResponse, ManageQuery } from '../types/index.ts'
 
+export const managePageSizeOptions = [50, 100, 200, 500] as const
+export const managePageSizeStorageKey = 'easy-proxies.manage.page-size'
+
 export const defaultManageQuery: ManageQuery = {
   page: 1,
   page_size: 100,
@@ -15,9 +18,38 @@ export const defaultManageQuery: ManageQuery = {
   sort_dir: 'asc',
 }
 
+export function normalizeManagePageSize(pageSize?: number): number {
+  return managePageSizeOptions.includes(pageSize as (typeof managePageSizeOptions)[number])
+    ? pageSize as number
+    : defaultManageQuery.page_size
+}
+
+export function getStoredManagePageSize(storage?: Pick<Storage, 'getItem'> | null): number {
+  if (!storage) {
+    return defaultManageQuery.page_size
+  }
+
+  const raw = storage.getItem(managePageSizeStorageKey)
+  if (!raw) {
+    return defaultManageQuery.page_size
+  }
+
+  const parsed = Number.parseInt(raw, 10)
+  return normalizeManagePageSize(parsed)
+}
+
+export function saveManagePageSize(pageSize: number, storage?: Pick<Storage, 'setItem'> | null): void {
+  if (!storage) {
+    return
+  }
+  storage.setItem(managePageSizeStorageKey, String(normalizeManagePageSize(pageSize)))
+}
+
 export function normalizeManageQuery(input: Partial<ManageQuery> = {}): ManageQuery {
   const page = typeof input.page === 'number' && input.page > 0 ? Math.floor(input.page) : defaultManageQuery.page
-  const pageSize = typeof input.page_size === 'number' && input.page_size > 0 ? Math.floor(input.page_size) : defaultManageQuery.page_size
+  const pageSize = typeof input.page_size === 'number' && input.page_size > 0
+    ? normalizeManagePageSize(Math.floor(input.page_size))
+    : defaultManageQuery.page_size
   return {
     page,
     page_size: pageSize,

@@ -781,15 +781,15 @@ func (m *Manager) CreateNode(ctx context.Context, node config.NodeConfig) (confi
 	return normalized, nil
 }
 
-// UpdateNode updates an existing node by name and persists to the Store.
-func (m *Manager) UpdateNode(ctx context.Context, name string, node config.NodeConfig) (config.NodeConfig, error) {
+// UpdateNode updates an existing node by unique identifier (preferred: URI) and persists to the Store.
+func (m *Manager) UpdateNode(ctx context.Context, identifier string, node config.NodeConfig) (config.NodeConfig, error) {
 	if ctx != nil {
 		if err := ctx.Err(); err != nil {
 			return config.NodeConfig{}, err
 		}
 	}
 
-	name = strings.TrimSpace(name)
+	identifier = strings.TrimSpace(identifier)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -797,12 +797,13 @@ func (m *Manager) UpdateNode(ctx context.Context, name string, node config.NodeC
 		return config.NodeConfig{}, errConfigUnavailable
 	}
 
-	idx := m.nodeIndexLocked(name)
+	idx := m.nodeIndexByIdentifierLocked(identifier)
 	if idx == -1 {
 		return config.NodeConfig{}, monitor.ErrNodeNotFound
 	}
 
-	normalized, err := m.prepareNodeLocked(node, name)
+	currentName := m.cfg.Nodes[idx].Name
+	normalized, err := m.prepareNodeLocked(node, currentName)
 	if err != nil {
 		return config.NodeConfig{}, err
 	}
@@ -813,7 +814,7 @@ func (m *Manager) UpdateNode(ctx context.Context, name string, node config.NodeC
 
 	// Persist to Store if available
 	if m.store != nil {
-		existing, err := m.store.GetNodeByName(ctx, name)
+		existing, err := m.lookupStoreNodeByIdentifier(ctx, identifier)
 		if err != nil {
 			return config.NodeConfig{}, fmt.Errorf("lookup in store: %w", err)
 		}
@@ -834,16 +835,16 @@ func (m *Manager) UpdateNode(ctx context.Context, name string, node config.NodeC
 	return normalized, nil
 }
 
-// SetNodeEnabled enables or disables a node by name.
+// SetNodeEnabled enables or disables a node by unique identifier (preferred: URI).
 // This only updates the store; a reload is needed for changes to take effect.
-func (m *Manager) SetNodeEnabled(ctx context.Context, name string, enabled bool) error {
+func (m *Manager) SetNodeEnabled(ctx context.Context, identifier string, enabled bool) error {
 	if ctx != nil {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 	}
 
-	name = strings.TrimSpace(name)
+	identifier = strings.TrimSpace(identifier)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -853,7 +854,7 @@ func (m *Manager) SetNodeEnabled(ctx context.Context, name string, enabled bool)
 
 	// Update in Store
 	if m.store != nil {
-		existing, err := m.store.GetNodeByName(ctx, name)
+		existing, err := m.lookupStoreNodeByIdentifier(ctx, identifier)
 		if err != nil {
 			return fmt.Errorf("lookup in store: %w", err)
 		}
@@ -866,7 +867,7 @@ func (m *Manager) SetNodeEnabled(ctx context.Context, name string, enabled bool)
 		}
 	} else {
 		// No store — just check the node exists in config
-		idx := m.nodeIndexLocked(name)
+		idx := m.nodeIndexByIdentifierLocked(identifier)
 		if idx == -1 {
 			return monitor.ErrNodeNotFound
 		}
@@ -874,7 +875,7 @@ func (m *Manager) SetNodeEnabled(ctx context.Context, name string, enabled bool)
 
 	// If disabling, remove from active config nodes
 	if !enabled {
-		idx := m.nodeIndexLocked(name)
+		idx := m.nodeIndexByIdentifierLocked(identifier)
 		if idx != -1 {
 			m.cfg.Nodes = append(m.cfg.Nodes[:idx], m.cfg.Nodes[idx+1:]...)
 		}
@@ -883,15 +884,15 @@ func (m *Manager) SetNodeEnabled(ctx context.Context, name string, enabled bool)
 	return nil
 }
 
-// DeleteNode removes a node by name and deletes it from the Store.
-func (m *Manager) DeleteNode(ctx context.Context, name string) error {
+// DeleteNode removes a node by unique identifier (preferred: URI) and deletes it from the Store.
+func (m *Manager) DeleteNode(ctx context.Context, identifier string) error {
 	if ctx != nil {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 	}
 
-	name = strings.TrimSpace(name)
+	identifier = strings.TrimSpace(identifier)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -899,13 +900,13 @@ func (m *Manager) DeleteNode(ctx context.Context, name string) error {
 		return errConfigUnavailable
 	}
 
-	idx := m.nodeIndexLocked(name)
+	idx := m.nodeIndexByIdentifierLocked(identifier)
 
 	// Delete from Store if available
 	var existing *store.Node
 	if m.store != nil {
 		var err error
-		existing, err = m.store.GetNodeByName(ctx, name)
+		existing, err = m.lookupStoreNodeByIdentifier(ctx, identifier)
 		if err != nil {
 			return fmt.Errorf("lookup in store: %w", err)
 		}
@@ -1206,6 +1207,38 @@ func (m *Manager) nodeIndexLocked(name string) int {
 		}
 	}
 	return -1
+}
+
+func (m *Manager) nodeIndexByIdentifierLocked(identifier string) int {
+	identifier = strings.TrimSpace(identifier)
+	if identifier == "" {
+		return -1
+	}
+
+	for idx, node := range m.cfg.Nodes {
+		if node.URI == identifier {
+			return idx
+		}
+	}
+
+	return m.nodeIndexLocked(identifier)
+}
+
+func (m *Manager) lookupStoreNodeByIdentifier(ctx context.Context, identifier string) (*store.Node, error) {
+	identifier = strings.TrimSpace(identifier)
+	if m.store == nil || identifier == "" {
+		return nil, nil
+	}
+
+	node, err := m.store.GetNodeByURI(ctx, identifier)
+	if err != nil {
+		return nil, err
+	}
+	if node != nil {
+		return node, nil
+	}
+
+	return m.store.GetNodeByName(ctx, identifier)
 }
 
 func (m *Manager) portInUseLocked(port uint16, currentName string) bool {
