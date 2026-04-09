@@ -35,7 +35,8 @@ RUN sed -i 's|deb.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list.d/debia
 WORKDIR /app
 COPY --from=builder /src/easy-proxies /usr/local/bin/easy-proxies
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
-RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+RUN sed -i 's/\r$//' /usr/local/bin/docker-entrypoint.sh \
+    && chmod +x /usr/local/bin/docker-entrypoint.sh
 COPY --chown=easy:easy config.example.yaml /etc/easy-proxies/config.yaml
 # Pool/Hybrid mode: 2323, Management: 9888, Multi-port/Hybrid mode: 24000-24200
 EXPOSE 2323 9888 24000-24200

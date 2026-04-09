@@ -11,7 +11,7 @@ func TestBatchProbeJobManagerRejectsConcurrentStart(t *testing.T) {
 	manager := NewBatchProbeJobManager(1)
 	block := make(chan struct{})
 
-	_, err := manager.Start([]string{"a"}, []Snapshot{{NodeInfo: NodeInfo{Tag: "a", Name: "node-a"}}}, func(ctx context.Context, snap Snapshot) (int64, error) {
+	_, err := manager.Start([]BatchProbeTarget{{Tag: "a", Name: "node-a"}}, func(ctx context.Context, target BatchProbeTarget) (int64, error) {
 		<-block
 		return 10, nil
 	})
@@ -19,7 +19,7 @@ func TestBatchProbeJobManagerRejectsConcurrentStart(t *testing.T) {
 		t.Fatalf("Start(first) error = %v", err)
 	}
 
-	_, err = manager.Start([]string{"b"}, []Snapshot{{NodeInfo: NodeInfo{Tag: "b", Name: "node-b"}}}, func(ctx context.Context, snap Snapshot) (int64, error) {
+	_, err = manager.Start([]BatchProbeTarget{{Tag: "b", Name: "node-b"}}, func(ctx context.Context, target BatchProbeTarget) (int64, error) {
 		return 0, nil
 	})
 	if !errors.Is(err, ErrBatchProbeJobRunning) {
@@ -32,12 +32,11 @@ func TestBatchProbeJobManagerRejectsConcurrentStart(t *testing.T) {
 func TestBatchProbeJobManagerTracksProgressAndCompletion(t *testing.T) {
 	manager := NewBatchProbeJobManager(2)
 	job, err := manager.Start(
-		[]string{"a", "b"},
-		[]Snapshot{
-			{NodeInfo: NodeInfo{Tag: "a", Name: "node-a"}},
-			{NodeInfo: NodeInfo{Tag: "b", Name: "node-b"}},
+		[]BatchProbeTarget{
+			{Tag: "a", Name: "node-a"},
+			{Tag: "b", Name: "node-b"},
 		},
-		func(ctx context.Context, snap Snapshot) (int64, error) {
+		func(ctx context.Context, target BatchProbeTarget) (int64, error) {
 			time.Sleep(20 * time.Millisecond)
 			return 15, nil
 		},
@@ -68,9 +67,8 @@ func TestBatchProbeJobManagerTracksProgressAndCompletion(t *testing.T) {
 func TestBatchProbeJobManagerTreatsHighLatencyAsFailure(t *testing.T) {
 	manager := NewBatchProbeJobManager(1)
 	job, err := manager.Start(
-		[]string{"slow"},
-		[]Snapshot{{NodeInfo: NodeInfo{Tag: "slow", Name: "slow-node"}}},
-		func(ctx context.Context, snap Snapshot) (int64, error) {
+		[]BatchProbeTarget{{Tag: "slow", Name: "slow-node"}},
+		func(ctx context.Context, target BatchProbeTarget) (int64, error) {
 			return 10001, nil
 		},
 	)
@@ -111,9 +109,8 @@ func TestBatchProbeJobManagerCancelCompletesHungProbe(t *testing.T) {
 	})
 
 	job, err := manager.Start(
-		[]string{"hung"},
-		[]Snapshot{{NodeInfo: NodeInfo{Tag: "hung", Name: "hung-node"}}},
-		func(ctx context.Context, snap Snapshot) (int64, error) {
+		[]BatchProbeTarget{{Tag: "hung", Name: "hung-node"}},
+		func(ctx context.Context, target BatchProbeTarget) (int64, error) {
 			<-release
 			return 0, nil
 		},
@@ -169,9 +166,8 @@ func TestBatchProbeJobManagerTimesOutHungProbe(t *testing.T) {
 	})
 
 	job, err := manager.Start(
-		[]string{"timeout"},
-		[]Snapshot{{NodeInfo: NodeInfo{Tag: "timeout", Name: "timeout-node"}}},
-		func(ctx context.Context, snap Snapshot) (int64, error) {
+		[]BatchProbeTarget{{Tag: "timeout", Name: "timeout-node"}},
+		func(ctx context.Context, target BatchProbeTarget) (int64, error) {
 			<-release
 			return 0, nil
 		},

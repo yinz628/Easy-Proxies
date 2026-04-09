@@ -128,6 +128,17 @@ func (s *sharedMemberState) forceRelease() {
 	}
 }
 
+func (s *sharedMemberState) restoreBlacklist(until time.Time) {
+	if until.IsZero() || !until.After(time.Now()) {
+		return
+	}
+	s.mu.Lock()
+	s.failures = 0
+	s.blacklisted = true
+	s.blacklistedUntil = until
+	s.mu.Unlock()
+}
+
 func (s *sharedMemberState) incActive() {
 	s.active.Add(1)
 	if entry := s.entry.Load(); entry != nil {

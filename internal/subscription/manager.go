@@ -51,6 +51,7 @@ const (
 )
 
 type refreshRequest struct {
+	kindFilter         feedKind
 	includeDisabledTXT bool
 }
 
@@ -158,9 +159,9 @@ func (m *Manager) Stop() {
 
 // RefreshNow triggers an immediate refresh, regardless of whether auto-refresh is enabled.
 // It only requires that subscription URLs are configured.
-func (m *Manager) RefreshNow() error {
+func (m *Manager) triggerManualRefresh(req refreshRequest) error {
 	m.mu.RLock()
-	hasSubscriptions := m.hasAnySubscriptionsLocked()
+	hasSubscriptions := m.hasSubscriptionsForKindLocked(req.kindFilter)
 	timeout := m.baseCfg.SubscriptionRefresh.Timeout
 	healthCheckTimeout := m.baseCfg.SubscriptionRefresh.HealthCheckTimeout
 	m.mu.RUnlock()
@@ -170,7 +171,7 @@ func (m *Manager) RefreshNow() error {
 	}
 
 	select {
-	case m.manualRefresh <- refreshRequest{includeDisabledTXT: true}:
+	case m.manualRefresh <- req:
 	default:
 		// Already a refresh pending
 	}
@@ -202,6 +203,22 @@ func (m *Manager) RefreshNow() error {
 			}
 		}
 	}
+}
+
+// RefreshLegacy triggers an immediate refresh of all legacy feeds.
+func (m *Manager) RefreshLegacy() error {
+	return m.triggerManualRefresh(refreshRequest{
+		kindFilter:         feedKindLegacy,
+		includeDisabledTXT: true,
+	})
+}
+
+// RefreshTXT triggers an immediate refresh of all TXT feeds.
+func (m *Manager) RefreshTXT() error {
+	return m.triggerManualRefresh(refreshRequest{
+		kindFilter:         feedKindTXT,
+		includeDisabledTXT: true,
+	})
 }
 
 // Status returns the current refresh status, including dynamic config state.
@@ -254,7 +271,7 @@ func (m *Manager) refreshLoop() {
 
 			// Only auto-refresh when enabled and subscriptions exist
 			if m.isEnabled() {
-				m.doRefresh(false)
+				m.doRefresh(refreshRequest{includeDisabledTXT: false})
 			}
 
 			m.mu.Lock()
@@ -267,7 +284,7 @@ func (m *Manager) refreshLoop() {
 
 		case req := <-m.manualRefresh:
 			// Manual refresh always executes (caller already verified subscriptions exist)
-			m.doRefresh(req.includeDisabledTXT)
+			m.doRefresh(req)
 			// Reset ticker and recalculate interval after manual refresh
 			newInterval := m.currentInterval()
 			if newInterval != interval {
@@ -313,63 +330,89 @@ func (m *Manager) hasAnySubscriptionsLocked() bool {
 	return len(m.baseCfg.Subscriptions) > 0 || len(m.baseCfg.TXTSubscriptions) > 0
 }
 
+func (m *Manager) hasSubscriptionsForKindLocked(kind feedKind) bool {
+	switch kind {
+	case feedKindLegacy:
+		return len(m.baseCfg.Subscriptions) > 0
+	case feedKindTXT:
+		return len(m.baseCfg.TXTSubscriptions) > 0
+	default:
+		return m.hasAnySubscriptionsLocked()
+	}
+}
+
 func (m *Manager) collectFeedRequests(includeDisabledTXT bool) []feedRequest {
+	return m.collectFeedRequestsByKind("", includeDisabledTXT)
+}
+
+func (m *Manager) collectFeedRequestsByKind(kindFilter feedKind, includeDisabledTXT bool) []feedRequest {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
 	var feeds []feedRequest
-	for _, subURL := range m.baseCfg.Subscriptions {
-		trimmed := strings.TrimSpace(subURL)
-		if trimmed == "" {
-			continue
+	if kindFilter == "" || kindFilter == feedKindLegacy {
+		for _, subURL := range m.baseCfg.Subscriptions {
+			trimmed := strings.TrimSpace(subURL)
+			if trimmed == "" {
+				continue
+			}
+			feeds = append(feeds, feedRequest{
+				Kind:          feedKindLegacy,
+				URL:           trimmed,
+				NormalizedURL: trimmed,
+				FeedKey:       txtsub.BuildFeedKey(txtsub.FeedKindLegacy, trimmed),
+			})
 		}
-		feeds = append(feeds, feedRequest{
-			Kind:          feedKindLegacy,
-			URL:           trimmed,
-			NormalizedURL: trimmed,
-			FeedKey:       txtsub.BuildFeedKey(txtsub.FeedKindLegacy, trimmed),
-		})
 	}
 
-	for _, txtCfg := range m.baseCfg.TXTSubscriptions {
-		trimmedURL := strings.TrimSpace(txtCfg.URL)
-		if trimmedURL == "" {
-			continue
+	if kindFilter == "" || kindFilter == feedKindTXT {
+		for _, txtCfg := range m.baseCfg.TXTSubscriptions {
+			trimmedURL := strings.TrimSpace(txtCfg.URL)
+			if trimmedURL == "" {
+				continue
+			}
+			if !includeDisabledTXT && !txtCfg.AutoUpdateEnabled {
+				continue
+			}
+			defaultProtocol, err := txtsub.NormalizeDefaultProtocol(txtCfg.DefaultProtocol)
+			if err != nil {
+				continue
+			}
+			normalizedURL := txtsub.NormalizeSourceURL(trimmedURL)
+			feeds = append(feeds, feedRequest{
+				Kind:              feedKindTXT,
+				Name:              strings.TrimSpace(txtCfg.Name),
+				URL:               trimmedURL,
+				NormalizedURL:     normalizedURL,
+				FeedKey:           txtsub.BuildFeedKey(txtsub.FeedKindTXT, normalizedURL),
+				DefaultProtocol:   defaultProtocol,
+				AutoUpdateEnabled: txtCfg.AutoUpdateEnabled,
+			})
 		}
-		if !includeDisabledTXT && !txtCfg.AutoUpdateEnabled {
-			continue
-		}
-		defaultProtocol, err := txtsub.NormalizeDefaultProtocol(txtCfg.DefaultProtocol)
-		if err != nil {
-			continue
-		}
-		normalizedURL := txtsub.NormalizeSourceURL(trimmedURL)
-		feeds = append(feeds, feedRequest{
-			Kind:              feedKindTXT,
-			Name:              strings.TrimSpace(txtCfg.Name),
-			URL:               trimmedURL,
-			NormalizedURL:     normalizedURL,
-			FeedKey:           txtsub.BuildFeedKey(txtsub.FeedKindTXT, normalizedURL),
-			DefaultProtocol:   defaultProtocol,
-			AutoUpdateEnabled: txtCfg.AutoUpdateEnabled,
-		})
 	}
 
 	return feeds
 }
 
-func (m *Manager) findTXTFeedRequestByFeedKey(feedKey string) (feedRequest, error) {
+func (m *Manager) findFeedRequestByFeedKey(feedKey string) (feedRequest, error) {
 	feeds := m.collectFeedRequests(true)
 	for _, feed := range feeds {
-		if feed.FeedKey != feedKey {
-			continue
+		if feed.FeedKey == feedKey {
+			return feed, nil
 		}
-		if feed.Kind != feedKindTXT {
-			return feedRequest{}, fmt.Errorf("feed %q is not a txt subscription", feedKey)
-		}
-		return feed, nil
 	}
-	return feedRequest{}, fmt.Errorf("txt feed %q not found", feedKey)
+	return feedRequest{}, fmt.Errorf("feed %q not found", feedKey)
+}
+
+func (m *Manager) findTXTFeedRequestByFeedKey(feedKey string) (feedRequest, error) {
+	feed, err := m.findFeedRequestByFeedKey(feedKey)
+	if err != nil {
+		return feedRequest{}, fmt.Errorf("txt feed %q not found", feedKey)
+	}
+	if feed.Kind != feedKindTXT {
+		return feedRequest{}, fmt.Errorf("feed %q is not a txt subscription", feedKey)
+	}
+	return feed, nil
 }
 
 func buildConfiguredFeedStatuses(cfg *config.Config, existing []monitor.SubscriptionFeedStatus) []monitor.SubscriptionFeedStatus {
@@ -433,9 +476,8 @@ func (m *Manager) currentIntervalLocked() time.Duration {
 }
 
 // doRefresh performs a single refresh operation.
-// It fetches configured feeds, updates their nodes in the SQLite Store,
-// then triggers a runtime reload.
-func (m *Manager) doRefresh(includeDisabledTXT bool) {
+// It fetches configured feeds and writes imported nodes into staged storage only.
+func (m *Manager) doRefresh(req refreshRequest) {
 	// Prevent concurrent refreshes
 	if !m.refreshMu.TryLock() {
 		m.logger.Warnf("refresh already in progress, skipping")
@@ -462,7 +504,7 @@ func (m *Manager) doRefresh(includeDisabledTXT bool) {
 	copy(previousFeedStatuses, m.status.Feeds)
 	m.mu.RUnlock()
 
-	feeds := m.collectFeedRequests(includeDisabledTXT)
+	feeds := m.collectFeedRequestsByKind(req.kindFilter, req.includeDisabledTXT)
 	feedStatuses := buildConfiguredFeedStatuses(cfgSnapshot, previousFeedStatuses)
 	feedStatusIndex := make(map[string]int, len(feedStatuses))
 	for idx := range feedStatuses {
@@ -535,16 +577,7 @@ func (m *Manager) doRefresh(includeDisabledTXT bool) {
 		return
 	}
 
-	if err := m.boxMgr.TriggerReload(m.ctx); err != nil {
-		m.mu.Lock()
-		m.status.LastError = err.Error()
-		m.status.LastRefresh = time.Now()
-		m.mu.Unlock()
-		return
-	}
-
-	enabled := true
-	totalNodes, err := m.store.CountNodes(m.ctx, store.NodeFilter{Enabled: &enabled})
+	totalNodes, err := m.store.CountNodes(m.ctx, store.NodeFilter{LifecycleState: store.NodeLifecycleStaged})
 	if err != nil {
 		m.logger.Warnf("failed to count nodes after refresh: %v", err)
 	}
@@ -555,7 +588,7 @@ func (m *Manager) doRefresh(includeDisabledTXT bool) {
 	m.status.Feeds = feedStatuses
 	m.mu.Unlock()
 
-	m.logger.Infof("subscription refresh completed, %d feeds updated, %d total nodes active", updatedFeeds, totalNodes)
+	m.logger.Infof("subscription refresh completed, %d feeds updated, %d staged nodes available", updatedFeeds, totalNodes)
 }
 
 // OnConfigUpdate is called by boxmgr after a successful reload.
@@ -639,7 +672,7 @@ func (m *Manager) fetchFeedNodes(feed feedRequest) (feedFetchResult, error) {
 }
 
 func (m *Manager) RefreshFeed(feedKey string) error {
-	feed, err := m.findTXTFeedRequestByFeedKey(strings.TrimSpace(feedKey))
+	feed, err := m.findFeedRequestByFeedKey(strings.TrimSpace(feedKey))
 	if err != nil {
 		return err
 	}
@@ -676,10 +709,6 @@ func (m *Manager) RefreshFeed(feedKey string) error {
 		return err
 	}
 
-	if err := m.boxMgr.TriggerReload(m.ctx); err != nil {
-		return err
-	}
-
 	status := m.Status()
 	for idx := range status.Feeds {
 		if status.Feeds[idx].FeedKey == feed.FeedKey {
@@ -690,8 +719,14 @@ func (m *Manager) RefreshFeed(feedKey string) error {
 		}
 	}
 
+	totalNodes, err := m.store.CountNodes(m.ctx, store.NodeFilter{LifecycleState: store.NodeLifecycleStaged})
+	if err != nil {
+		m.logger.Warnf("failed to count staged nodes after feed refresh: %v", err)
+	}
+
 	m.mu.Lock()
 	m.status.LastRefresh = time.Now()
+	m.status.NodeCount = int(totalNodes)
 	m.status.LastError = ""
 	m.status.Feeds = status.Feeds
 	m.mu.Unlock()
@@ -792,10 +827,31 @@ func (m *Manager) persistFeedNodes(feed feedRequest, nodes []store.Node) error {
 	case feedKindTXT:
 		return m.store.ReplaceTXTFeedNodes(m.ctx, feed.FeedKey, nodes)
 	default:
-		if _, err := m.store.DeleteNodesByFeedKey(m.ctx, feed.FeedKey); err != nil {
-			return err
+		currentURIs := make(map[string]struct{}, len(nodes))
+		for _, node := range nodes {
+			if uri := strings.TrimSpace(node.URI); uri != "" {
+				currentURIs[uri] = struct{}{}
+			}
 		}
-		return m.store.BulkUpsertNodes(m.ctx, nodes)
+
+		return m.store.WithTx(m.ctx, func(tx store.Store) error {
+			existingNodes, err := tx.ListNodes(m.ctx, store.NodeFilter{Source: store.NodeSourceSubscription})
+			if err != nil {
+				return err
+			}
+			for _, existing := range existingNodes {
+				if existing.FeedKey != feed.FeedKey {
+					continue
+				}
+				if _, ok := currentURIs[strings.TrimSpace(existing.URI)]; ok {
+					continue
+				}
+				if err := tx.DeleteNode(m.ctx, existing.ID); err != nil {
+					return err
+				}
+			}
+			return tx.BulkUpsertNodes(m.ctx, nodes)
+		})
 	}
 }
 
@@ -817,14 +873,15 @@ func buildStoreNodesForFeed(feed feedRequest, nodes []config.NodeConfig) []store
 			name = fmt.Sprintf("sub-node-%d", len(storeNodes)+1)
 		}
 		storeNodes = append(storeNodes, store.Node{
-			URI:      uri,
-			Name:     name,
-			Source:   string(n.Source),
-			FeedKey:  feed.FeedKey,
-			Port:     n.Port,
-			Username: n.Username,
-			Password: n.Password,
-			Enabled:  true,
+			URI:            uri,
+			Name:           name,
+			Source:         string(n.Source),
+			FeedKey:        feed.FeedKey,
+			Port:           n.Port,
+			Username:       n.Username,
+			Password:       n.Password,
+			Enabled:        true,
+			LifecycleState: store.NodeLifecycleStaged,
 		})
 	}
 	return storeNodes

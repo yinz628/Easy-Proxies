@@ -7,8 +7,16 @@ import type {
   ConfigNodesResponse,
   ConfigNodePayload,
   ConfigNodeMutationResponse,
+  ImportNodesResponse,
+  BatchLifecycleAction,
+  BatchLifecycleResponse,
+  ManageListResponse,
+  ManageQuery,
+  ManageSelectionRequest,
   SubscriptionStatus,
+  SubscriptionImportResponse,
   BatchProbeJob,
+  BatchQualityJob,
   ProbeSSEEvent,
   NodeQualityCheckResult,
   QualityCheckBatchEvent,
@@ -90,6 +98,21 @@ export class ApiError extends Error {
   }
 }
 
+function normalizeSelectionBody(selectionOrNames: ManageSelectionRequest | string[], key: 'names' | 'tags'): ManageSelectionRequest | { tags: string[] } {
+  if (Array.isArray(selectionOrNames)) {
+    if (key === 'tags') {
+      return { tags: selectionOrNames }
+    }
+    return {
+      selection: {
+        mode: 'uris',
+        uris: selectionOrNames,
+      },
+    }
+  }
+  return selectionOrNames
+}
+
 // ---- Auth API ----
 
 /** Check if password is required & login */
@@ -129,8 +152,33 @@ export async function fetchNodes(): Promise<NodesResponse> {
   return request<NodesResponse>('/api/nodes')
 }
 
+export async function fetchManageNodes(query: ManageQuery, signal?: AbortSignal): Promise<ManageListResponse> {
+  const params = new URLSearchParams()
+  params.set('page', String(query.page))
+  params.set('page_size', String(query.page_size))
+  if (query.keyword) params.set('keyword', query.keyword)
+  if (query.status) params.set('status', query.status)
+  if (query.region) params.set('region', query.region)
+  if (query.source) params.set('source', query.source)
+  if (query.lifecycle_state) params.set('lifecycle_state', query.lifecycle_state)
+  if (query.manual_probe_status) params.set('manual_probe_status', query.manual_probe_status)
+  if (query.activation_ready) params.set('activation_ready', query.activation_ready)
+  if (query.quality_status) params.set('quality_status', query.quality_status)
+  params.set('sort_key', query.sort_key)
+  params.set('sort_dir', query.sort_dir)
+
+  return request<ManageListResponse>(`/api/nodes/manage?${params.toString()}`, { signal })
+}
+
 export async function probeNode(tag: string): Promise<{ message: string; latency_ms: number }> {
-  return request(`/api/nodes/${encodeURIComponent(tag)}/probe`, { method: 'POST' })
+  const response = await request<{ message?: string; latency_ms?: number; error?: string }>(`/api/nodes/${encodeURIComponent(tag)}/probe`, { method: 'POST' })
+  if (response.error) {
+    throw new Error(response.error)
+  }
+  return {
+    message: response.message || '探测成功',
+    latency_ms: response.latency_ms ?? -1,
+  }
 }
 
 export async function releaseNode(tag: string): Promise<{ message: string }> {
@@ -301,37 +349,44 @@ export async function createConfigNode(payload: ConfigNodePayload): Promise<Conf
   })
 }
 
-export async function updateConfigNode(name: string, payload: ConfigNodePayload): Promise<ConfigNodeMutationResponse> {
-  return request<ConfigNodeMutationResponse>(`/api/nodes/config/${encodeURIComponent(name)}`, {
+export async function updateConfigNode(identifier: string, payload: ConfigNodePayload): Promise<ConfigNodeMutationResponse> {
+  return request<ConfigNodeMutationResponse>(`/api/nodes/config/${encodeURIComponent(identifier)}`, {
     method: 'PUT',
     body: JSON.stringify(payload),
   })
 }
 
-export async function deleteConfigNode(name: string): Promise<ConfigNodeMutationResponse> {
-  return request<ConfigNodeMutationResponse>(`/api/nodes/config/${encodeURIComponent(name)}`, {
+export async function deleteConfigNode(identifier: string): Promise<ConfigNodeMutationResponse> {
+  return request<ConfigNodeMutationResponse>(`/api/nodes/config/${encodeURIComponent(identifier)}`, {
     method: 'DELETE',
   })
 }
 
-export async function toggleConfigNode(name: string, enabled: boolean): Promise<ConfigNodeMutationResponse> {
-  return request<ConfigNodeMutationResponse>(`/api/nodes/config/${encodeURIComponent(name)}`, {
+export async function toggleConfigNode(identifier: string, enabled: boolean): Promise<ConfigNodeMutationResponse> {
+  return request<ConfigNodeMutationResponse>(`/api/nodes/config/${encodeURIComponent(identifier)}`, {
     method: 'PATCH',
     body: JSON.stringify({ enabled }),
   })
 }
 
-export async function batchToggleConfigNodes(names: string[], enabled: boolean): Promise<{ message: string; success: number; total: number; errors?: string[] }> {
+export async function batchToggleConfigNodes(selectionOrNames: ManageSelectionRequest | string[], enabled: boolean): Promise<{ message: string; success: number; total: number; errors?: string[] }> {
   return request('/api/nodes/config/batch-toggle', {
     method: 'POST',
-    body: JSON.stringify({ names, enabled }),
+    body: JSON.stringify({ ...normalizeSelectionBody(selectionOrNames, 'names'), enabled }),
   })
 }
 
-export async function batchDeleteConfigNodes(names: string[]): Promise<{ message: string; success: number; total: number; errors?: string[] }> {
+export async function batchLifecycleConfigNodes(selectionOrNames: ManageSelectionRequest | string[], action: BatchLifecycleAction): Promise<BatchLifecycleResponse> {
+  return request('/api/nodes/config/batch-lifecycle', {
+    method: 'POST',
+    body: JSON.stringify({ ...normalizeSelectionBody(selectionOrNames, 'names'), action }),
+  })
+}
+
+export async function batchDeleteConfigNodes(selectionOrNames: ManageSelectionRequest | string[]): Promise<{ message: string; success: number; total: number; errors?: string[] }> {
   return request('/api/nodes/config/batch-delete', {
     method: 'POST',
-    body: JSON.stringify({ names }),
+    body: JSON.stringify(normalizeSelectionBody(selectionOrNames, 'names')),
   })
 }
 
@@ -344,11 +399,21 @@ export async function triggerReload(): Promise<{ message: string }> {
 // ---- Subscription API ----
 
 export async function fetchSubscriptionStatus(): Promise<SubscriptionStatus> {
-  return request<SubscriptionStatus>('/api/subscription/status')
+  const response = await request<SubscriptionStatus>('/api/subscription/status')
+  return {
+    ...response,
+    node_count: response.staged_count ?? response.node_count,
+  }
 }
 
-export async function refreshSubscription(): Promise<{ message: string; node_count: number }> {
-  return request('/api/subscription/refresh', { method: 'POST' })
+export async function refreshLegacySubscriptions(): Promise<SubscriptionImportResponse> {
+  const response = await request<SubscriptionImportResponse>('/api/subscription/refresh-legacy', { method: 'POST' })
+  return { ...response, node_count: response.staged_count }
+}
+
+export async function refreshTXTSubscriptions(): Promise<SubscriptionImportResponse> {
+  const response = await request<SubscriptionImportResponse>('/api/subscription/refresh-txt', { method: 'POST' })
+  return { ...response, node_count: response.staged_count }
 }
 
 export function probeBatchNodes(
@@ -374,8 +439,8 @@ export function probeBatchNodes(
         credentials: 'include',
         signal: controller.signal,
       })
-
       if (!res.ok) {
+
         let message = `批量探测失败: HTTP ${res.status}`
         try {
           const body = await res.json()
@@ -419,10 +484,10 @@ export function probeBatchNodes(
   return controller
 }
 
-export async function startProbeBatchJob(tags: string[]): Promise<{ job: BatchProbeJob }> {
+export async function startProbeBatchJob(selectionOrTags: ManageSelectionRequest | string[]): Promise<{ job: BatchProbeJob }> {
   return request('/api/nodes/probe-batch/start', {
     method: 'POST',
-    body: JSON.stringify({ tags }),
+    body: JSON.stringify(normalizeSelectionBody(selectionOrTags, 'tags')),
   })
 }
 
@@ -437,36 +502,123 @@ export async function cancelProbeBatchJob(jobId: string): Promise<{ message: str
   })
 }
 
-export function checkNodeQualityBatch(
-  tags: string[],
+export async function startQualityBatchJob(selectionOrTags: ManageSelectionRequest | string[]): Promise<{ job: BatchQualityJob }> {
+  return request('/api/nodes/quality-check-batch', {
+    method: 'POST',
+    body: JSON.stringify(normalizeSelectionBody(selectionOrTags, 'tags')),
+  })
+}
+
+async function readQualityBatchStream(
+  jobId: string,
+  controller: AbortController,
+  onEvent: (event: QualityCheckBatchEvent) => void,
+  onError?: (error: Error) => void,
+): Promise<void> {
+  try {
+    const headers: Record<string, string> = {}
+    if (authToken) {
+      headers['Authorization'] = `Bearer ${authToken}`
+    }
+
+    const res = await fetch(`/api/nodes/quality-check-batch/stream?job_id=${encodeURIComponent(jobId)}`, {
+      method: 'GET',
+      headers,
+      credentials: 'include',
+      signal: controller.signal,
+    })
+
+    if (!res.ok) {
+      let message = `批量质量检测任务流订阅失败: HTTP ${res.status}`
+      try {
+        const text = await res.text()
+        if (text) message = text
+      } catch { /* ignore parse errors */ }
+      throw new ApiError(message, res.status)
+    }
+
+    const reader = res.body?.getReader()
+    if (!reader) throw new Error('No response body')
+
+    const decoder = new TextDecoder()
+    let buffer = ''
+
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+
+      buffer += decoder.decode(value, { stream: true })
+      const lines = buffer.split('\n')
+      buffer = lines.pop() || ''
+
+      for (const line of lines) {
+        const trimmed = line.trim()
+        if (trimmed.startsWith('data: ')) {
+          try {
+            const data = JSON.parse(trimmed.slice(6)) as QualityCheckBatchEvent
+            onEvent(data)
+          } catch { /* skip malformed events */ }
+        }
+      }
+    }
+  } catch (err) {
+    if ((err as Error).name !== 'AbortError') {
+      onError?.(err as Error)
+    }
+  }
+}
+
+export async function fetchQualityBatchJobStatus(): Promise<{ job: BatchQualityJob | null }> {
+  return request('/api/nodes/quality-check-batch/status')
+}
+
+export async function cancelQualityBatchJob(jobId: string): Promise<{ message: string; job_id: string }> {
+  return request('/api/nodes/quality-check-batch/cancel', {
+    method: 'POST',
+    body: JSON.stringify({ job_id: jobId }),
+  })
+}
+
+export function streamQualityBatchJob(
+  jobId: string,
   onEvent: (event: QualityCheckBatchEvent) => void,
   onError?: (error: Error) => void
 ): AbortController {
   const controller = new AbortController()
+  void readQualityBatchStream(jobId, controller, onEvent, onError)
+  return controller
+}
+
+export function checkNodeQualityBatch(
+  selectionOrTags: ManageSelectionRequest | string[],
+  onEvent: (event: QualityCheckBatchEvent) => void,
+  onError?: (error: Error) => void
+): AbortController {
+  const controller = new AbortController()
+  let jobId: string | null = null
+  let cancelRequested = false
+
+  controller.signal.addEventListener('abort', () => {
+    if (cancelRequested || !jobId) return
+    cancelRequested = true
+    void cancelQualityBatchJob(jobId).catch(() => {})
+  })
 
   const doFetch = async () => {
     try {
-      const headers: Record<string, string> = {
-        'Content-Type': 'application/json',
-      }
-      if (authToken) {
-        headers['Authorization'] = `Bearer ${authToken}`
-      }
+      const start = await startQualityBatchJob(selectionOrTags)
+      jobId = start.job.id
+      void readQualityBatchStream(jobId, controller, onEvent, onError)
+      return
+      /*
 
-      const res = await fetch('/api/nodes/quality-check-batch', {
-        method: 'POST',
-        headers,
-        body: JSON.stringify({ tags }),
-        credentials: 'include',
-        signal: controller.signal,
-      })
 
       if (!res.ok) {
         let message = `鎵归噺璐ㄩ噺妫€鏌ュけ璐? HTTP ${res.status}`
         try {
           const body = await res.json()
           if (body.error) message = body.error
-        } catch { /* ignore parse errors */ }
+        } catch {}
         throw new ApiError(message, res.status)
       }
 
@@ -490,10 +642,10 @@ export function checkNodeQualityBatch(
             try {
               const data = JSON.parse(trimmed.slice(6)) as QualityCheckBatchEvent
               onEvent(data)
-            } catch { /* skip malformed events */ }
+            } catch {}
           }
         }
-      }
+      */
     } catch (err) {
       if ((err as Error).name !== 'AbortError') {
         onError?.(err as Error)
@@ -505,11 +657,12 @@ export function checkNodeQualityBatch(
   return controller
 }
 
-export async function refreshSubscriptionFeed(feedKey: string): Promise<{ message: string; feed_key: string }> {
-  return request('/api/subscription/refresh-feed', {
+export async function refreshSubscriptionFeed(feedKey: string): Promise<SubscriptionImportResponse> {
+  const response = await request<SubscriptionImportResponse>('/api/subscription/refresh-feed', {
     method: 'POST',
     body: JSON.stringify({ feed_key: feedKey }),
   })
+  return { ...response, node_count: response.staged_count }
 }
 
 // ---- Export API ----
@@ -527,11 +680,31 @@ export async function exportProxies(): Promise<string> {
   return res.text()
 }
 
+export async function exportSelectedProxies(selection: ManageSelectionRequest): Promise<string> {
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+  }
+  if (authToken) {
+    headers['Authorization'] = `Bearer ${authToken}`
+  }
+  const res = await fetch('/api/export', {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(selection),
+    credentials: 'include',
+  })
+  if (!res.ok) throw new ApiError('导出选中节点失败', res.status)
+  return res.text()
+}
+
 // ---- Import API ----
 
-export async function importNodes(content: string): Promise<{ message: string; imported: number; errors?: string[] }> {
+export async function importNodes(content: string, namePrefix: string): Promise<ImportNodesResponse> {
   return request('/api/import', {
     method: 'POST',
-    body: JSON.stringify({ content }),
+    body: JSON.stringify({
+      content,
+      name_prefix: namePrefix,
+    }),
   })
 }

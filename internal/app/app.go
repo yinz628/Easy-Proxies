@@ -160,7 +160,7 @@ func loadNodesFromStore(ctx context.Context, cfg *config.Config, s store.Store) 
 	// Convert store.Node to config.NodeConfig
 	var configNodes []config.NodeConfig
 	for _, n := range nodes {
-		if !n.Enabled {
+		if n.LifecycleState != store.NodeLifecycleActive {
 			continue
 		}
 		configNodes = append(configNodes, config.NodeConfig{
@@ -193,14 +193,15 @@ func seedStoreFromConfig(ctx context.Context, cfg *config.Config, s store.Store)
 			source = store.NodeSourceSubscription
 		}
 		node := store.Node{
-			URI:      n.URI,
-			Name:     n.Name,
-			Source:   source,
-			FeedKey:  n.FeedKey,
-			Port:     n.Port,
-			Username: n.Username,
-			Password: n.Password,
-			Enabled:  true,
+			URI:            n.URI,
+			Name:           n.Name,
+			Source:         source,
+			FeedKey:        n.FeedKey,
+			Port:           n.Port,
+			Username:       n.Username,
+			Password:       n.Password,
+			Enabled:        true,
+			LifecycleState: store.NodeLifecycleActive,
 		}
 		if source == store.NodeSourceTXTSubscription && n.FeedKey != "" {
 			txtFeedNodes[n.FeedKey] = append(txtFeedNodes[n.FeedKey], node)

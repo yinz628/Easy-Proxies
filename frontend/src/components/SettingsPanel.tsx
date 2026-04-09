@@ -1,6 +1,14 @@
 import { useState, useEffect, useCallback, useMemo } from 'react'
 import type { SettingsData, SubscriptionStatus, TXTSubscriptionConfig } from '../types'
-import { fetchSettings, updateSettings, triggerReload, fetchSubscriptionStatus, refreshSubscription, refreshSubscriptionFeed } from '../api/client'
+import {
+  fetchSettings,
+  updateSettings,
+  triggerReload,
+  fetchSubscriptionStatus,
+  refreshLegacySubscriptions,
+  refreshTXTSubscriptions,
+  refreshSubscriptionFeed,
+} from '../api/client'
 
 const defaultSettings: SettingsData = {
   mode: 'pool',
@@ -59,7 +67,7 @@ export default function SettingsPanel() {
 
   // Subscription status
   const [subStatus, setSubStatus] = useState<SubscriptionStatus | null>(null)
-  const [subRefreshing, setSubRefreshing] = useState(false)
+  const [subRefreshing, setSubRefreshing] = useState<'legacy' | 'txt' | null>(null)
   const [refreshingFeedKey, setRefreshingFeedKey] = useState<string | null>(null)
 
   // New subscription input
@@ -144,31 +152,45 @@ export default function SettingsPanel() {
     }
   }
 
-  const handleSubRefresh = async () => {
-    setSubRefreshing(true)
+  const handleLegacyRefresh = async () => {
+    setSubRefreshing('legacy')
     setError('')
     try {
-      const res = await refreshSubscription()
-      setSuccess(`订阅刷新成功，共 ${res.node_count} 个节点`)
+      const res = await refreshLegacySubscriptions()
+      setSuccess(`已导入 ${res.staged_count} 个候选节点`)
       await refreshSubStatus()
     } catch (err) {
-      setError(err instanceof Error ? err.message : '刷新订阅失败')
+      setError(err instanceof Error ? err.message : '刷新 Legacy 订阅失败')
     } finally {
-      setSubRefreshing(false)
+      setSubRefreshing(null)
     }
   }
 
-  const handleTxtFeedRefresh = async (feedKey: string) => {
+  const handleFeedRefresh = async (feedKey: string) => {
     setRefreshingFeedKey(feedKey)
     setError('')
     try {
       const res = await refreshSubscriptionFeed(feedKey)
-      setSuccess(res.message || '单源刷新成功')
+      setSuccess(`已导入 ${res.staged_count} 个候选节点`)
       await refreshSubStatus()
     } catch (err) {
-      setError(err instanceof Error ? err.message : '单源刷新失败')
+      setError(err instanceof Error ? err.message : '刷新订阅源失败')
     } finally {
       setRefreshingFeedKey(null)
+    }
+  }
+
+  const handleTXTRefresh = async () => {
+    setSubRefreshing('txt')
+    setError('')
+    try {
+      const res = await refreshTXTSubscriptions()
+      setSuccess(`已导入 ${res.staged_count} 个候选节点`)
+      await refreshSubStatus()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '刷新 TXT 订阅失败')
+    } finally {
+      setSubRefreshing(null)
     }
   }
 
@@ -256,15 +278,23 @@ export default function SettingsPanel() {
     })
   }
 
-  const txtFeedStatusByURL = useMemo(() => {
+  const feedStatusByURL = useMemo(() => {
     const map = new Map<string, NonNullable<SubscriptionStatus['feeds']>[number]>()
     for (const feed of subStatus?.feeds || []) {
-      if (feed.type === 'txt') {
-        map.set(feed.url, feed)
-      }
+      map.set(feed.url, feed)
     }
     return map
   }, [subStatus])
+
+  const stagedCount = subStatus?.staged_count ?? subStatus?.node_count ?? 0
+  const hasSubscriptionSources =
+    Boolean(subStatus?.has_subscriptions) ||
+    settings.subscriptions.length > 0 ||
+    settings.txt_subscriptions.length > 0
+  const isSubscriptionRefreshBusy =
+    subRefreshing !== null ||
+    refreshingFeedKey !== null ||
+    Boolean(subStatus?.is_refreshing)
 
   // Warn before leaving with unsaved changes
   useEffect(() => {
@@ -877,16 +907,16 @@ export default function SettingsPanel() {
               </div>
               <div>
                 <h3 className="font-bold text-lg text-base-content">订阅链接管理</h3>
-                <p className="text-xs text-base-content/50 font-medium">配置节点获取来源</p>
+                <p className="text-xs text-base-content/50 font-medium">刷新后仅导入候选节点，不会自动进入运行池</p>
               </div>
             </div>
 
             {/* Show refresh button when subscriptions exist (saved or in current settings) */}
-            {(subStatus?.has_subscriptions || settings.subscriptions.length > 0 || settings.txt_subscriptions.length > 0) && (
+            {hasSubscriptionSources && (
               <div className="flex items-center gap-3 bg-base-200/50 px-3 py-1.5 rounded-lg border border-base-300/50">
-                {subStatus && subStatus.node_count != null && subStatus.node_count > 0 && (
+                {subStatus && (
                   <span className="text-sm font-medium text-base-content/70">
-                    节点: <strong className="text-base-content">{subStatus.node_count}</strong>
+                    候选: <strong className="text-base-content">{stagedCount}</strong>
                   </span>
                 )}
                 {subStatus?.enabled && (
@@ -895,19 +925,26 @@ export default function SettingsPanel() {
                 <div className="w-px h-4 bg-base-300 mx-1"></div>
                 <button
                   className="btn btn-sm btn-ghost hover:bg-primary/10 hover:text-primary gap-1.5 px-2"
-                  onClick={handleSubRefresh}
-                  disabled={subRefreshing || subStatus?.is_refreshing || isDirty}
-                  title={isDirty ? '请先保存设置并重载配置' : '立即刷新订阅'}
+                  onClick={handleLegacyRefresh}
+                  disabled={isSubscriptionRefreshBusy || isDirty || settings.subscriptions.length === 0}
+                  title={isDirty ? '请先保存当前设置' : 'Update Legacy'}
                 >
-                  {subRefreshing || subStatus?.is_refreshing ? (
+                  {subRefreshing === 'legacy' ? (
                     <span className="loading loading-spinner loading-xs"></span>
                   ) : (
-                    <>
-                      <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
-                      </svg>
-                      立即刷新
-                    </>
+                    'Update Legacy'
+                  )}
+                </button>
+                <button
+                  className="btn btn-sm btn-ghost hover:bg-primary/10 hover:text-primary gap-1.5 px-2"
+                  onClick={handleTXTRefresh}
+                  disabled={isSubscriptionRefreshBusy || isDirty || settings.txt_subscriptions.length === 0}
+                  title={isDirty ? '请先保存当前设置' : 'Update TXT'}
+                >
+                  {subRefreshing === 'txt' ? (
+                    <span className="loading loading-spinner loading-xs"></span>
+                  ) : (
+                    'Update TXT'
                   )}
                 </button>
               </div>
@@ -984,6 +1021,40 @@ export default function SettingsPanel() {
             </div>
           )}
           
+          {(subStatus?.feeds || []).some((feed) => feed.type === 'legacy') && (
+            <div className="rounded-xl border border-base-300/50 bg-base-200/20 p-4 space-y-3">
+              <div className="text-sm font-semibold">Legacy Feeds</div>
+              {(subStatus?.feeds || [])
+                .filter((feed) => feed.type === 'legacy')
+                .map((feed) => (
+                  <div key={feed.feed_key} className="flex flex-col gap-2 rounded-lg border border-base-300/40 bg-base-100/60 p-3 lg:flex-row lg:items-center">
+                    <div className="min-w-0 flex-1">
+                      <div className="truncate text-sm font-medium">{feed.name || feed.url}</div>
+                      <div className="truncate text-xs text-base-content/50">{feed.url}</div>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        className="btn btn-sm btn-ghost text-primary hover:bg-primary/10"
+                        onClick={() => handleFeedRefresh(feed.feed_key)}
+                        disabled={isSubscriptionRefreshBusy || isDirty}
+                        title={isDirty ? '请先保存当前设置' : 'Refresh'}
+                      >
+                        {refreshingFeedKey === feed.feed_key ? 'Refreshing...' : 'Refresh'}
+                      </button>
+                      <span className="text-xs text-base-content/60">
+                        候选节点 {feed.valid_nodes ?? 0}
+                      </span>
+                    </div>
+                    <div className="text-xs text-base-content/60 lg:text-right">
+                      {feed.last_refresh && <span>上次刷新: {new Date(feed.last_refresh).toLocaleString()}</span>}
+                      {feed.last_error && <span className="block break-all text-error">错误: {feed.last_error}</span>}
+                    </div>
+                  </div>
+                ))}
+            </div>
+          )}
+
           <div className="mt-8 pt-6 border-t border-base-200 space-y-4">
             <div className="flex items-center gap-3">
               <div className="w-9 h-9 rounded-lg bg-primary/10 flex items-center justify-center text-primary shrink-0">
@@ -1000,7 +1071,7 @@ export default function SettingsPanel() {
             {settings.txt_subscriptions.length > 0 ? (
               <div className="space-y-4">
                 {settings.txt_subscriptions.map((item, index) => {
-                  const feedStatus = txtFeedStatusByURL.get(item.url)
+                  const feedStatus = feedStatusByURL.get(item.url)
                   return (
                     <div key={`${item.url}-${index}`} className="rounded-xl border border-base-300/50 bg-base-200/20 p-4 space-y-4">
                       <div className="grid gap-4 lg:grid-cols-[1fr_1.4fr_180px_auto] items-start">
@@ -1052,11 +1123,11 @@ export default function SettingsPanel() {
                           <button
                             type="button"
                             className="btn btn-sm btn-ghost text-primary hover:bg-primary/10"
-                            onClick={() => feedStatus && handleTxtFeedRefresh(feedStatus.feed_key)}
-                            disabled={!feedStatus || refreshingFeedKey === feedStatus.feed_key || isDirty}
-                            title={isDirty ? '请先保存当前设置' : '只刷新当前 TXT 源'}
+                            onClick={() => feedStatus && handleFeedRefresh(feedStatus.feed_key)}
+                            disabled={!feedStatus || isSubscriptionRefreshBusy || isDirty}
+                            title={isDirty ? '请先保存当前设置' : 'Refresh'}
                           >
-                            {refreshingFeedKey === feedStatus?.feed_key ? '刷新中...' : '单独刷新'}
+                            {refreshingFeedKey === feedStatus?.feed_key ? 'Refreshing...' : 'Refresh'}
                           </button>
                           <button
                             type="button"
@@ -1151,7 +1222,7 @@ export default function SettingsPanel() {
             </div>
           </div>
 
-          <p className="text-xs text-base-content/40 text-center mt-4">⚠️ 添加、删除或修改订阅后，需点击顶部「保存设置」；节点集合发生变化后，再执行「立即刷新」或「重载配置」让运行时同步。</p>
+          <p className="text-xs text-base-content/40 text-center mt-4">添加、删除或修改订阅后，需先点击顶部「保存设置」。执行 Update Legacy、Update TXT 或单源 Refresh 只会导入候选节点，不会自动重载运行池。</p>
         </div>
       </div>
 

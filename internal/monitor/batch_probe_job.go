@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"sync"
 	"time"
+
+	"easy_proxies/internal/config"
 )
 
 type BatchProbeJobStatus string
@@ -29,6 +31,13 @@ type BatchProbeJobResult struct {
 	Error     string `json:"error,omitempty"`
 }
 
+type BatchProbeTarget struct {
+	Tag         string
+	Name        string
+	StoreNodeID int64
+	ConfigNode  config.NodeConfig
+}
+
 type BatchProbeJob struct {
 	ID            string               `json:"id"`
 	Status        BatchProbeJobStatus  `json:"status"`
@@ -40,7 +49,6 @@ type BatchProbeJob struct {
 	Success       int                  `json:"success"`
 	Failed        int                  `json:"failed"`
 	ActiveWorkers int                  `json:"active_workers"`
-	RequestedTags []string             `json:"requested_tags"`
 	LastResult    *BatchProbeJobResult `json:"last_result,omitempty"`
 	LastError     string               `json:"last_error,omitempty"`
 }
@@ -65,7 +73,7 @@ func NewBatchProbeJobManager(workers int) *BatchProbeJobManager {
 	}
 }
 
-func (m *BatchProbeJobManager) Start(tags []string, snapshots []Snapshot, probeFn func(ctx context.Context, snap Snapshot) (int64, error)) (*BatchProbeJob, error) {
+func (m *BatchProbeJobManager) Start(targets []BatchProbeTarget, probeFn func(ctx context.Context, target BatchProbeTarget) (int64, error)) (*BatchProbeJob, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -75,18 +83,17 @@ func (m *BatchProbeJobManager) Start(tags []string, snapshots []Snapshot, probeF
 
 	now := time.Now()
 	job := &BatchProbeJob{
-		ID:            fmt.Sprintf("%d", now.UnixNano()),
-		Status:        BatchProbeQueued,
-		StartedAt:     now,
-		UpdatedAt:     now,
-		Total:         len(snapshots),
-		RequestedTags: append([]string(nil), tags...),
+		ID:        fmt.Sprintf("%d", now.UnixNano()),
+		Status:    BatchProbeQueued,
+		StartedAt: now,
+		UpdatedAt: now,
+		Total:     len(targets),
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	m.job = job
 	m.cancel = cancel
 
-	go m.run(ctx, job, snapshots, probeFn)
+	go m.run(ctx, job, targets, probeFn)
 
 	return cloneBatchProbeJob(job), nil
 }
@@ -113,29 +120,29 @@ func (m *BatchProbeJobManager) Cancel(jobID string) error {
 	return nil
 }
 
-func (m *BatchProbeJobManager) run(ctx context.Context, job *BatchProbeJob, snapshots []Snapshot, probeFn func(ctx context.Context, snap Snapshot) (int64, error)) {
+func (m *BatchProbeJobManager) run(ctx context.Context, job *BatchProbeJob, targets []BatchProbeTarget, probeFn func(ctx context.Context, target BatchProbeTarget) (int64, error)) {
 	m.update(job.ID, func(current *BatchProbeJob) {
 		current.Status = BatchProbeRunning
 		current.UpdatedAt = time.Now()
 	})
 
-	workCh := make(chan Snapshot)
+	workCh := make(chan BatchProbeTarget)
 	var wg sync.WaitGroup
 
 	for i := 0; i < m.workers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for snap := range workCh {
+			for target := range workCh {
 				m.update(job.ID, func(current *BatchProbeJob) {
 					current.ActiveWorkers++
 					current.UpdatedAt = time.Now()
 				})
 
-				latency, err := m.runProbe(ctx, snap, probeFn)
+				latency, err := m.runProbe(ctx, target, probeFn)
 				result := BatchProbeJobResult{
-					Tag:       snap.Tag,
-					Name:      snap.Name,
+					Tag:       target.Tag,
+					Name:      target.Name,
 					LatencyMs: latency,
 				}
 				if err != nil {
@@ -159,12 +166,12 @@ func (m *BatchProbeJobManager) run(ctx context.Context, job *BatchProbeJob, snap
 	}
 
 	go func() {
-		for _, snap := range snapshots {
+		for _, target := range targets {
 			select {
 			case <-ctx.Done():
 				close(workCh)
 				return
-			case workCh <- snap:
+			case workCh <- target:
 			}
 		}
 		close(workCh)
@@ -194,14 +201,14 @@ type batchProbeResult struct {
 	err     error
 }
 
-func (m *BatchProbeJobManager) runProbe(ctx context.Context, snap Snapshot, probeFn func(ctx context.Context, snap Snapshot) (int64, error)) (int64, error) {
+func (m *BatchProbeJobManager) runProbe(ctx context.Context, target BatchProbeTarget, probeFn func(ctx context.Context, target BatchProbeTarget) (int64, error)) (int64, error) {
 	timeout := m.effectiveProbeTimeout()
 	probeCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	resultCh := make(chan batchProbeResult, 1)
 	go func() {
-		latency, err := probeFn(probeCtx, snap)
+		latency, err := probeFn(probeCtx, target)
 		resultCh <- batchProbeResult{latency: latency, err: err}
 	}()
 
@@ -258,9 +265,6 @@ func cloneBatchProbeJob(job *BatchProbeJob) *BatchProbeJob {
 		return nil
 	}
 	cloned := *job
-	if job.RequestedTags != nil {
-		cloned.RequestedTags = append([]string(nil), job.RequestedTags...)
-	}
 	if job.LastResult != nil {
 		resultCopy := *job.LastResult
 		cloned.LastResult = &resultCopy

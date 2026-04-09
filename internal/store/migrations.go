@@ -155,6 +155,39 @@ CREATE TABLE IF NOT EXISTS node_quality_checks (
 CREATE INDEX IF NOT EXISTS idx_node_quality_checks_node_id ON node_quality_checks(node_id);
 `,
 		},
+		{
+			Version:     6,
+			Description: "add quality version and provider statuses",
+			Up: `
+ALTER TABLE node_stats ADD COLUMN quality_version TEXT NOT NULL DEFAULT '';
+ALTER TABLE node_stats ADD COLUMN quality_openai_status TEXT NOT NULL DEFAULT '';
+ALTER TABLE node_stats ADD COLUMN quality_anthropic_status TEXT NOT NULL DEFAULT '';
+`,
+		},
+		{
+			Version:     7,
+			Description: "add node lifecycle state and manual probe results",
+			Up: `
+ALTER TABLE nodes ADD COLUMN lifecycle_state TEXT NOT NULL DEFAULT '';
+UPDATE nodes
+   SET lifecycle_state = CASE
+       WHEN enabled = 1 THEN 'active'
+       ELSE 'disabled'
+   END
+ WHERE lifecycle_state = '';
+CREATE INDEX IF NOT EXISTS idx_nodes_lifecycle_state ON nodes(lifecycle_state);
+
+CREATE TABLE IF NOT EXISTS node_manual_probe_results (
+    node_id     INTEGER PRIMARY KEY REFERENCES nodes(id) ON DELETE CASCADE,
+    status      TEXT    NOT NULL DEFAULT '',
+    latency_ms  INTEGER NOT NULL DEFAULT 0,
+    timed_out   INTEGER NOT NULL DEFAULT 0,
+    message     TEXT    NOT NULL DEFAULT '',
+    checked_at  TEXT    NOT NULL DEFAULT '',
+    updated_at  TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+`,
+		},
 	}
 }
 

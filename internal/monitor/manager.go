@@ -73,6 +73,29 @@ type Snapshot struct {
 	Timeline          []TimelineEvent `json:"timeline,omitempty"`
 }
 
+// RestoredNodeState is the persisted runtime state loaded from the store.
+type RestoredNodeState struct {
+	FailureCount     int
+	SuccessCount     int64
+	Blacklisted      bool
+	BlacklistedUntil time.Time
+	LastError        string
+	LastFailure      time.Time
+	LastSuccess      time.Time
+	LastLatencyMs    int64
+	Available        bool
+	InitialCheckDone bool
+	TotalUpload      int64
+	TotalDownload    int64
+}
+
+// RestoreEntry maps persisted runtime state to a node identity.
+type RestoreEntry struct {
+	URI   string
+	Name  string
+	State RestoredNodeState
+}
+
 type NodeTrafficSpeed struct {
 	Tag           string `json:"tag"`
 	UploadSpeed   int64  `json:"upload_speed"`   // bytes/sec
@@ -136,22 +159,24 @@ type entry struct {
 
 // Manager aggregates all node states for the UI/API.
 type Manager struct {
-	cfg        Config
-	reloadGen  uint64 // current reload generation
-	probeDst   M.Socksaddr
-	probeReady bool
-	mu         sync.RWMutex
-	nodes      map[string]*entry
-	ctx        context.Context
-	cancel     context.CancelFunc
-	logger     Logger
+	cfg           Config
+	reloadGen     uint64 // current reload generation
+	probeDst      M.Socksaddr
+	probeReady    bool
+	mu            sync.RWMutex
+	nodes         map[string]*entry
+	restoreByURI  map[string]RestoredNodeState
+	restoreByName map[string]RestoredNodeState
+	ctx           context.Context
+	cancel        context.CancelFunc
+	logger        Logger
 
 	// periodic health check control
-	healthMu        sync.Mutex
-	healthInterval  time.Duration
-	healthTimeout   time.Duration
-	healthTicker    *time.Ticker
-	healthIntervalC chan time.Duration
+	healthMu         sync.Mutex
+	healthInterval   time.Duration
+	healthTimeout    time.Duration
+	healthTicker     *time.Ticker
+	healthIntervalC  chan time.Duration
 	probeAllInFlight atomic.Bool
 }
 
@@ -165,10 +190,12 @@ type Logger interface {
 func NewManager(cfg Config) (*Manager, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	m := &Manager{
-		cfg:    cfg,
-		nodes:  make(map[string]*entry),
-		ctx:    ctx,
-		cancel: cancel,
+		cfg:           cfg,
+		nodes:         make(map[string]*entry),
+		restoreByURI:  make(map[string]RestoredNodeState),
+		restoreByName: make(map[string]RestoredNodeState),
+		ctx:           ctx,
+		cancel:        cancel,
 	}
 	if cfg.ProbeTarget != "" {
 		target := cfg.ProbeTarget
@@ -238,9 +265,6 @@ func (m *Manager) StartPeriodicHealthCheck(interval, timeout time.Duration) {
 	m.healthMu.Unlock()
 
 	go func() {
-		// 启动后立即进行一次检查（走去重）
-		m.RequestProbeAllOnce(timeout)
-
 		for {
 			select {
 			case <-m.ctx.Done():
@@ -303,12 +327,29 @@ func (m *Manager) RequestProbeAllOnce(timeout time.Duration) {
 	}
 	go func() {
 		defer m.probeAllInFlight.Store(false)
-		m.probeAllNodes(timeout)
+		m.probeNodes(timeout, false)
 	}()
 }
 
-// probeAllNodes checks all registered nodes concurrently.
-func (m *Manager) probeAllNodes(timeout time.Duration) {
+// RequestProbePendingOnce triggers a probe round for nodes that have not
+// completed their initial check yet. If another probe round is already
+// running, it returns immediately.
+func (m *Manager) RequestProbePendingOnce(timeout time.Duration) {
+	if !m.probeReady {
+		return
+	}
+	if m.probeAllInFlight.Swap(true) {
+		return
+	}
+	go func() {
+		defer m.probeAllInFlight.Store(false)
+		m.probeNodes(timeout, true)
+	}()
+}
+
+// probeNodes checks registered nodes concurrently.
+// If onlyPending is true, nodes that already completed the initial check are skipped.
+func (m *Manager) probeNodes(timeout time.Duration, onlyPending bool) {
 	m.mu.RLock()
 	entries := make([]*entry, 0, len(m.nodes))
 	for _, e := range m.nodes {
@@ -335,10 +376,14 @@ func (m *Manager) probeAllNodes(timeout time.Duration) {
 
 	for _, e := range entries {
 		e.mu.RLock()
+		initialCheckDone := e.initialCheckDone
 		probeFn := e.probe
 		tag := e.info.Tag
 		e.mu.RUnlock()
 
+		if onlyPending && initialCheckDone {
+			continue
+		}
 		if probeFn == nil {
 			continue
 		}
@@ -353,22 +398,12 @@ func (m *Manager) probeAllNodes(timeout time.Duration) {
 			latency, err := probe(ctx)
 			cancel()
 
-			entry.mu.Lock()
 			if err != nil {
 				failedCount.Add(1)
-				entry.lastError = err.Error()
-				entry.lastFail = time.Now()
-				entry.lastProbe = 0
-				entry.available = false
-				entry.initialCheckDone = true
 			} else {
 				availableCount.Add(1)
-				entry.lastOK = time.Now()
-				entry.lastProbe = latency
-				entry.available = true
-				entry.initialCheckDone = true
 			}
-			entry.mu.Unlock()
+			entry.recordProbeResult(latency, err)
 
 			if err != nil && m.logger != nil {
 				m.logger.Warn("probe failed for ", tag, ": ", err)
@@ -467,12 +502,55 @@ func (m *Manager) Register(info NodeInfo) *EntryHandle {
 			timeline:  make([]TimelineEvent, 0, maxTimelineSize),
 			reloadGen: m.reloadGen,
 		}
+		if restored, exists := m.takeRestoredStateLocked(info); exists {
+			e.applyRestoredState(restored)
+		}
 		m.nodes[info.Tag] = e
 	} else {
 		e.info = info
 		e.reloadGen = m.reloadGen
 	}
 	return &EntryHandle{ref: e}
+}
+
+// PreloadNodeStates stores persisted runtime state that should be applied when
+// matching nodes are registered.
+func (m *Manager) PreloadNodeStates(entries []RestoreEntry) {
+	if len(entries) == 0 {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, item := range entries {
+		if uri := strings.TrimSpace(item.URI); uri != "" {
+			m.restoreByURI[uri] = item.State
+		}
+		if name := strings.TrimSpace(item.Name); name != "" {
+			m.restoreByName[name] = item.State
+		}
+	}
+}
+
+func (m *Manager) takeRestoredStateLocked(info NodeInfo) (RestoredNodeState, bool) {
+	if info.URI != "" {
+		if state, ok := m.restoreByURI[info.URI]; ok {
+			delete(m.restoreByURI, info.URI)
+			if info.Name != "" {
+				delete(m.restoreByName, info.Name)
+			}
+			return state, true
+		}
+	}
+	if info.Name != "" {
+		if state, ok := m.restoreByName[info.Name]; ok {
+			delete(m.restoreByName, info.Name)
+			if info.URI != "" {
+				delete(m.restoreByURI, info.URI)
+			}
+			return state, true
+		}
+	}
+	return RestoredNodeState{}, false
 }
 
 // DestinationForProbe exposes the configured destination for health checks.
@@ -523,13 +601,22 @@ func (m *Manager) UpdateProbeTarget(target string) error {
 // Snapshot returns a sorted copy of current node states.
 // If onlyAvailable is true, only returns nodes that passed initial health check.
 func (m *Manager) Snapshot() []Snapshot {
-	return m.SnapshotFiltered(false)
+	return m.snapshotFiltered(false, false)
+}
+
+// SnapshotDetailed returns a sorted copy of current node states including timeline data.
+func (m *Manager) SnapshotDetailed() []Snapshot {
+	return m.snapshotFiltered(false, true)
 }
 
 // SnapshotFiltered returns a sorted copy of current node states.
 // If onlyAvailable is true, only returns nodes that passed initial health check.
 // Nodes that haven't been checked yet are also included (they will be checked on first use).
 func (m *Manager) SnapshotFiltered(onlyAvailable bool) []Snapshot {
+	return m.snapshotFiltered(onlyAvailable, false)
+}
+
+func (m *Manager) snapshotFiltered(onlyAvailable bool, includeTimeline bool) []Snapshot {
 	m.mu.RLock()
 	list := make([]*entry, 0, len(m.nodes))
 	for _, e := range m.nodes {
@@ -538,7 +625,7 @@ func (m *Manager) SnapshotFiltered(onlyAvailable bool) []Snapshot {
 	m.mu.RUnlock()
 	snapshots := make([]Snapshot, 0, len(list))
 	for _, e := range list {
-		snap := e.snapshot()
+		snap := e.snapshot(includeTimeline)
 		// 如果只要可用节点：
 		// - 跳过已完成检查但不可用的节点
 		// - 保留未完成检查的节点（它们会在首次使用时被检查）
@@ -625,21 +712,7 @@ func (m *Manager) Probe(ctx context.Context, tag string) (time.Duration, error) 
 	if e.probe == nil {
 		return 0, errors.New("probe not available for this node")
 	}
-	latency, err := e.probe(ctx)
-	if err != nil {
-		// 探测失败：标记节点为不可用，清除旧延迟数据
-		e.mu.Lock()
-		e.available = false
-		e.initialCheckDone = true
-		e.lastProbe = 0 // 清除延迟，前端显示"未测试"
-		e.lastError = err.Error()
-		e.lastFail = time.Now()
-		e.mu.Unlock()
-		return 0, err
-	}
-	// 探测成功：recordSuccessWithLatency 已在 probe 函数内更新 available=true
-	e.recordProbeLatency(latency)
-	return latency, nil
+	return e.probe(ctx)
 }
 
 func (m *Manager) HTTPRequest(ctx context.Context, tag, method, rawURL string, headers map[string]string, maxBodyBytes int64) (*HTTPCheckResult, error) {
@@ -676,7 +749,7 @@ func (m *Manager) entry(tag string) (*entry, error) {
 	return e, nil
 }
 
-func (e *entry) snapshot() Snapshot {
+func (e *entry) snapshot(includeTimeline bool) Snapshot {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 
@@ -689,7 +762,7 @@ func (e *entry) snapshot() Snapshot {
 	}
 
 	var timelineCopy []TimelineEvent
-	if len(e.timeline) > 0 {
+	if includeTimeline && len(e.timeline) > 0 {
 		timelineCopy = make([]TimelineEvent, len(e.timeline))
 		copy(timelineCopy, e.timeline)
 	}
@@ -714,6 +787,33 @@ func (e *entry) snapshot() Snapshot {
 		DownloadSpeed:     e.downloadSpeed,
 		Timeline:          timelineCopy,
 	}
+}
+
+func (e *entry) applyRestoredState(state RestoredNodeState) {
+	if e == nil {
+		return
+	}
+	e.failure = state.FailureCount
+	e.success = state.SuccessCount
+	e.lastError = state.LastError
+	e.lastFail = state.LastFailure
+	e.lastOK = state.LastSuccess
+	e.available = state.Available
+	e.initialCheckDone = state.InitialCheckDone
+	if state.LastLatencyMs > 0 {
+		e.lastProbe = time.Duration(state.LastLatencyMs) * time.Millisecond
+	} else {
+		e.lastProbe = 0
+	}
+	if state.Blacklisted && state.BlacklistedUntil.After(time.Now()) {
+		e.blacklist = true
+		e.until = state.BlacklistedUntil
+	} else {
+		e.blacklist = false
+		e.until = time.Time{}
+	}
+	e.totalUpload.Store(state.TotalUpload)
+	e.totalDownload.Store(state.TotalDownload)
 }
 
 func (e *entry) recordFailure(err error, destination string) {
@@ -748,6 +848,34 @@ func (e *entry) recordSuccessWithLatency(latency time.Duration) {
 	e.lastProbe = latency
 	e.available = true
 	e.initialCheckDone = true
+	latencyMs := latency.Milliseconds()
+	if latencyMs == 0 && latency > 0 {
+		latencyMs = 1
+	}
+	e.appendTimelineLocked(true, latencyMs, "", "")
+}
+
+func (e *entry) recordProbeResult(latency time.Duration, err error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if err != nil {
+		e.failure++
+		e.lastError = err.Error()
+		e.lastFail = time.Now()
+		e.lastProbe = 0
+		e.available = false
+		e.initialCheckDone = true
+		e.appendTimelineLocked(false, 0, e.lastError, "")
+		return
+	}
+
+	e.success++
+	e.lastOK = time.Now()
+	e.lastProbe = latency
+	e.available = true
+	e.initialCheckDone = true
+
 	latencyMs := latency.Milliseconds()
 	if latencyMs == 0 && latency > 0 {
 		latencyMs = 1
@@ -975,4 +1103,12 @@ func (h *EntryHandle) SetTraffic(upload, download int64) {
 	}
 	h.ref.totalUpload.Store(upload)
 	h.ref.totalDownload.Store(download)
+}
+
+// Snapshot returns the current entry snapshot.
+func (h *EntryHandle) Snapshot() Snapshot {
+	if h == nil || h.ref == nil {
+		return Snapshot{}
+	}
+	return h.ref.snapshot(false)
 }

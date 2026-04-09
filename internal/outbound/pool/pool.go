@@ -186,10 +186,6 @@ func (p *poolOutbound) Start(stage adapter.StartStage) error {
 	if err != nil {
 		return err
 	}
-	// 在初始化完成后，立即在后台触发健康检查
-	if p.monitor != nil {
-		go p.probeAllMembersOnStartup()
-	}
 	return nil
 }
 
@@ -259,6 +255,9 @@ func (p *poolOutbound) probeAllMembersOnStartup() {
 		p.mu.Lock()
 		for _, member := range p.members {
 			if member.entry != nil {
+				if member.entry.Snapshot().InitialCheckDone {
+					continue
+				}
 				member.entry.MarkInitialCheckDone(true)
 			}
 		}
@@ -277,6 +276,16 @@ func (p *poolOutbound) probeAllMembersOnStartup() {
 	failedCount := 0
 
 	for _, member := range members {
+		if member.entry != nil {
+			snap := member.entry.Snapshot()
+			if snap.InitialCheckDone {
+				if member.shared != nil && snap.Blacklisted {
+					member.shared.restoreBlacklist(snap.BlacklistedUntil)
+				}
+				continue
+			}
+		}
+
 		// Create a timeout context for each probe
 		ctx, cancel := context.WithTimeout(p.ctx, 15*time.Second)
 
@@ -603,12 +612,8 @@ func (p *poolOutbound) makeProbeFunc(member *memberState) func(ctx context.Conte
 		}
 
 		start := time.Now()
-		probeDst := destination.String()
 		conn, err := member.outbound.DialContext(ctx, N.NetworkTCP, destination)
 		if err != nil {
-			if member.entry != nil {
-				member.entry.RecordFailure(err, probeDst)
-			}
 			return 0, err
 		}
 		defer conn.Close()
@@ -616,22 +621,13 @@ func (p *poolOutbound) makeProbeFunc(member *memberState) func(ctx context.Conte
 		// Perform HTTP probe to measure actual latency (TTFB)
 		_, err = httpProbe(ctx, conn, destination.AddrString())
 		if err != nil {
-			if member.entry != nil {
-				member.entry.RecordFailure(err, probeDst)
-			}
 			return 0, err
 		}
 
 		// Total duration = dial time + HTTP probe
 		duration := time.Since(start)
 		if err := monitor.ProbeLatencyError(duration); err != nil {
-			if member.entry != nil {
-				member.entry.RecordFailure(err, probeDst)
-			}
 			return 0, err
-		}
-		if member.entry != nil {
-			member.entry.RecordSuccessWithLatency(duration)
 		}
 		return duration, nil
 	}
@@ -767,12 +763,8 @@ func (p *poolOutbound) makeProbeByTagFunc(tag string) func(ctx context.Context) 
 		}
 
 		start := time.Now()
-		probeDst := destination.String()
 		conn, err := member.outbound.DialContext(ctx, N.NetworkTCP, destination)
 		if err != nil {
-			if member.entry != nil {
-				member.entry.RecordFailure(err, probeDst)
-			}
 			return 0, err
 		}
 		defer conn.Close()
@@ -780,22 +772,13 @@ func (p *poolOutbound) makeProbeByTagFunc(tag string) func(ctx context.Context) 
 		// Perform HTTP probe to measure actual latency (TTFB)
 		_, err = httpProbe(ctx, conn, destination.AddrString())
 		if err != nil {
-			if member.entry != nil {
-				member.entry.RecordFailure(err, probeDst)
-			}
 			return 0, err
 		}
 
 		// Total duration = dial time + TTFB
 		duration := time.Since(start)
 		if err := monitor.ProbeLatencyError(duration); err != nil {
-			if member.entry != nil {
-				member.entry.RecordFailure(err, probeDst)
-			}
 			return 0, err
-		}
-		if member.entry != nil {
-			member.entry.RecordSuccessWithLatency(duration)
 		}
 		return duration, nil
 	}

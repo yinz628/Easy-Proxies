@@ -163,7 +163,13 @@ export interface ConfigNodeConfig {
   password: string
   source?: string
   disabled?: boolean
-  quality_status?: string
+  lifecycle_state?: NodeLifecycleState
+  quality_version?: string
+  quality_status?: QualityStatus
+  quality_openai_status?: ProviderReachability
+  quality_anthropic_status?: ProviderReachability
+  activation_ready?: boolean
+  activation_block_reason?: string
   quality_score?: number
   quality_grade?: string
   quality_summary?: string
@@ -178,9 +184,112 @@ export interface ConfigNodesResponse {
   nodes: ConfigNodeConfig[]
 }
 
+export type ManageStatus = '' | 'normal' | 'unavailable' | 'blacklisted' | 'pending' | 'disabled'
+export type ManageSortKey = 'name' | 'status' | 'latency' | 'region' | 'port' | 'source'
+export type ManageSortDir = 'asc' | 'desc'
+export type ManualProbeStatus = 'untested' | 'pass' | 'fail' | 'timeout'
+export type NodeLifecycleState = 'active' | 'staged' | 'disabled'
+export type ActivationReadyFilter = '' | 'ready' | 'blocked'
+export type BatchLifecycleAction = 'activate' | 'deactivate' | 'disable'
+
+export interface ManageQuery {
+  page: number
+  page_size: number
+  keyword: string
+  status: ManageStatus
+  region: string
+  source: string
+  lifecycle_state: NodeLifecycleState | ''
+  manual_probe_status: ManualProbeStatus | ''
+  activation_ready: ActivationReadyFilter
+  quality_status: string
+  sort_key: ManageSortKey
+  sort_dir: ManageSortDir
+}
+
+export interface ManageFilterSnapshot {
+  keyword: string
+  status: ManageStatus
+  region: string
+  source: string
+  lifecycle_state: NodeLifecycleState | ''
+  manual_probe_status: ManualProbeStatus | ''
+  activation_ready: ActivationReadyFilter
+  quality_status: string
+}
+
+export interface ManageNodeRow extends ConfigNodeConfig {
+  runtime_status: Exclude<ManageStatus, ''>
+  latency_ms: number
+  manual_probe_status: ManualProbeStatus
+  manual_probe_latency_ms: number
+  manual_probe_checked?: number
+  manual_probe_message?: string
+  activation_ready: boolean
+  activation_block_reason?: string
+  region?: string
+  country?: string
+  active_connections: number
+  success_count: number
+  failure_count: number
+  tag?: string
+}
+
+export interface ManageListResponse {
+  items: ManageNodeRow[]
+  page: number
+  page_size: number
+  total: number
+  filtered_total: number
+  summary: Record<Exclude<ManageStatus, ''>, number>
+  facets: {
+    regions: string[]
+    sources: string[]
+    lifecycle_states: NodeLifecycleState[]
+    manual_probe_statuses: ManualProbeStatus[]
+    activation_readiness: Exclude<ActivationReadyFilter, ''>[]
+    quality_statuses: string[]
+  }
+}
+
+export type SelectionState =
+  | { mode: 'uris'; uris: Set<string> }
+  | { mode: 'filter'; filter: ManageFilterSnapshot; excludeUris: Set<string> }
+
+export type ManageSelectionRequest =
+  | { selection: { mode: 'uris'; uris: string[] } }
+  | { selection: { mode: 'filter'; filter: ManageFilterSnapshot; exclude_uris: string[] } }
+
 export interface ConfigNodeMutationResponse {
   node?: ConfigNodeConfig
   message: string
+}
+
+export interface ImportResultItem {
+  line: number
+  requested_name?: string
+  final_name: string
+  status: 'imported'
+  reason?: 'missing_name' | 'name_conflict'
+}
+
+export interface ImportNodesResponse {
+  message: string
+  imported: number
+  renamed: number
+  items?: ImportResultItem[]
+  errors?: string[]
+}
+
+export interface BatchLifecycleResponse {
+  message: string
+  action: BatchLifecycleAction
+  total: number
+  success: number
+  skipped: number
+  errors?: string[]
+  reloaded?: boolean
+  reload_error?: string
 }
 
 export interface TXTSubscriptionConfig {
@@ -209,12 +318,20 @@ export interface SubscriptionStatus {
   has_subscriptions?: boolean
   last_refresh?: string
   next_refresh?: string
+  staged_count?: number
   node_count?: number
   last_error?: string
   refresh_count?: number
   is_refreshing?: boolean
   message?: string
   feeds?: SubscriptionFeedStatus[]
+}
+
+export interface SubscriptionImportResponse {
+  message: string
+  staged_count: number
+  node_count?: number
+  feed_key?: string
 }
 
 export interface NodeQualityCheckItem {
@@ -225,9 +342,18 @@ export interface NodeQualityCheckItem {
   message?: string
 }
 
+export type QualityStatus = 'dual_available' | 'openai_only' | 'anthropic_only' | 'unavailable' | 'unchecked'
+export type ProviderReachability = 'pass' | 'fail'
+export type BatchQualityJobStatus = 'queued' | 'running' | 'completed' | 'failed' | 'cancelled'
+
 export interface NodeQualityCheckResult {
   node_id: number
-  quality_status: string
+  quality_version?: string
+  quality_status: QualityStatus
+  quality_openai_status?: ProviderReachability
+  quality_anthropic_status?: ProviderReachability
+  activation_ready: boolean
+  activation_block_reason?: string
   quality_score?: number
   quality_grade: string
   quality_summary: string
@@ -241,16 +367,28 @@ export interface NodeQualityCheckResult {
 
 export interface QualityCheckBatchStart {
   type: 'start'
+  job_id: string
+  status: BatchQualityJobStatus
   total: number
+  completed: number
+  success: number
+  failed: number
 }
 
 export interface QualityCheckBatchProgress {
   type: 'progress'
+  job_id: string
   tag: string
   name: string
+  uri: string
   status: 'success' | 'error'
   error: string
-  quality_status?: string
+  quality_version?: string
+  quality_status?: QualityStatus
+  quality_openai_status?: ProviderReachability
+  quality_anthropic_status?: ProviderReachability
+  activation_ready?: boolean
+  activation_block_reason?: string
   quality_score?: number
   quality_grade?: string
   quality_summary?: string
@@ -262,16 +400,54 @@ export interface QualityCheckBatchProgress {
   items?: NodeQualityCheckItem[]
   current: number
   total: number
+  success: number
+  failed: number
 }
 
 export interface QualityCheckBatchComplete {
   type: 'complete'
+  job_id: string
+  status: BatchQualityJobStatus
   total: number
+  completed: number
   success: number
   failed: number
 }
 
 export type QualityCheckBatchEvent = QualityCheckBatchStart | QualityCheckBatchProgress | QualityCheckBatchComplete
+
+export interface BatchQualityJobResult {
+  tag: string
+  name: string
+  uri: string
+  error?: string
+  quality_version?: string
+  quality_status?: QualityStatus
+  quality_openai_status?: ProviderReachability
+  quality_anthropic_status?: ProviderReachability
+  activation_ready?: boolean
+  activation_block_reason?: string
+  quality_score?: number
+  quality_grade?: string
+  quality_summary?: string
+  quality_checked_at?: string
+  items?: NodeQualityCheckItem[]
+}
+
+export interface BatchQualityJob {
+  id: string
+  status: BatchQualityJobStatus
+  started_at: string
+  updated_at: string
+  completed_at?: string
+  total: number
+  completed: number
+  success: number
+  failed: number
+  active_workers: number
+  last_result?: BatchQualityJobResult
+  last_error?: string
+}
 
 export interface BatchProbeJobResult {
   tag: string
@@ -291,7 +467,6 @@ export interface BatchProbeJob {
   success: number
   failed: number
   active_workers: number
-  requested_tags: string[]
   last_result?: BatchProbeJobResult
   last_error?: string
 }
@@ -342,5 +517,5 @@ export interface TrafficStreamEvent {
   upload_speed: number
   download_speed: number
   sampled_at: string
-  nodes: TrafficStreamNode[]
+  nodes?: TrafficStreamNode[]
 }

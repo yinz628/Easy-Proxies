@@ -48,6 +48,9 @@ type Store interface {
 	// Nodes are matched by URI for upsert logic.
 	BulkUpsertNodes(ctx context.Context, nodes []Node) error
 
+	// BatchUpdateNodeLifecycle updates lifecycle state for a batch of nodes.
+	BatchUpdateNodeLifecycle(ctx context.Context, nodeIDs []int64, lifecycleState string) error
+
 	// CountNodes returns the total number of nodes matching the filter.
 	CountNodes(ctx context.Context, filter NodeFilter) (int64, error)
 
@@ -85,6 +88,15 @@ type Store interface {
 
 	// SaveNodeQualityCheck replaces the latest quality-check summary and detail rows for a node.
 	SaveNodeQualityCheck(ctx context.Context, check *NodeQualityCheck) error
+
+	// GetNodeManualProbeResult returns the latest manual probe result for a node.
+	GetNodeManualProbeResult(ctx context.Context, nodeID int64) (*NodeManualProbeResult, error)
+
+	// GetAllNodeManualProbeResults returns manual probe results for all nodes.
+	GetAllNodeManualProbeResults(ctx context.Context) (map[int64]*NodeManualProbeResult, error)
+
+	// SaveNodeManualProbeResult creates or updates the latest manual probe result for a node.
+	SaveNodeManualProbeResult(ctx context.Context, result *NodeManualProbeResult) error
 
 	// --- Timeline ---
 
@@ -133,69 +145,79 @@ type Store interface {
 
 // Node represents a proxy node stored in the database.
 type Node struct {
-	ID        int64     `json:"id"`
-	URI       string    `json:"uri"`
-	Name      string    `json:"name"`
-	Source    string    `json:"source"` // inline, nodes_file, subscription, manual
-	FeedKey   string    `json:"feed_key,omitempty"`
-	Port      uint16    `json:"port"`
-	Username  string    `json:"username,omitempty"`
-	Password  string    `json:"password,omitempty"`
-	Region    string    `json:"region,omitempty"`
-	Country   string    `json:"country,omitempty"`
-	Enabled   bool      `json:"enabled"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	ID             int64     `json:"id"`
+	URI            string    `json:"uri"`
+	Name           string    `json:"name"`
+	Source         string    `json:"source"` // inline, nodes_file, subscription, manual
+	FeedKey        string    `json:"feed_key,omitempty"`
+	Port           uint16    `json:"port"`
+	Username       string    `json:"username,omitempty"`
+	Password       string    `json:"password,omitempty"`
+	Region         string    `json:"region,omitempty"`
+	Country        string    `json:"country,omitempty"`
+	Enabled        bool      `json:"enabled"`
+	LifecycleState string    `json:"lifecycle_state"`
+	CreatedAt      time.Time `json:"created_at"`
+	UpdatedAt      time.Time `json:"updated_at"`
 }
 
 // NodeFilter specifies criteria for listing nodes.
 type NodeFilter struct {
-	Source  string // Filter by source (empty = all)
-	Region  string // Filter by region (empty = all)
-	Enabled *bool  // Filter by enabled status (nil = all)
-	Limit   int    // Max results (0 = no limit)
-	Offset  int    // Pagination offset
+	Source         string // Filter by source (empty = all)
+	Region         string // Filter by region (empty = all)
+	Enabled        *bool  // Filter by enabled status (nil = all)
+	LifecycleState string // Filter by lifecycle state (empty = all)
+	Limit          int    // Max results (0 = no limit)
+	Offset         int    // Pagination offset
 }
 
 // NodeStats holds runtime statistics for a node.
 type NodeStats struct {
-	NodeID             int64     `json:"node_id"`
-	FailureCount       int       `json:"failure_count"`
-	SuccessCount       int64     `json:"success_count"`
-	Blacklisted        bool      `json:"blacklisted"`
-	BlacklistedUntil   time.Time `json:"blacklisted_until"`
-	LastError          string    `json:"last_error"`
-	LastFailureAt      time.Time `json:"last_failure_at"`
-	LastSuccessAt      time.Time `json:"last_success_at"`
-	LastLatencyMs      int64     `json:"last_latency_ms"` // -1 = untested
-	Available          bool      `json:"available"`
-	InitialCheckDone   bool      `json:"initial_check_done"`
-	TotalUploadBytes   int64     `json:"total_upload_bytes"`
-	TotalDownloadBytes int64     `json:"total_download_bytes"`
-	QualityStatus      string    `json:"quality_status"`
-	QualityScore       *int      `json:"quality_score,omitempty"`
-	QualityGrade       string    `json:"quality_grade"`
-	QualitySummary     string    `json:"quality_summary"`
-	QualityCheckedAt   time.Time `json:"quality_checked_at"`
-	ExitIP             string    `json:"exit_ip"`
-	ExitCountry        string    `json:"exit_country"`
-	ExitCountryCode    string    `json:"exit_country_code"`
-	ExitRegion         string    `json:"exit_region"`
-	UpdatedAt          time.Time `json:"updated_at"`
+	NodeID                 int64     `json:"node_id"`
+	FailureCount           int       `json:"failure_count"`
+	SuccessCount           int64     `json:"success_count"`
+	Blacklisted            bool      `json:"blacklisted"`
+	BlacklistedUntil       time.Time `json:"blacklisted_until"`
+	LastError              string    `json:"last_error"`
+	LastFailureAt          time.Time `json:"last_failure_at"`
+	LastSuccessAt          time.Time `json:"last_success_at"`
+	LastLatencyMs          int64     `json:"last_latency_ms"` // -1 = untested
+	Available              bool      `json:"available"`
+	InitialCheckDone       bool      `json:"initial_check_done"`
+	TotalUploadBytes       int64     `json:"total_upload_bytes"`
+	TotalDownloadBytes     int64     `json:"total_download_bytes"`
+	QualityStatus          string    `json:"quality_status"`
+	QualityVersion         string    `json:"quality_version"`
+	QualityOpenAIStatus    string    `json:"quality_openai_status"`
+	QualityAnthropicStatus string    `json:"quality_anthropic_status"`
+	QualityScore           *int      `json:"quality_score,omitempty"`
+	QualityGrade           string    `json:"quality_grade"`
+	QualitySummary         string    `json:"quality_summary"`
+	QualityCheckedAt       time.Time `json:"quality_checked_at"`
+	ExitIP                 string    `json:"exit_ip"`
+	ExitCountry            string    `json:"exit_country"`
+	ExitCountryCode        string    `json:"exit_country_code"`
+	ExitRegion             string    `json:"exit_region"`
+	UpdatedAt              time.Time `json:"updated_at"`
 }
 
 type NodeQualityCheck struct {
-	NodeID           int64                  `json:"node_id"`
-	QualityStatus    string                 `json:"quality_status"`
-	QualityScore     *int                   `json:"quality_score,omitempty"`
-	QualityGrade     string                 `json:"quality_grade"`
-	QualitySummary   string                 `json:"quality_summary"`
-	QualityCheckedAt time.Time              `json:"quality_checked_at"`
-	ExitIP           string                 `json:"exit_ip,omitempty"`
-	ExitCountry      string                 `json:"exit_country,omitempty"`
-	ExitCountryCode  string                 `json:"exit_country_code,omitempty"`
-	ExitRegion       string                 `json:"exit_region,omitempty"`
-	Items            []NodeQualityCheckItem `json:"items"`
+	NodeID                 int64                  `json:"node_id"`
+	QualityStatus          string                 `json:"quality_status"`
+	QualityVersion         string                 `json:"quality_version"`
+	QualityOpenAIStatus    string                 `json:"quality_openai_status"`
+	QualityAnthropicStatus string                 `json:"quality_anthropic_status"`
+	ActivationReady        bool                   `json:"activation_ready"`
+	ActivationBlockReason  string                 `json:"activation_block_reason,omitempty"`
+	QualityScore           *int                   `json:"quality_score,omitempty"`
+	QualityGrade           string                 `json:"quality_grade"`
+	QualitySummary         string                 `json:"quality_summary"`
+	QualityCheckedAt       time.Time              `json:"quality_checked_at"`
+	ExitIP                 string                 `json:"exit_ip,omitempty"`
+	ExitCountry            string                 `json:"exit_country,omitempty"`
+	ExitCountryCode        string                 `json:"exit_country_code,omitempty"`
+	ExitRegion             string                 `json:"exit_region,omitempty"`
+	Items                  []NodeQualityCheckItem `json:"items"`
 }
 
 type NodeQualityCheckItem struct {
@@ -204,6 +226,16 @@ type NodeQualityCheckItem struct {
 	HTTPStatus int    `json:"http_status,omitempty"`
 	LatencyMs  int64  `json:"latency_ms,omitempty"`
 	Message    string `json:"message,omitempty"`
+}
+
+type NodeManualProbeResult struct {
+	NodeID    int64     `json:"node_id"`
+	Status    string    `json:"status"`
+	LatencyMs int64     `json:"latency_ms"`
+	TimedOut  bool      `json:"timed_out"`
+	Message   string    `json:"message,omitempty"`
+	CheckedAt time.Time `json:"checked_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 // StatsUpdate represents a batch update for node statistics.
@@ -254,9 +286,22 @@ type SubscriptionStatus struct {
 
 // Node source constants (matching config.NodeSource values).
 const (
-	NodeSourceInline       = "inline"
-	NodeSourceFile         = "nodes_file"
-	NodeSourceSubscription = "subscription"
-	NodeSourceManual       = "manual"
+	NodeSourceInline          = "inline"
+	NodeSourceFile            = "nodes_file"
+	NodeSourceSubscription    = "subscription"
+	NodeSourceManual          = "manual"
 	NodeSourceTXTSubscription = "txt_subscription"
+)
+
+const (
+	NodeLifecycleActive   = "active"
+	NodeLifecycleStaged   = "staged"
+	NodeLifecycleDisabled = "disabled"
+)
+
+const (
+	ManualProbeStatusUntested = "untested"
+	ManualProbeStatusPass     = "pass"
+	ManualProbeStatusFail     = "fail"
+	ManualProbeStatusTimeout  = "timeout"
 )

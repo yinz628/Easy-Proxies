@@ -91,29 +91,42 @@ geoip:
 # ───────────────────────────────────────────────────────────────
 # 订阅自动刷新配置（可选）
 # ───────────────────────────────────────────────────────────────
+# 注意：
+#   - 程序启动时不会主动拉取 legacy subscriptions 或 txt_subscriptions
+#   - 管理页手动刷新只会把订阅节点导入到 staged 候选池
+#   - 导入后的节点不会自动进入运行池，需在管理页完成探测/质检后手动激活
+#   - 只有 lifecycle_state = active 的订阅节点才会进入实际运行池
 # subscription_refresh:
-#   enabled: false              # 是否启用定时刷新
+#   enabled: false              # 是否启用定时刷新（默认建议关闭）
 #   interval: 1h                # 刷新间隔（默认 1 小时）
 #   timeout: 30s                # 获取订阅的超时时间
 #   health_check_timeout: 60s   # 新节点健康检查超时
 #   drain_timeout: 30s          # 旧实例排空超时时间
-#   min_available_nodes: 1      # 最少可用节点数，低于此值不切换
+#   min_available_nodes: 1      # 保留兼容字段；staged 导入场景下不会直接触发运行池切换
 
 # ═══════════════════════════════════════════════════════════════
 # 节点配置方式（三选一或混合使用）
 # ═══════════════════════════════════════════════════════════════
 
+# 订阅节点推荐工作流：
+# 1. Settings 手动刷新 legacy / TXT feed
+# 2. 新导入节点进入 staged 候选池
+# 3. 在管理页执行 Probe / Quality Check
+# 4. 手动 Activate 选中的合格节点
+# 5. 只有 active 节点会进入实际代理池
+
 # ───────────────────────────────────────────────────────────────
-# 方式 1: 订阅链接（推荐，自动获取并写入 nodes.txt）
+# 方式 1: 订阅链接（推荐，用于导入到 staged 候选池）
 # ───────────────────────────────────────────────────────────────
 subscriptions:
   - "https://example.com/subscribe?token=xxx"
 #   - "https://another.com/api/v1/client/subscribe?token=yyy"
+# 上述 legacy 订阅不会在启动时自动拉取；需在 Settings 页面手动更新
 # txt_subscriptions:
 #   - name: "vmheaven-http"
 #     url: "https://github.com/vmheaven/VMHeaven-Free-Proxy-Updated/blob/main/http.txt"
 #     default_protocol: "http"        # http | https | socks5
-#     auto_update_enabled: true       # 是否参与定时自动刷新
+#     auto_update_enabled: true       # 是否参与定时自动刷新（只导入 staged，不自动激活）
 #   - name: "vmheaven-socks5"
 #     url: "https://github.com/vmheaven/VMHeaven-Free-Proxy-Updated/blob/main/socks5_anonymous.txt"
 #     default_protocol: "socks5"
